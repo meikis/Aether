@@ -1,5 +1,6 @@
 package com.zhousl.aether.agentmode
 
+import android.annotation.SuppressLint
 import android.app.ActivityOptions
 import android.app.PendingIntent
 import android.content.Context
@@ -359,6 +360,7 @@ class AetherAgentModeShizukuService @Keep constructor(
         }
     }
 
+    @SuppressLint("BlockedPrivateApi")
     private fun setInputEventDisplayId(event: InputEvent, displayId: Int) {
         val method = InputEvent::class.java.getDeclaredMethod(
             "setDisplayId",
