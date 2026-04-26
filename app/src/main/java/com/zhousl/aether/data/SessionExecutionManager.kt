@@ -7,13 +7,13 @@ import com.zhousl.aether.AetherNotificationController
 import com.zhousl.aether.AppForegroundTracker
 import com.zhousl.aether.termux.TermuxBashTool
 import com.zhousl.aether.ui.AttachmentKind
+import com.zhousl.aether.ui.AssistantResponseBlock
 import com.zhousl.aether.ui.ChatAttachment
 import com.zhousl.aether.ui.ChatMessage
 import com.zhousl.aether.ui.ChatSession
 import com.zhousl.aether.ui.ChatToolInvocation
 import com.zhousl.aether.ui.MessageAuthor
 import com.zhousl.aether.ui.syncActiveBranches
-import java.util.LinkedHashMap
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.coroutines.cancellation.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -50,6 +50,7 @@ data class SessionExecutionState(
     val sessionId: String,
     val isRunning: Boolean = false,
     val pendingToolInvocations: List<ChatToolInvocation> = emptyList(),
+    val pendingResponseBlocks: List<AssistantResponseBlock> = emptyList(),
     val pendingAssistantText: String = "",
     val pendingStatusText: String = "",
     val pendingInputs: List<PendingSessionInput> = emptyList(),
@@ -121,8 +122,12 @@ class SessionExecutionManager(
         if (validationError != null) {
             val completion = appendAgentMessage(
                 sessionId = request.sessionId,
-                text = validationError,
-                toolInvocations = emptyList(),
+                blocks = listOf(
+                    AssistantResponseBlock.Text(
+                        id = "agent-validation-${System.currentTimeMillis()}",
+                        text = validationError,
+                    )
+                ),
                 thoughtDurationMillis = null,
                 outcome = SessionTurnOutcome.ValidationError,
             )
@@ -137,6 +142,7 @@ class SessionExecutionManager(
                 sessionId = request.sessionId,
                 isRunning = true,
                 pendingToolInvocations = emptyList(),
+                pendingResponseBlocks = emptyList(),
                 pendingAssistantText = "",
                 pendingStatusText = "",
                 activeTurnStartedAtMillis = System.currentTimeMillis(),
@@ -221,6 +227,7 @@ class SessionExecutionManager(
                     sessionId = handle.sessionId,
                     isRunning = false,
                     pendingToolInvocations = emptyList(),
+                    pendingResponseBlocks = emptyList(),
                     pendingAssistantText = "",
                     pendingStatusText = "",
                     pendingInputs = emptyList(),
@@ -249,7 +256,6 @@ class SessionExecutionManager(
         request: SessionTurnRequest,
     ): CompletionSummary {
         val turnStartedAtMillis = System.currentTimeMillis()
-        val completedToolInvocations = LinkedHashMap<String, ChatToolInvocation>()
         val mcpClientManager = McpClientManager(bashTool = bashTool)
         val agent = AetherAgent(
             client = OpenAiCompatibleClient(),
@@ -266,6 +272,7 @@ class SessionExecutionManager(
                 sessionId = handle.sessionId,
                 isRunning = true,
                 pendingToolInvocations = emptyList(),
+                pendingResponseBlocks = emptyList(),
                 pendingAssistantText = "",
                 pendingStatusText = "",
                 activeTurnStartedAtMillis = turnStartedAtMillis,
@@ -315,24 +322,32 @@ class SessionExecutionManager(
                         startedAtUptimeMillis = now,
                         completedAtUptimeMillis = if (event.outputJson == null) null else now,
                     )
-                    if (!invocation.isRunning) {
-                        completedToolInvocations[invocation.id] = invocation
-                    }
                     updateExecutionState(handle.sessionId) { current ->
+                        val pendingToolInvocations = upsertToolInvocation(
+                            current.pendingToolInvocations,
+                            invocation,
+                        )
+                        val pendingResponseBlocks = upsertAssistantResponseToolInvocation(
+                            blocks = current.pendingResponseBlocks,
+                            toolInvocation = invocation,
+                        ) { handle.nextPendingBlockId("pending-tools") }
                         current.copy(
-                            pendingToolInvocations = upsertToolInvocation(
-                                current.pendingToolInvocations,
-                                invocation,
-                            )
+                            pendingToolInvocations = pendingToolInvocations,
+                            pendingResponseBlocks = pendingResponseBlocks,
                         )
                     }
                 },
                 onAssistantTextDelta = { delta ->
                     if (delta.isEmpty()) return@runTurn
                     updateExecutionState(handle.sessionId) { current ->
+                        val pendingResponseBlocks = appendAssistantResponseText(
+                            blocks = current.pendingResponseBlocks,
+                            delta = delta,
+                        ) { handle.nextPendingBlockId("pending-text") }
                         current.copy(
                             pendingStatusText = "",
-                            pendingAssistantText = current.pendingAssistantText + delta
+                            pendingAssistantText = pendingTrailingAssistantText(pendingResponseBlocks),
+                            pendingResponseBlocks = pendingResponseBlocks,
                         )
                     }
                 },
@@ -377,8 +392,10 @@ class SessionExecutionManager(
                 onSuccess = { reply ->
                     appendAgentMessage(
                         sessionId = handle.sessionId,
-                        text = reply,
-                        toolInvocations = completedToolInvocations.values.toList(),
+                        blocks = ensureAssistantResponseFinalText(
+                            blocks = currentAssistantResponseBlocks(handle.sessionId),
+                            finalText = reply,
+                        ) { handle.nextPendingBlockId("agent-text") },
                         thoughtDurationMillis = thoughtDurationMillis,
                         outcome = SessionTurnOutcome.Success,
                     )
@@ -386,8 +403,15 @@ class SessionExecutionManager(
                 onFailure = { throwable ->
                     appendAgentMessage(
                         sessionId = handle.sessionId,
-                        text = "Request failed: ${throwable.message ?: "Unknown error"}",
-                        toolInvocations = completedToolInvocations.values.toList(),
+                        blocks = appendAssistantResponseText(
+                            blocks = currentAssistantResponseBlocks(handle.sessionId),
+                            delta = buildString {
+                                if (currentAssistantResponseBlocks(handle.sessionId).lastOrNull() is AssistantResponseBlock.Text) {
+                                    append("\n\n")
+                                }
+                                append("Request failed: ${throwable.message ?: "Unknown error"}")
+                            },
+                        ) { handle.nextPendingBlockId("agent-text") },
                         thoughtDurationMillis = thoughtDurationMillis,
                         outcome = SessionTurnOutcome.Failure,
                     )
@@ -398,9 +422,11 @@ class SessionExecutionManager(
         } catch (_: CancellationException) {
             val snapshot = _executionStates.value[handle.sessionId] ?: SessionExecutionState(sessionId = handle.sessionId)
             val finalizedToolInvocations = finalizeInterruptedToolInvocations(snapshot.pendingToolInvocations)
+            val finalizedResponseBlocks = finalizeInterruptedAssistantResponseBlocks(snapshot.pendingResponseBlocks)
             val thoughtDurationMillis = (System.currentTimeMillis() - turnStartedAtMillis).coerceAtLeast(0L)
             clearPendingInputs(handle)
             val completion = if (
+                finalizedResponseBlocks.isEmpty() &&
                 snapshot.pendingAssistantText.isBlank() &&
                 finalizedToolInvocations.isEmpty()
             ) {
@@ -412,8 +438,26 @@ class SessionExecutionManager(
             } else {
                 appendAgentMessage(
                     sessionId = handle.sessionId,
-                    text = snapshot.pendingAssistantText,
-                    toolInvocations = finalizedToolInvocations,
+                    blocks = finalizedResponseBlocks.ifEmpty {
+                        buildList {
+                            if (snapshot.pendingAssistantText.isNotBlank()) {
+                                add(
+                                    AssistantResponseBlock.Text(
+                                        id = handle.nextPendingBlockId("agent-text"),
+                                        text = snapshot.pendingAssistantText,
+                                    )
+                                )
+                            }
+                            if (finalizedToolInvocations.isNotEmpty()) {
+                                add(
+                                    AssistantResponseBlock.ToolGroup(
+                                        id = handle.nextPendingBlockId("agent-tools"),
+                                        toolInvocations = finalizedToolInvocations,
+                                    )
+                                )
+                            }
+                        }
+                    },
                     thoughtDurationMillis = thoughtDurationMillis,
                     outcome = SessionTurnOutcome.Neutral,
                 )
@@ -427,6 +471,7 @@ class SessionExecutionManager(
             updateExecutionState(handle.sessionId) { current ->
                 current.copy(
                     pendingToolInvocations = emptyList(),
+                    pendingResponseBlocks = emptyList(),
                     pendingAssistantText = "",
                     activeTurnStartedAtMillis = null,
                 )
@@ -540,13 +585,59 @@ class SessionExecutionManager(
 
     private fun appendAgentMessage(
         sessionId: String,
-        text: String,
-        toolInvocations: List<ChatToolInvocation>,
+        blocks: List<AssistantResponseBlock>,
         thoughtDurationMillis: Long?,
         outcome: SessionTurnOutcome,
     ): CompletionSummary {
         var sessionTitle = resolveSessionTitle(sessionId)
-        var replySummary = text.trim()
+        var replySummary = blocks.lastOrNull()
+            ?.let(::assistantResponseBlockSummaryText)
+            .orEmpty()
+
+        val normalizedBlocks = normalizeAssistantResponseBlocks(blocks)
+        val messageTimestamp = System.currentTimeMillis()
+        val responseGroupId = "agent-group-$messageTimestamp"
+        val appendedMessages = normalizedBlocks.mapIndexedNotNull { index, block ->
+            when (block) {
+                is AssistantResponseBlock.Text -> {
+                    if (block.text.isBlank()) {
+                        null
+                    } else {
+                        ChatMessage(
+                            id = "agent-${messageTimestamp + index}",
+                            author = MessageAuthor.Agent,
+                            text = block.text,
+                            createdAtMillis = messageTimestamp + index,
+                            responseGroupId = responseGroupId,
+                        )
+                    }
+                }
+
+                is AssistantResponseBlock.ToolGroup -> {
+                    if (block.toolInvocations.isEmpty()) {
+                        null
+                    } else {
+                        ChatMessage(
+                            id = "agent-${messageTimestamp + index}",
+                            author = MessageAuthor.Agent,
+                            text = "",
+                            createdAtMillis = messageTimestamp + index,
+                            toolInvocations = block.toolInvocations,
+                            responseGroupId = responseGroupId,
+                        )
+                    }
+                }
+            }
+        }.let { messages ->
+            if (messages.isEmpty()) {
+                emptyList()
+            } else {
+                messages.toMutableList().apply {
+                    val lastIndex = lastIndex
+                    set(lastIndex, get(lastIndex).copy(thoughtDurationMillis = thoughtDurationMillis))
+                }
+            }
+        }
 
         chatStateStore.update { persisted ->
             val sessionIndex = persisted.sessions.indexOfFirst { it.id == sessionId }
@@ -555,15 +646,7 @@ class SessionExecutionManager(
             val updatedSessions = persisted.sessions.toMutableList()
             val session = updatedSessions.removeAt(sessionIndex)
             val updatedSession = session.withDerivedMessages(
-                session.messages +
-                    ChatMessage(
-                        id = "agent-${System.currentTimeMillis()}",
-                        author = MessageAuthor.Agent,
-                        text = text,
-                        createdAtMillis = System.currentTimeMillis(),
-                        toolInvocations = toolInvocations,
-                        thoughtDurationMillis = thoughtDurationMillis,
-                    )
+                session.messages + appendedMessages
             )
             sessionTitle = updatedSession.title
             replySummary = updatedSession.preview
@@ -577,6 +660,9 @@ class SessionExecutionManager(
             outcome = outcome,
         )
     }
+
+    private fun currentAssistantResponseBlocks(sessionId: String): List<AssistantResponseBlock> =
+        _executionStates.value[sessionId]?.pendingResponseBlocks.orEmpty()
 
     private fun appendConsumedUserMessages(
         sessionId: String,
@@ -850,6 +936,148 @@ class SessionExecutionManager(
         }
     }
 
+    private fun appendAssistantResponseText(
+        blocks: List<AssistantResponseBlock>,
+        delta: String,
+        newBlockId: () -> String,
+    ): List<AssistantResponseBlock> {
+        if (delta.isEmpty()) return blocks
+        val lastBlock = blocks.lastOrNull()
+        return if (lastBlock is AssistantResponseBlock.Text) {
+            blocks.toMutableList().apply {
+                set(lastIndex, lastBlock.copy(text = lastBlock.text + delta))
+            }
+        } else {
+            blocks + AssistantResponseBlock.Text(
+                id = newBlockId(),
+                text = delta,
+            )
+        }
+    }
+
+    private fun upsertAssistantResponseToolInvocation(
+        blocks: List<AssistantResponseBlock>,
+        toolInvocation: ChatToolInvocation,
+        newBlockId: () -> String,
+    ): List<AssistantResponseBlock> {
+        val existingIndex = blocks.indexOfFirst { block ->
+            block is AssistantResponseBlock.ToolGroup &&
+                block.toolInvocations.any { it.id == toolInvocation.id }
+        }
+        if (existingIndex >= 0) {
+            val toolBlock = blocks[existingIndex] as AssistantResponseBlock.ToolGroup
+            return blocks.toMutableList().apply {
+                set(
+                    existingIndex,
+                    toolBlock.copy(
+                        toolInvocations = upsertToolInvocation(toolBlock.toolInvocations, toolInvocation),
+                    ),
+                )
+            }
+        }
+
+        val lastBlock = blocks.lastOrNull()
+        return if (lastBlock is AssistantResponseBlock.ToolGroup) {
+            blocks.toMutableList().apply {
+                set(
+                    lastIndex,
+                    lastBlock.copy(
+                        toolInvocations = upsertToolInvocation(lastBlock.toolInvocations, toolInvocation),
+                    ),
+                )
+            }
+        } else {
+            blocks + AssistantResponseBlock.ToolGroup(
+                id = newBlockId(),
+                toolInvocations = upsertToolInvocation(emptyList(), toolInvocation),
+            )
+        }
+    }
+
+    private fun pendingTrailingAssistantText(
+        blocks: List<AssistantResponseBlock>,
+    ): String = (blocks.lastOrNull() as? AssistantResponseBlock.Text)?.text.orEmpty()
+
+    private fun ensureAssistantResponseFinalText(
+        blocks: List<AssistantResponseBlock>,
+        finalText: String,
+        newBlockId: () -> String,
+    ): List<AssistantResponseBlock> {
+        if (finalText.isBlank()) return normalizeAssistantResponseBlocks(blocks)
+        val normalized = normalizeAssistantResponseBlocks(blocks)
+        val lastTextIndex = normalized.indexOfLast { it is AssistantResponseBlock.Text }
+        if (lastTextIndex < 0) {
+            return normalized + AssistantResponseBlock.Text(
+                id = newBlockId(),
+                text = finalText,
+            )
+        }
+        val lastTextBlock = normalized[lastTextIndex] as AssistantResponseBlock.Text
+        if (lastTextBlock.text == finalText) return normalized
+        return normalized.toMutableList().apply {
+            set(lastTextIndex, lastTextBlock.copy(text = finalText))
+        }
+    }
+
+    private fun normalizeAssistantResponseBlocks(
+        blocks: List<AssistantResponseBlock>,
+    ): List<AssistantResponseBlock> = buildList {
+        blocks.forEach { block ->
+            when (block) {
+                is AssistantResponseBlock.Text -> {
+                    if (block.text.isBlank()) return@forEach
+                    val previous = lastOrNull()
+                    if (previous is AssistantResponseBlock.Text) {
+                        removeAt(lastIndex)
+                        add(previous.copy(text = previous.text + block.text))
+                    } else {
+                        add(block)
+                    }
+                }
+
+                is AssistantResponseBlock.ToolGroup -> {
+                    if (block.toolInvocations.isEmpty()) return@forEach
+                    val previous = lastOrNull()
+                    if (previous is AssistantResponseBlock.ToolGroup) {
+                        removeAt(lastIndex)
+                        add(
+                            previous.copy(
+                                toolInvocations = previous.toolInvocations + block.toolInvocations,
+                            ),
+                        )
+                    } else {
+                        add(block)
+                    }
+                }
+            }
+        }
+    }
+
+    private fun finalizeInterruptedAssistantResponseBlocks(
+        blocks: List<AssistantResponseBlock>,
+    ): List<AssistantResponseBlock> = normalizeAssistantResponseBlocks(
+        blocks.map { block ->
+            when (block) {
+                is AssistantResponseBlock.Text -> block
+                is AssistantResponseBlock.ToolGroup -> block.copy(
+                    toolInvocations = finalizeInterruptedToolInvocations(block.toolInvocations),
+                )
+            }
+        }
+    )
+
+    private fun assistantResponseBlockSummaryText(
+        block: AssistantResponseBlock,
+    ): String = when (block) {
+        is AssistantResponseBlock.Text -> block.text.trim()
+        is AssistantResponseBlock.ToolGroup -> ChatMessage(
+            id = block.id,
+            author = MessageAuthor.Agent,
+            text = "",
+            toolInvocations = block.toolInvocations,
+        ).summaryText()
+    }
+
     private fun finalizeInterruptedToolInvocations(
         invocations: List<ChatToolInvocation>,
     ): List<ChatToolInvocation> = invocations.map { invocation ->
@@ -925,12 +1153,19 @@ class SessionExecutionManager(
         val lock = Any()
         val queuedInputs = ArrayDeque<PendingEnvelope>()
         val steerInputs = ArrayDeque<PendingEnvelope>()
+        private var pendingBlockCounter: Long = 0
 
         @Volatile
         var pauseRequested: Boolean = false
 
         @Volatile
         var job: Job? = null
+
+        fun nextPendingBlockId(prefix: String): String {
+            val nextId = pendingBlockCounter
+            pendingBlockCounter += 1
+            return "$prefix-$sessionId-$nextId"
+        }
     }
 }
 

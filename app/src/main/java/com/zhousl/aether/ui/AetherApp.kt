@@ -183,7 +183,7 @@ private fun AetherAppContent(
     val selectedMcpServerIds = activeSession?.activeMcpServerIds ?: uiState.draftSelectedMcpServerIds
     val agentModeSelected = activeSession?.agentModeEnabled ?: uiState.draftAgentModeEnabled
     val pendingToolInvocations = currentSessionExecution?.pendingToolInvocations.orEmpty()
-    val pendingAssistantText = currentSessionExecution?.pendingAssistantText.orEmpty()
+    val pendingResponseBlocks = currentSessionExecution?.pendingResponseBlocks.orEmpty()
     val pendingInputs = currentSessionExecution?.pendingInputs.orEmpty()
     val isCurrentSessionRunning = currentSessionExecution?.isRunning == true
     val currentWorkspaceDirectory = workspaceFileBridge.workspaceDirectory(uiState.currentSessionId)
@@ -432,8 +432,8 @@ private fun AetherAppContent(
                     workspaceDirectory = currentWorkspaceDirectory,
                     pendingToolInvocations = pendingToolInvocations,
                     pendingToolInvocationStateKey = "pending-tools-${uiState.currentSessionId}",
-                    pendingAssistantText = pendingAssistantText,
-                    pendingStatusText = uiState.pendingStatusText,
+                    pendingResponseBlocks = pendingResponseBlocks,
+                    pendingStatusText = currentSessionExecution?.pendingStatusText.orEmpty(),
                     pendingInputs = pendingInputs,
                     inputValue = uiState.draftInput,
                     draftAttachments = uiState.draftAttachments,

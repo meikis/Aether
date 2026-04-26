@@ -146,6 +146,24 @@ import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.delay
 import org.json.JSONObject
 
+private sealed interface ConversationListItem {
+    val key: String
+
+    data class Message(
+        val message: ChatMessage,
+    ) : ConversationListItem {
+        override val key: String = message.id
+    }
+
+    data class AssistantGroup(
+        val messages: List<ChatMessage>,
+    ) : ConversationListItem {
+        override val key: String = messages.firstOrNull()?.responseGroupId
+            ?: messages.firstOrNull()?.id
+            ?: "assistant-group"
+    }
+}
+
 private val ConversationTopFadeHeight = 42.dp
 private val DrawerOverlayFadeHeight = 18.dp
 private val ComposerCardShape = RoundedCornerShape(26.dp)
@@ -198,7 +216,7 @@ fun ConversationScreen(
     workspaceDirectory: String,
     pendingToolInvocations: List<ChatToolInvocation>,
     pendingToolInvocationStateKey: String,
-    pendingAssistantText: String,
+    pendingResponseBlocks: List<AssistantResponseBlock>,
     pendingStatusText: String,
     pendingInputs: List<PendingSessionInput>,
     inputValue: String,
@@ -248,6 +266,7 @@ fun ConversationScreen(
     isSending: Boolean,
 ) {
     val listState = rememberLazyListState()
+    val conversationItems = remember(messages) { buildConversationListItems(messages) }
     val bottomAnchorRequester = remember { BringIntoViewRequester() }
     var previewAttachment by remember { mutableStateOf<ChatAttachment?>(null) }
     var shouldAutoFollow by rememberSaveable { mutableStateOf(true) }
@@ -352,25 +371,51 @@ fun ConversationScreen(
                     ),
                     verticalArrangement = Arrangement.spacedBy(22.dp),
                 ) {
-                    items(messages, key = { it.id }) { message ->
-                        ConversationMessageBubble(
-                            message = message,
-                            actionsEnabled = !isSending,
-                            workspaceDirectory = workspaceDirectory,
-                            onOpenAttachment = { previewAttachment = it },
-                            onOpenLink = onOpenLink,
-                            onEdit = { onEditMessage(message.id) },
-                            onDelete = { onDeleteMessage(message.id) },
-                            onCopy = { onCopyMessage(message) },
-                            onRedo = { onRedoAgentMessage(message.id) },
-                            onRetry = { onRetryUserMessage(message.id) },
-                            onSwitchBranch = { delta -> onSwitchUserMessageBranch(message.id, delta) },
-                        )
+                    items(conversationItems, key = { it.key }) { item ->
+                        when (item) {
+                            is ConversationListItem.Message -> {
+                                val message = item.message
+                                ConversationMessageBubble(
+                                    message = message,
+                                    actionsEnabled = !isSending,
+                                    workspaceDirectory = workspaceDirectory,
+                                    onOpenAttachment = { previewAttachment = it },
+                                    onOpenLink = onOpenLink,
+                                    onEdit = { onEditMessage(message.id) },
+                                    onDelete = { onDeleteMessage(message.id) },
+                                    onCopy = { onCopyMessage(message) },
+                                    onRedo = { onRedoAgentMessage(message.id) },
+                                    onRetry = { onRetryUserMessage(message.id) },
+                                    onSwitchBranch = { delta -> onSwitchUserMessageBranch(message.id, delta) },
+                                )
+                            }
+
+                            is ConversationListItem.AssistantGroup -> {
+                                val lastMessage = item.messages.last()
+                                ConversationAssistantGroupBubble(
+                                    messages = item.messages,
+                                    actionsEnabled = !isSending,
+                                    workspaceDirectory = workspaceDirectory,
+                                    onOpenAttachment = { previewAttachment = it },
+                                    onOpenLink = onOpenLink,
+                                    onCopy = {
+                                        onCopyMessage(
+                                            lastMessage.copy(
+                                                text = item.messages.joinToString("\n\n") { message -> message.text }
+                                                    .trim(),
+                                            )
+                                        )
+                                    },
+                                    onRedo = { onRedoAgentMessage(lastMessage.id) },
+                                    onDelete = { onDeleteMessage(lastMessage.id) },
+                                )
+                            }
+                        }
                     }
                     items(pendingInputs, key = { it.id }) { pendingInput ->
                         PendingSessionInputBubble(pendingInput = pendingInput)
                     }
-                    if (pendingToolInvocations.isNotEmpty() || isSending) {
+                    if (pendingResponseBlocks.isNotEmpty() || pendingToolInvocations.isNotEmpty() || isSending) {
                         item(key = "pending-generation-block") {
                             Column(
                                 modifier = Modifier
@@ -378,37 +423,28 @@ fun ConversationScreen(
                                     .animateContentSize(),
                                 verticalArrangement = Arrangement.spacedBy(10.dp),
                             ) {
-                                val agentModePreviewVisible =
-                                    agentModeSelected ||
-                                    agentModeDisplayState.isActive ||
-                                    agentModeDisplayState.latestPreviewPath.isNotBlank()
-                                if (agentModePreviewVisible) {
-                                    AgentModePreviewPanel(
-                                        displayState = agentModeDisplayState,
-                                        toolInvocation = pendingToolInvocations.lastOrNull(),
-                                    )
-                                }
-                                if (pendingToolInvocations.isNotEmpty() && !agentModePreviewVisible) {
-                                    ToolInvocationList(
-                                        toolInvocations = pendingToolInvocations,
-                                        stateKey = pendingToolInvocationStateKey,
-                                        autoExpand = pendingAssistantText.isBlank(),
-                                    )
-                                }
+                                PendingAssistantTimeline(
+                                    blocks = pendingResponseBlocks,
+                                    workspaceDirectory = workspaceDirectory,
+                                    onOpenLink = onOpenLink,
+                                    pendingToolInvocationStateKey = pendingToolInvocationStateKey,
+                                    pendingToolInvocations = pendingToolInvocations,
+                                    agentModeSelected = agentModeSelected,
+                                    agentModeDisplayState = agentModeDisplayState,
+                                )
                                 if (isSending) {
-                                    if (pendingAssistantText.isNotBlank()) {
-                                        PendingAssistantResponseBlock(
-                                            text = pendingAssistantText,
-                                            workspaceDirectory = workspaceDirectory,
-                                            onOpenLink = onOpenLink,
+                                    if (pendingResponseBlocks.isEmpty() && pendingStatusText.isNotBlank()) {
+                                        ShimmerStatusText(
+                                            text = pendingStatusText,
+                                            modifier = Modifier.padding(top = 6.dp),
                                         )
+                                    } else if (pendingResponseBlocks.isEmpty()) {
+                                        ConversationThinkingIndicator()
                                     } else if (pendingStatusText.isNotBlank()) {
                                         ShimmerStatusText(
                                             text = pendingStatusText,
                                             modifier = Modifier.padding(top = 6.dp),
                                         )
-                                    } else {
-                                        ConversationThinkingIndicator()
                                     }
                                 }
                             }
@@ -701,6 +737,130 @@ private fun ConversationThinkingIndicator() {
         text = if (strings.appLanguage == AppLanguage.SimplifiedChinese) "思考中" else "Thinking",
         modifier = Modifier.padding(top = 6.dp),
     )
+}
+
+@Composable
+private fun PendingAssistantTimeline(
+    blocks: List<AssistantResponseBlock>,
+    workspaceDirectory: String,
+    onOpenLink: (String) -> Unit,
+    pendingToolInvocationStateKey: String,
+    pendingToolInvocations: List<ChatToolInvocation>,
+    agentModeSelected: Boolean,
+    agentModeDisplayState: AgentModeDisplayState,
+) {
+    if (blocks.isEmpty()) {
+        val agentModePreviewVisible =
+            pendingToolInvocations.isNotEmpty() &&
+                (agentModeSelected ||
+                    agentModeDisplayState.isActive ||
+                    agentModeDisplayState.latestPreviewPath.isNotBlank())
+        if (agentModePreviewVisible) {
+            AgentModePreviewPanel(
+                displayState = agentModeDisplayState,
+                toolInvocation = pendingToolInvocations.lastOrNull(),
+            )
+        } else if (pendingToolInvocations.isNotEmpty()) {
+            ToolInvocationList(
+                toolInvocations = pendingToolInvocations,
+                stateKey = pendingToolInvocationStateKey,
+                autoExpand = true,
+            )
+        }
+        return
+    }
+
+    blocks.forEachIndexed { index, block ->
+        when (block) {
+            is AssistantResponseBlock.Text -> PendingAssistantResponseBlock(
+                text = block.text,
+                workspaceDirectory = workspaceDirectory,
+                onOpenLink = onOpenLink,
+            )
+
+            is AssistantResponseBlock.ToolGroup -> {
+                val isLastBlock = index == blocks.lastIndex
+                val shouldShowAgentModePreview =
+                    isLastBlock &&
+                        (agentModeSelected ||
+                            agentModeDisplayState.isActive ||
+                            agentModeDisplayState.latestPreviewPath.isNotBlank()) &&
+                        block.toolInvocations.any { it.toolName.equals("agent_display", ignoreCase = true) }
+                if (shouldShowAgentModePreview) {
+                    AgentModePreviewPanel(
+                        displayState = agentModeDisplayState,
+                        toolInvocation = block.toolInvocations.lastOrNull(),
+                    )
+                } else {
+                    ToolInvocationList(
+                        toolInvocations = block.toolInvocations,
+                        stateKey = "$pendingToolInvocationStateKey-${block.id}",
+                        autoExpand = isLastBlock,
+                    )
+                }
+            }
+        }
+    }
+}
+
+private fun buildConversationListItems(
+    messages: List<ChatMessage>,
+): List<ConversationListItem> = buildList {
+    var index = 0
+    while (index < messages.size) {
+        val message = messages[index]
+        val responseGroupId = message.responseGroupId
+        if (
+            message.author == MessageAuthor.Agent &&
+            (!responseGroupId.isNullOrBlank() || isLegacyAssistantGroupStart(messages, index))
+        ) {
+            val groupedMessages = buildList {
+                var groupIndex = index
+                while (groupIndex < messages.size) {
+                    val candidate = messages[groupIndex]
+                    if (candidate.author != MessageAuthor.Agent) {
+                        break
+                    }
+                    val matchesGroup = if (!responseGroupId.isNullOrBlank()) {
+                        candidate.responseGroupId == responseGroupId
+                    } else {
+                        val offset = groupIndex - index
+                        candidate.responseGroupId.isNullOrBlank() &&
+                            candidate.createdAtMillis == message.createdAtMillis + offset
+                    }
+                    if (!matchesGroup) {
+                        break
+                    }
+                    add(candidate)
+                    groupIndex += 1
+                }
+            }
+            if (groupedMessages.isNotEmpty()) {
+                add(ConversationListItem.AssistantGroup(groupedMessages))
+                index += groupedMessages.size
+                continue
+            }
+        }
+        add(ConversationListItem.Message(message))
+        index += 1
+    }
+}
+
+private fun isLegacyAssistantGroupStart(
+    messages: List<ChatMessage>,
+    index: Int,
+): Boolean {
+    val message = messages.getOrNull(index) ?: return false
+    if (
+        message.author != MessageAuthor.Agent ||
+        !message.responseGroupId.isNullOrBlank()
+    ) {
+        return false
+    }
+    val next = messages.getOrNull(index + 1) ?: return false
+    return next.author == MessageAuthor.Agent &&
+        next.responseGroupId.isNullOrBlank() &&
+        next.createdAtMillis == message.createdAtMillis + 1
 }
 
 @Composable
