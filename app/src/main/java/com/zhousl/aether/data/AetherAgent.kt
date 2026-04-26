@@ -1540,43 +1540,38 @@ class AetherAgent(
                 )
                 put(
                     "parameters",
-                    JSONObject().apply {
-                        put("type", "object")
-                        put(
-                            "properties",
-                            JSONObject().apply {
-                                put(
-                                    "command",
-                                    JSONObject().apply {
-                                        put("type", "string")
-                                        put("description", "The bash command or script to execute.")
-                                    }
-                                )
-                                put(
-                                    "working_directory",
-                                    JSONObject().apply {
-                                        put("type", "string")
-                                        put(
-                                            "description",
-                                            "Optional working directory inside Termux, for example ~/.aether/workspaces/<session-id>."
-                                        )
-                                    }
-                                )
-                                put(
-                                    "workingDirectory",
-                                    JSONObject().apply {
-                                        put("type", "string")
-                                        put(
-                                            "description",
-                                            "Alias of working_directory."
-                                        )
-                                    }
-                                )
-                            }
-                        )
-                        put("required", JSONArray().put("command"))
-                        put("additionalProperties", false)
-                    }
+                    buildStrictToolParameters(
+                        properties = JSONObject().apply {
+                            put(
+                                "command",
+                                JSONObject().apply {
+                                    put("type", "string")
+                                    put("description", "The bash command or script to execute.")
+                                }
+                            )
+                            put(
+                                "working_directory",
+                                JSONObject().apply {
+                                    put("type", "string")
+                                    put(
+                                        "description",
+                                        "Optional working directory inside Termux, for example ~/.aether/workspaces/<session-id>."
+                                    )
+                                }
+                            )
+                            put(
+                                "workingDirectory",
+                                JSONObject().apply {
+                                    put("type", "string")
+                                    put(
+                                        "description",
+                                        "Alias of working_directory."
+                                    )
+                                }
+                            )
+                        },
+                        required = listOf("command"),
+                    )
                 )
                 put("strict", true)
             }
@@ -1837,15 +1832,10 @@ class AetherAgent(
                 put("description", description)
                 put(
                     "parameters",
-                    JSONObject().apply {
-                        put("type", "object")
-                        put("properties", properties)
-                        put(
-                            "required",
-                            JSONArray().apply { required.forEach(::put) },
-                        )
-                        put("additionalProperties", false)
-                    }
+                    buildStrictToolParameters(
+                        properties = properties,
+                        required = required,
+                    )
                 )
                 put("strict", true)
             }
@@ -1929,6 +1919,62 @@ internal fun shouldReconnectLlmRequest(throwable: Throwable): Boolean {
     }
     return false
 }
+
+internal fun buildStrictToolParameters(
+    properties: JSONObject,
+    required: List<String>,
+): JSONObject {
+    val requiredSet = required.toSet()
+    val normalizedProperties = JSONObject()
+    val normalizedRequired = JSONArray()
+    val iterator = properties.keys()
+
+    while (iterator.hasNext()) {
+        val propertyName = iterator.next()
+        normalizedRequired.put(propertyName)
+        val propertySchema = JSONObject(properties.getJSONObject(propertyName).toString())
+        normalizedProperties.put(
+            propertyName,
+            if (propertyName in requiredSet) {
+                propertySchema
+            } else {
+                makeSchemaNullable(propertySchema)
+            },
+        )
+    }
+
+    return JSONObject().apply {
+        put("type", "object")
+        put("properties", normalizedProperties)
+        put("required", normalizedRequired)
+        put("additionalProperties", false)
+    }
+}
+
+private fun makeSchemaNullable(schema: JSONObject): JSONObject =
+    JSONObject(schema.toString()).apply {
+        when (val typeValue = opt("type")) {
+            is String -> {
+                if (typeValue != "null") {
+                    put("type", JSONArray().put(typeValue).put("null"))
+                }
+            }
+
+            is JSONArray -> {
+                var hasNull = false
+                for (index in 0 until typeValue.length()) {
+                    if (typeValue.optString(index) == "null") {
+                        hasNull = true
+                        break
+                    }
+                }
+                if (!hasNull) {
+                    typeValue.put("null")
+                }
+                put("type", typeValue)
+            }
+        }
+    }
 
 private fun resolveReconnectDelayMillis(
     throwable: Throwable,
