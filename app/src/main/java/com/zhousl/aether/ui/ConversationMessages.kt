@@ -776,6 +776,84 @@ private fun AssistantMessageBlock(
 }
 
 @Composable
+fun ConversationAssistantGroupBubble(
+    messages: List<ChatMessage>,
+    actionsEnabled: Boolean,
+    workspaceDirectory: String?,
+    onOpenAttachment: (ChatAttachment) -> Unit,
+    onOpenLink: (String) -> Unit,
+    onCopy: () -> Unit,
+    onRedo: () -> Unit,
+    onDelete: () -> Unit,
+) {
+    if (messages.isEmpty()) return
+    val strings = rememberAetherStrings()
+    val thoughtDurationMillis = messages.lastOrNull()?.thoughtDurationMillis
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        thoughtDurationMillis?.let { duration ->
+            Text(
+                text = if (strings.appLanguage == AppLanguage.SimplifiedChinese) {
+                    "鎬濊€冧簡 ${formatThoughtDuration(duration)}"
+                } else {
+                    "Thought for ${formatThoughtDuration(duration)}"
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = AetherOnSurfaceVariant,
+            )
+        }
+        messages.forEach { message ->
+            val agentModeFrames = remember(message.toolInvocations) {
+                buildAgentModeReplayFrames(message.toolInvocations)
+            }
+            if (agentModeFrames.isNotEmpty()) {
+                AgentModeReplayPanel(
+                    frames = agentModeFrames,
+                    stateKey = "agent-mode-replay-${message.id}",
+                )
+            } else {
+                ToolInvocationList(
+                    toolInvocations = message.toolInvocations,
+                    stateKey = "message-tools-${message.id}",
+                )
+            }
+            AssistantAttachments(
+                attachments = message.attachments,
+                onOpenAttachment = onOpenAttachment,
+            )
+            if (message.text.isNotBlank()) {
+                MarkdownContent(
+                    markdown = message.text,
+                    workspaceDirectory = workspaceDirectory,
+                    onLinkClick = onOpenLink,
+                )
+            }
+        }
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            AssistantMessageAction(
+                icon = LucideIcons.Copy,
+                contentDescription = if (strings.appLanguage == AppLanguage.SimplifiedChinese) "澶嶅埗鍥炲" else "Copy reply",
+                onClick = onCopy,
+            )
+            AssistantMessageAction(
+                icon = LucideIcons.RotateCcw,
+                contentDescription = if (strings.appLanguage == AppLanguage.SimplifiedChinese) "閲嶆柊鎵ц鍥炲" else "Redo reply",
+                enabled = actionsEnabled,
+                onClick = onRedo,
+            )
+            AssistantMessageAction(
+                icon = LucideIcons.Trash2,
+                contentDescription = if (strings.appLanguage == AppLanguage.SimplifiedChinese) "鍒犻櫎鍥炲" else "Delete reply",
+                enabled = actionsEnabled,
+                onClick = onDelete,
+            )
+        }
+    }
+}
+
+@Composable
 private fun AgentModeReplayPanel(
     frames: List<AgentModeReplayFrame>,
     stateKey: String,

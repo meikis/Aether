@@ -125,6 +125,7 @@ private fun parseMessages(messages: JSONArray?): List<ChatMessage> {
                         null
                     },
                     branchGroup = parseBranchGroup(message.optJSONObject("branchGroup")),
+                    responseGroupId = message.optString("responseGroupId").ifBlank { null },
                 )
             )
         }
@@ -140,6 +141,7 @@ private fun ChatMessage.toJson(): JSONObject = JSONObject().apply {
     }
     thoughtDurationMillis?.let { put("thoughtDurationMillis", it) }
     branchGroup?.let { put("branchGroup", it.toJson()) }
+    responseGroupId?.let { put("responseGroupId", it) }
     put("toolInvocations", JSONArray().apply { toolInvocations.forEach { put(it.toJson()) } })
     put("attachments", JSONArray().apply { attachments.forEach { put(it.toJson()) } })
 }

@@ -147,6 +147,20 @@ data class ChatToolInvocation(
     val completedAtUptimeMillis: Long? = null,
 )
 
+sealed interface AssistantResponseBlock {
+    val id: String
+
+    data class Text(
+        override val id: String,
+        val text: String,
+    ) : AssistantResponseBlock
+
+    data class ToolGroup(
+        override val id: String,
+        val toolInvocations: List<ChatToolInvocation>,
+    ) : AssistantResponseBlock
+}
+
 data class ChatMessage(
     val id: String,
     val author: MessageAuthor,
@@ -156,6 +170,7 @@ data class ChatMessage(
     val toolInvocations: List<ChatToolInvocation> = emptyList(),
     val thoughtDurationMillis: Long? = null,
     val branchGroup: ChatBranchGroup? = null,
+    val responseGroupId: String? = null,
 )
 
 data class ChatSession(
@@ -190,6 +205,7 @@ data class AetherUiState(
     val isSending: Boolean = false,
     val pendingResponseSessionId: String? = null,
     val pendingToolInvocations: List<ChatToolInvocation> = emptyList(),
+    val pendingResponseBlocks: List<AssistantResponseBlock> = emptyList(),
     val pendingAssistantText: String = "",
     val pendingStatusText: String = "",
     val sessionExecutionStates: Map<String, SessionExecutionState> = emptyMap(),
@@ -274,6 +290,7 @@ class AetherViewModel(
                         isSending = currentExecution?.isRunning == true,
                         pendingResponseSessionId = currentExecution?.sessionId,
                         pendingToolInvocations = currentExecution?.pendingToolInvocations.orEmpty(),
+                        pendingResponseBlocks = currentExecution?.pendingResponseBlocks.orEmpty(),
                         pendingAssistantText = currentExecution?.pendingAssistantText.orEmpty(),
                         pendingStatusText = currentExecution?.pendingStatusText.orEmpty(),
                     )
@@ -290,6 +307,7 @@ class AetherViewModel(
                         isSending = currentExecution?.isRunning == true,
                         pendingResponseSessionId = currentExecution?.sessionId,
                         pendingToolInvocations = currentExecution?.pendingToolInvocations.orEmpty(),
+                        pendingResponseBlocks = currentExecution?.pendingResponseBlocks.orEmpty(),
                         pendingAssistantText = currentExecution?.pendingAssistantText.orEmpty(),
                         pendingStatusText = currentExecution?.pendingStatusText.orEmpty(),
                     )
@@ -835,7 +853,8 @@ class AetherViewModel(
             val messageIndex = session.messages.indexOfFirst { it.id == messageId }
             if (messageIndex < 0) return@update current
 
-            val trimmedMessages = session.messages.take(messageIndex)
+            val trimFromIndex = session.messages.resolveConversationTrimIndex(messageIndex)
+            val trimmedMessages = session.messages.take(trimFromIndex)
             val updatedSessions = current.sessions.toMutableList().apply {
                 removeAt(sessionIndex)
                 if (trimmedMessages.isNotEmpty()) {
@@ -906,7 +925,8 @@ class AetherViewModel(
             }
             if (messageIndex < 0) return@update current
 
-            val trimmedMessages = session.messages.take(messageIndex)
+            val trimFromIndex = session.messages.resolveConversationTrimIndex(messageIndex)
+            val trimmedMessages = session.messages.take(trimFromIndex)
             if (trimmedMessages.lastOrNull()?.author != MessageAuthor.User) {
                 return@update current
             }
@@ -2505,6 +2525,48 @@ class AetherViewModel(
         if (attachments.isEmpty()) return "Empty message"
         if (attachments.size == 1) return attachments.first().name
         return "${attachments.size} attachments"
+    }
+
+    private fun List<ChatMessage>.resolveConversationTrimIndex(
+        targetIndex: Int,
+    ): Int {
+        val targetMessage = getOrNull(targetIndex) ?: return targetIndex
+        val responseGroupId = targetMessage.responseGroupId
+        if (
+            targetMessage.author != MessageAuthor.Agent ||
+            responseGroupId.isNullOrBlank()
+        ) {
+            return targetIndex
+        }
+        if (responseGroupId.isNullOrBlank()) {
+            return resolveLegacyAssistantGroupStartIndex(targetIndex)
+        }
+        val groupStartIndex = indexOfFirst { message ->
+            message.author == MessageAuthor.Agent && message.responseGroupId == responseGroupId
+        }
+        return if (groupStartIndex >= 0) groupStartIndex else targetIndex
+    }
+
+    private fun List<ChatMessage>.resolveLegacyAssistantGroupStartIndex(
+        targetIndex: Int,
+    ): Int {
+        val targetMessage = getOrNull(targetIndex) ?: return targetIndex
+        if (targetMessage.author != MessageAuthor.Agent) return targetIndex
+        var groupStartIndex = targetIndex
+        var expectedCreatedAtMillis = targetMessage.createdAtMillis
+        while (groupStartIndex > 0) {
+            val previous = this[groupStartIndex - 1]
+            if (
+                previous.author != MessageAuthor.Agent ||
+                !previous.responseGroupId.isNullOrBlank() ||
+                previous.createdAtMillis != expectedCreatedAtMillis - 1
+            ) {
+                break
+            }
+            groupStartIndex -= 1
+            expectedCreatedAtMillis = previous.createdAtMillis
+        }
+        return groupStartIndex
     }
 
     private fun formatBytes(bytes: Long): String = when {
