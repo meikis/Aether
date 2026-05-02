@@ -39,6 +39,7 @@ data class TavilySearchRequest(
     val timeRange: String? = null,
     val includeAnswer: Boolean = true,
     val includeRawContent: Boolean = false,
+    val includeFavicon: Boolean = true,
     val includeDomains: List<String> = emptyList(),
     val excludeDomains: List<String> = emptyList(),
     val country: String? = null,
@@ -120,6 +121,7 @@ class WebToolsClient(
                 put("max_results", request.maxResults.coerceIn(1, 20))
                 put("include_answer", if (request.includeAnswer) "basic" else false)
                 put("include_raw_content", if (request.includeRawContent) "markdown" else false)
+                put("include_favicon", request.includeFavicon)
                 put("include_usage", true)
                 request.timeRange?.takeIf { it.isNotBlank() }?.let { put("time_range", it) }
                 request.country?.takeIf { it.isNotBlank() }?.let { put("country", it) }

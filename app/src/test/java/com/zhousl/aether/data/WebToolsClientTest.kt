@@ -101,6 +101,7 @@ class WebToolsClientTest {
             assertEquals("advanced", payload.getString("search_depth"))
             assertEquals("markdown", payload.getString("include_raw_content"))
             assertEquals("basic", payload.getString("include_answer"))
+            assertEquals(true, payload.getBoolean("include_favicon"))
             assertEquals("example.com", payload.getJSONArray("include_domains").getString(0))
         } finally {
             server.shutdown()

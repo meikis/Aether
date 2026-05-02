@@ -147,6 +147,7 @@ class AetherViewModel(
         }
 
         viewModelScope.launch {
+                        pendingStatusDetail = currentExecution?.pendingStatusDetail.orEmpty(),
             sessionExecutionManager.executionStates.collect { executionStates ->
                 _uiState.update { current ->
                     val currentExecution = executionStates[current.currentSessionId]
@@ -164,6 +165,7 @@ class AetherViewModel(
         }
 
         viewModelScope.launch {
+                        pendingStatusDetail = currentExecution?.pendingStatusDetail.orEmpty(),
             sessionExecutionManager.turnEvents.collect { event ->
                 handleTurnEvent(event)
             }
@@ -2503,6 +2505,16 @@ class AetherViewModel(
     private fun ChatMessage.summaryText(): String {
         val textSummary = text.trim()
         if (textSummary.isNotBlank()) return textSummary
+        reasoningTrace?.let { trace ->
+            trace.chunks.lastOrNull { it.detail.isNotBlank() || it.title.isNotBlank() }?.let { chunk ->
+                return chunk.detail.ifBlank { chunk.title }
+            }
+            return if (trace.toolInvocations.isNotEmpty()) {
+                "Thought and used ${trace.toolInvocations.size} tools"
+            } else {
+                "Thought"
+            }
+        }
         if (toolInvocations.isNotEmpty()) {
             return if (toolInvocations.size == 1) {
                 when (toolInvocations.first().toolName.lowercase()) {

@@ -66,6 +66,11 @@ data class AgentToolEvent(
     val outputJson: String? = null,
 )
 
+data class StreamingStatus(
+    val text: String,
+    val detail: String = "",
+)
+
 internal val LlmProvider.supportsParallelToolCallParameter: Boolean
     get() = this == LlmProvider.OpenAiResponses || this == LlmProvider.OpenAiCompatible
 

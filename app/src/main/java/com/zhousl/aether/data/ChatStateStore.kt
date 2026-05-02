@@ -1,21 +1,28 @@
 package com.zhousl.aether.data
 
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 
 class ChatStateStore(
-    scope: CoroutineScope,
+    private val scope: CoroutineScope,
     private val chatRepository: ChatRepository,
 ) {
     private val updateLock = Any()
+    private val persistMutex = Mutex()
     private val persistenceQueue = Channel<PendingPersistedChatState>(capacity = Channel.CONFLATED)
     private val _state = MutableStateFlow(PersistedChatState())
     private var localGeneration = 0L
     private var persistedGeneration = 0L
+    private var latestPending: PendingPersistedChatState? = null
 
     val state: StateFlow<PersistedChatState> = _state.asStateFlow()
 
@@ -30,16 +37,63 @@ class ChatStateStore(
             }
         }
         scope.launch {
-            for (pending in persistenceQueue) {
-                chatRepository.updateChatState(
-                    sessions = pending.state.sessions,
-                    currentSessionId = pending.state.currentSessionId,
-                )
-                synchronized(updateLock) {
-                    if (pending.generation > persistedGeneration) {
-                        persistedGeneration = pending.generation
-                    }
+            try {
+                for (pending in persistenceQueue) {
+                    persistPending(pending)
                 }
+            } finally {
+                withContext(NonCancellable) {
+                    flushLatestPending()
+                }
+            }
+        }
+    }
+
+    suspend fun flush() {
+        flushLatestPending()
+    }
+
+    suspend fun updateAndFlush(
+        transform: (PersistedChatState) -> PersistedChatState,
+    ): PersistedChatState {
+        val updated = update(transform)
+        flushLatestPending()
+        return updated
+    }
+
+    private suspend fun persistPending(pending: PendingPersistedChatState) {
+        persistMutex.withLock {
+            if (synchronized(updateLock) { pending.generation <= persistedGeneration }) {
+                return@withLock
+            }
+
+            chatRepository.updateChatState(
+                sessions = pending.state.sessions,
+                currentSessionId = pending.state.currentSessionId,
+            )
+            synchronized(updateLock) {
+                if (pending.generation > persistedGeneration) {
+                    persistedGeneration = pending.generation
+                }
+                val latest = latestPending
+                if (latest != null && latest.generation <= pending.generation) {
+                    latestPending = null
+                }
+            }
+        }
+    }
+
+    private suspend fun flushLatestPending() {
+        val pending = synchronized(updateLock) {
+            latestPending?.takeIf { it.generation > persistedGeneration }
+        } ?: return
+        persistPending(pending)
+    }
+
+    private fun persistWithoutQueue(pending: PendingPersistedChatState) {
+        scope.launch(Dispatchers.IO + NonCancellable) {
+            runCatching {
+                persistPending(pending)
             }
         }
     }
@@ -54,9 +108,14 @@ class ChatStateStore(
             PendingPersistedChatState(
                 generation = localGeneration,
                 state = updated,
-            )
+            ).also {
+                latestPending = it
+            }
         }
-        persistenceQueue.trySend(pending)
+        val sendResult = persistenceQueue.trySend(pending)
+        if (sendResult.isFailure) {
+            persistWithoutQueue(pending)
+        }
         return pending.state
     }
 

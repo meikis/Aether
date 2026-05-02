@@ -43,8 +43,10 @@ class AetherAgent(
         agentModeEnabled: Boolean = false,
         onToolEvent: suspend (AgentToolEvent) -> Unit = {},
         onAssistantTextDelta: suspend (String) -> Unit = {},
+        onAssistantReasoningDelta: suspend (String) -> Unit = {},
+        onAssistantReasoningSummaryDelta: suspend (String) -> Unit = {},
         onAssistantTextReset: suspend () -> Unit = {},
-        onStreamingStatus: suspend (String?) -> Unit = {},
+        onStreamingStatus: suspend (StreamingStatus?) -> Unit = {},
         onSkillActivated: suspend (ActiveSkillContext) -> Unit = {},
         pollInjectedUserMessages: suspend () -> List<LlmMessage> = { emptyList() },
     ): Result<String> {
@@ -156,6 +158,8 @@ class AetherAgent(
                         onParallelToolCallsUnsupported(parallelToolCallSupportKey)
                     },
                     onTextDelta = onAssistantTextDelta,
+                    onReasoningDelta = onAssistantReasoningDelta,
+                    onReasoningSummaryDelta = onAssistantReasoningSummaryDelta,
                     onTextReset = onAssistantTextReset,
                     onStreamingStatus = onStreamingStatus,
                 )
@@ -681,8 +685,10 @@ class AetherAgent(
         parallelToolCallsEnabled: Boolean,
         onParallelToolCallsUnsupported: suspend () -> Unit,
         onTextDelta: suspend (String) -> Unit,
+        onReasoningDelta: suspend (String) -> Unit,
+        onReasoningSummaryDelta: suspend (String) -> Unit,
         onTextReset: suspend () -> Unit,
-        onStreamingStatus: suspend (String?) -> Unit,
+        onStreamingStatus: suspend (StreamingStatus?) -> Unit,
     ): ChatCompletionResult {
         var reconnectFailures = 0
         var reconnectStatusVisible = false
@@ -703,6 +709,8 @@ class AetherAgent(
                     }
                     onTextDelta(delta)
                 },
+                onReasoningDelta = onReasoningDelta,
+                onReasoningSummaryDelta = onReasoningSummaryDelta,
                 onStreamActivity = {
                     if (reconnectStatusVisible) {
                         reconnectStatusVisible = false
@@ -738,11 +746,62 @@ class AetherAgent(
             if (receivedTextThisAttempt) {
                 onTextReset()
             }
-            reconnectStatusVisible = true
             val attemptNumber = reconnectFailures + 1
-            onStreamingStatus("Reconnecting... $attemptNumber/${LlmReconnectDelayScheduleMillis.size}")
-            delay(resolveReconnectDelayMillis(failure, reconnectFailures))
+            val reconnectDelayMillis = resolveReconnectDelayMillis(failure, reconnectFailures)
+            reconnectStatusVisible = true
+            onStreamingStatus(
+                StreamingStatus(
+                    text = "Reconnecting... $attemptNumber/${LlmReconnectDelayScheduleMillis.size}",
+                    detail = formatReconnectFailureDetail(
+                        throwable = failure,
+                        attemptNumber = attemptNumber,
+                        maxAttempts = LlmReconnectDelayScheduleMillis.size,
+                        delayMillis = reconnectDelayMillis,
+                    ),
+                )
+            )
+            delay(reconnectDelayMillis)
             reconnectFailures += 1
+        }
+    }
+
+    private fun formatReconnectFailureDetail(
+        throwable: Throwable,
+        attemptNumber: Int,
+        maxAttempts: Int,
+        delayMillis: Long,
+    ): String = buildString {
+        appendLine("Attempt $attemptNumber/$maxAttempts failed.")
+        appendLine("Retry delay: ${formatReconnectDelay(delayMillis)}")
+        append("Error: ")
+        append(formatThrowableSummary(throwable))
+
+        var cause = throwable.cause
+        var depth = 0
+        while (cause != null && cause !== throwable && depth < 3) {
+            appendLine()
+            append("Cause: ")
+            append(formatThrowableSummary(cause))
+            cause = cause.cause
+            depth += 1
+        }
+    }
+
+    private fun formatReconnectDelay(delayMillis: Long): String =
+        if (delayMillis % 1000L == 0L) {
+            "${delayMillis / 1000L}s"
+        } else {
+            "${delayMillis}ms"
+        }
+
+    private fun formatThrowableSummary(throwable: Throwable): String {
+        val type = throwable.javaClass.simpleName.ifBlank { "Throwable" }
+        val statusPrefix = (throwable as? LlmHttpException)?.let { "HTTP ${it.statusCode}: " }.orEmpty()
+        val message = throwable.message?.trim().orEmpty()
+        return if (message.isBlank()) {
+            "$statusPrefix$type"
+        } else {
+            "$statusPrefix$type: $message"
         }
     }
 
@@ -754,6 +813,8 @@ class AetherAgent(
         toolChoice: String?,
         parallelToolCallsEnabled: Boolean,
         onTextDelta: suspend (String) -> Unit,
+        onReasoningDelta: suspend (String) -> Unit,
+        onReasoningSummaryDelta: suspend (String) -> Unit,
         onStreamActivity: suspend () -> Unit,
     ): Result<ChatCompletionResult> = coroutineScope {
         val timeoutMillis = settings.llmInactivityReconnectTimeoutSeconds * 1000L
@@ -772,6 +833,8 @@ class AetherAgent(
                     null
                 },
                 onTextDelta = onTextDelta,
+                onReasoningDelta = onReasoningDelta,
+                onReasoningSummaryDelta = onReasoningSummaryDelta,
                 onStreamActivity = {
                     lastActivityAt.set(SystemClock.elapsedRealtime())
                     onStreamActivity()

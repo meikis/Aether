@@ -25,6 +25,7 @@ import okio.BufferedSource
 import org.json.JSONArray
 import org.json.JSONObject
 import org.json.JSONTokener
+import java.net.URI
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 import kotlin.math.roundToLong
@@ -44,6 +45,7 @@ class OpenAiCompatibleClient(
         tools: List<JSONObject> = emptyList(),
         toolChoice: String? = null,
         parallelToolCalls: Boolean? = null,
+        disableReasoning: Boolean = false,
     ): Result<ChatCompletionResult> = try {
         val request = when (settings.provider) {
             LlmProvider.OpenAiResponses -> buildOpenAiResponsesRequest(
@@ -53,6 +55,7 @@ class OpenAiCompatibleClient(
                 tools = tools,
                 toolChoice = toolChoice,
                 parallelToolCalls = parallelToolCalls,
+                disableReasoning = disableReasoning,
             )
 
             LlmProvider.OpenAiCompatible -> buildOpenAiRequest(
@@ -62,6 +65,7 @@ class OpenAiCompatibleClient(
                 tools = tools,
                 toolChoice = toolChoice,
                 parallelToolCalls = parallelToolCalls,
+                disableReasoning = disableReasoning,
             )
 
             LlmProvider.VertexExpress -> buildVertexRequest(
@@ -85,9 +89,7 @@ class OpenAiCompatibleClient(
         val json = parseJsonObject(responsePayload.bodyString)
 
         if (!responsePayload.isSuccessful) {
-            val errorMessage = json?.optJSONObject("error")?.optString("message")
-                ?: json?.optString("message")
-                ?: buildUnexpectedResponseMessage(responsePayload)
+            val errorMessage = extractLlmErrorMessage(json, responsePayload)
             throw buildLlmRequestException(responsePayload, errorMessage)
         }
 
@@ -117,6 +119,8 @@ class OpenAiCompatibleClient(
         toolChoice: String? = null,
         parallelToolCalls: Boolean? = null,
         onTextDelta: suspend (String) -> Unit = {},
+        onReasoningDelta: suspend (String) -> Unit = {},
+        onReasoningSummaryDelta: suspend (String) -> Unit = {},
         onStreamActivity: suspend () -> Unit = {},
     ): Result<ChatCompletionResult> = try {
         Result.success(
@@ -140,6 +144,8 @@ class OpenAiCompatibleClient(
                     toolChoice = toolChoice,
                     parallelToolCalls = parallelToolCalls,
                     onTextDelta = onTextDelta,
+                    onReasoningDelta = onReasoningDelta,
+                    onReasoningSummaryDelta = onReasoningSummaryDelta,
                     onStreamActivity = onStreamActivity,
                 )
 
@@ -347,6 +353,8 @@ class OpenAiCompatibleClient(
             assistantText = assistantText,
             toolCalls = toolCalls,
             assistantMessage = JSONObject(message.toString()),
+            reasoningText = extractOpenAiReasoningText(message),
+            reasoningSummaryText = extractReasoningDetailsSummary(message.optJSONArray("reasoning_details")),
         )
     }
 
@@ -600,9 +608,16 @@ class OpenAiCompatibleClient(
         toolChoice: String?,
         parallelToolCalls: Boolean?,
         onTextDelta: suspend (String) -> Unit,
+        onReasoningDelta: suspend (String) -> Unit,
+        onReasoningSummaryDelta: suspend (String) -> Unit,
         onStreamActivity: suspend () -> Unit,
     ): ChatCompletionResult {
-        val accumulator = OpenAiStreamAccumulator(onTextDelta)
+        val accumulator = OpenAiStreamAccumulator(
+            onTextDelta = onTextDelta,
+            onReasoningDelta = onReasoningDelta,
+            onReasoningSummaryDelta = onReasoningSummaryDelta,
+            includeEmptyReasoningContentForToolCalls = shouldIncludeEmptyReasoningContentForToolCalls(settings),
+        )
         return executeStreamingRequest(
             request = buildOpenAiRequest(
                 settings = settings,
@@ -686,6 +701,7 @@ class OpenAiCompatibleClient(
         toolChoice: String?,
         parallelToolCalls: Boolean?,
         stream: Boolean = false,
+        disableReasoning: Boolean = false,
     ): Request {
         val endpoint = buildOpenAiResponsesEndpoint(settings.baseUrl)
         val trimmedApiKey = settings.apiKey.trim()
@@ -728,6 +744,7 @@ class OpenAiCompatibleClient(
             if (stream) {
                 put("stream", true)
             }
+            putReasoningDisabledIfNeeded(settings, disableReasoning)
         }
 
         return Request.Builder()
@@ -755,6 +772,7 @@ class OpenAiCompatibleClient(
         toolChoice: String?,
         parallelToolCalls: Boolean?,
         stream: Boolean = false,
+        disableReasoning: Boolean = false,
     ): Request {
         val endpoint = buildOpenAiChatCompletionEndpoint(settings.baseUrl)
         val trimmedApiKey = settings.apiKey.trim()
@@ -800,6 +818,7 @@ class OpenAiCompatibleClient(
             if (stream) {
                 put("stream", true)
             }
+            putReasoningDisabledIfNeeded(settings, disableReasoning)
         }
 
         return Request.Builder()
@@ -1232,6 +1251,83 @@ class OpenAiCompatibleClient(
             "$hint$details"
     }
 
+    private fun extractLlmErrorMessage(
+        json: JSONObject?,
+        responsePayload: HttpResponsePayload,
+    ): String {
+        if (json == null) return buildUnexpectedResponseMessage(responsePayload)
+
+        json.optJSONObject("error")?.let { error ->
+            error.optString("message").trim().ifBlank { null }?.let { return it }
+            val type = error.optString("type").trim()
+            val code = error.opt("code")?.toString()?.trim().orEmpty()
+            val param = error.opt("param")?.toString()?.trim().orEmpty()
+            return buildString {
+                append("HTTP ${responsePayload.code}: upstream error")
+                if (type.isNotBlank()) append(" type=$type")
+                if (code.isNotBlank() && code != "null") append(" code=$code")
+                if (param.isNotBlank() && param != "null") append(" param=$param")
+                append(responsePreviewSuffix(responsePayload))
+            }
+        }
+
+        json.optString("message").trim().ifBlank { null }?.let { return it }
+        json.optString("error").trim().ifBlank { null }?.let { return it }
+        json.optString("detail").trim().ifBlank { null }?.let { return it }
+
+        return "HTTP ${responsePayload.code}: upstream returned an error without a message." +
+            responsePreviewSuffix(responsePayload)
+    }
+
+    private fun responsePreviewSuffix(responsePayload: HttpResponsePayload): String {
+        val preview = responsePayload.bodyString
+            .trim()
+            .replace(Regex("\\s+"), " ")
+            .take(240)
+        return if (preview.isBlank()) "" else " Response preview: $preview"
+    }
+
+    private fun shouldIncludeEmptyReasoningContentForToolCalls(settings: AppSettings): Boolean {
+        if (settings.provider != LlmProvider.OpenAiCompatible) return false
+        val host = runCatching {
+            URI(settings.baseUrl.trim()).host.orEmpty().lowercase()
+        }.getOrDefault("")
+        val model = settings.modelId.lowercase()
+        return "deepseek" in host || "deepseek" in model
+    }
+
+    private fun JSONObject.putReasoningDisabledIfNeeded(
+        settings: AppSettings,
+        disableReasoning: Boolean,
+    ) {
+        if (!disableReasoning) return
+        if (settings.provider != LlmProvider.OpenAiCompatible && settings.provider != LlmProvider.OpenAiResponses) return
+
+        val host = runCatching {
+            URI(settings.baseUrl.trim()).host.orEmpty().lowercase()
+        }.getOrDefault("")
+        val model = settings.modelId.lowercase()
+        when {
+            "openrouter" in host || "openrouter" in model -> {
+                put(
+                    "reasoning",
+                    JSONObject().apply {
+                        put("effort", "none")
+                    },
+                )
+            }
+
+            "deepseek" in host || "deepseek" in model -> {
+                put(
+                    "thinking",
+                    JSONObject().apply {
+                        put("type", "disabled")
+                    },
+                )
+            }
+        }
+    }
+
     private suspend fun executeStreamingRequest(
         request: Request,
         parseJsonResponse: (JSONObject) -> ChatCompletionResult,
@@ -1292,9 +1388,7 @@ class OpenAiCompatibleClient(
                         retryAfterHeader = response.header("Retry-After").orEmpty(),
                     )
                     val json = parseJsonObject(bodyString)
-                    val errorMessage = json?.optJSONObject("error")?.optString("message")
-                        ?: json?.optString("message")
-                        ?: buildUnexpectedResponseMessage(responsePayload)
+                    val errorMessage = extractLlmErrorMessage(json, responsePayload)
                     throw buildLlmRequestException(responsePayload, errorMessage)
                 }
 
@@ -1467,8 +1561,17 @@ internal fun preferredRetryDelayMillis(throwable: Throwable): Long? {
 
 private class OpenAiStreamAccumulator(
     private val onTextDelta: suspend (String) -> Unit,
+    private val onReasoningDelta: suspend (String) -> Unit,
+    private val onReasoningSummaryDelta: suspend (String) -> Unit,
+    private val includeEmptyReasoningContentForToolCalls: Boolean,
 ) {
     private val assistantText = StringBuilder()
+    private val reasoningContent = StringBuilder()
+    private var sawReasoningContent = false
+    private val reasoning = StringBuilder()
+    private val reasoningDetailsText = StringBuilder()
+    private val reasoningSummary = StringBuilder()
+    private val reasoningDetails = mutableListOf<JSONObject>()
     private val toolCalls = linkedMapOf<Int, MutableToolCallAccumulator>()
 
     suspend fun consume(chunk: JSONObject) {
@@ -1478,6 +1581,39 @@ private class OpenAiStreamAccumulator(
             val delta = choice.optJSONObject("delta")
                 ?: choice.optJSONObject("message")
                 ?: continue
+
+            val reasoningDelta = extractReasoningDelta(delta)
+            if (reasoningDelta.isNotEmpty()) {
+                reasoning.append(reasoningDelta)
+                onReasoningDelta(reasoningDelta)
+            }
+            val reasoningContentDelta = delta.optNullableString("reasoning_content")
+            if (reasoningContentDelta != null) {
+                sawReasoningContent = true
+            }
+            if (!reasoningContentDelta.isNullOrEmpty()) {
+                reasoningContent.append(reasoningContentDelta)
+                onReasoningDelta(reasoningContentDelta)
+            }
+            val reasoningDetailsDelta = delta.optJSONArray("reasoning_details")
+            if (reasoningDetailsDelta != null) {
+                for (index in 0 until reasoningDetailsDelta.length()) {
+                    val detail = reasoningDetailsDelta.optJSONObject(index) ?: continue
+                    reasoningDetails += JSONObject(detail.toString())
+                }
+                val reasoningDetailsSummaryDelta = extractReasoningDetailsSummary(reasoningDetailsDelta)
+                if (reasoningDetailsSummaryDelta.isNotEmpty()) {
+                    reasoningSummary.append(reasoningDetailsSummaryDelta)
+                    onReasoningSummaryDelta(reasoningDetailsSummaryDelta)
+                }
+                if (reasoningDelta.isEmpty() && reasoningContentDelta.isNullOrEmpty()) {
+                    val reasoningDetailsTextDelta = extractReasoningDetailsText(reasoningDetailsDelta)
+                    if (reasoningDetailsTextDelta.isNotEmpty()) {
+                        reasoningDetailsText.append(reasoningDetailsTextDelta)
+                        onReasoningDelta(reasoningDetailsTextDelta)
+                    }
+                }
+            }
 
             val textDelta = extractTextDelta(delta)
             if (textDelta.isNotEmpty()) {
@@ -1526,7 +1662,16 @@ private class OpenAiStreamAccumulator(
             assistantMessage = buildOpenAiAssistantMessage(
                 assistantText = resolvedText,
                 toolCalls = resolvedToolCalls,
+                reasoningContent = reasoningContent.toString().takeIf { it.isNotBlank() }
+                    ?: if (includeEmptyReasoningContentForToolCalls && sawReasoningContent && resolvedToolCalls.isNotEmpty()) "" else null,
+                reasoning = reasoning.toString(),
+                reasoningDetails = reasoningDetails,
             ),
+            reasoningText = reasoningContent.toString()
+                .ifBlank { reasoning.toString() }
+                .ifBlank { reasoningDetailsText.toString() }
+                .ifBlank { reasoningSummary.toString() },
+            reasoningSummaryText = reasoningSummary.toString(),
         )
     }
 }
@@ -1825,6 +1970,100 @@ private fun extractTextDelta(message: JSONObject): String =
         else -> ""
     }
 
+private fun extractReasoningDelta(message: JSONObject): String =
+    when (val value = message.opt("reasoning")) {
+        is String -> value
+        is JSONObject -> value.optNullableString("text")
+            .orEmpty()
+            .ifBlank { value.optNullableString("content").orEmpty() }
+        is JSONArray -> buildString {
+            for (index in 0 until value.length()) {
+                when (val item = value.opt(index)) {
+                    is JSONObject -> append(
+                        item.optNullableString("text")
+                            .orEmpty()
+                            .ifBlank { item.optNullableString("content").orEmpty() }
+                    )
+                    is String -> append(item)
+                }
+            }
+        }
+        else -> ""
+    }
+
+private fun extractOpenAiReasoningText(message: JSONObject): String =
+    message.optNullableString("reasoning_content").orEmpty()
+        .ifBlank { extractReasoningDelta(message) }
+        .ifBlank { extractReasoningDetailsText(message.optJSONArray("reasoning_details")) }
+        .ifBlank { extractReasoningDetailsSummary(message.optJSONArray("reasoning_details")) }
+
+private fun extractReasoningDetailsText(details: JSONArray?): String {
+    if (details == null) return ""
+    return buildString {
+        for (index in 0 until details.length()) {
+            val detail = details.optJSONObject(index) ?: continue
+            if (detail.optString("type") != "reasoning.text") continue
+            appendReasoningTextValue(detail.opt("text"))
+            appendReasoningTextValue(detail.opt("content"))
+        }
+    }
+}
+
+private fun extractReasoningDetailsSummary(details: JSONArray?): String {
+    if (details == null) return ""
+    return buildString {
+        for (index in 0 until details.length()) {
+            val detail = details.optJSONObject(index) ?: continue
+            if (detail.optString("type") != "reasoning.summary") continue
+            appendReasoningSummaryValue(detail.opt("summary"))
+        }
+    }
+}
+
+private fun StringBuilder.appendReasoningTextValue(value: Any?) {
+    when (value) {
+        is String -> append(value)
+        is JSONObject -> {
+            val text = value.optNullableString("text")
+                .orEmpty()
+                .ifBlank { value.optNullableString("content").orEmpty() }
+            append(text)
+        }
+        is JSONArray -> {
+            for (index in 0 until value.length()) {
+                appendReasoningTextValue(value.opt(index))
+            }
+        }
+    }
+}
+
+private fun StringBuilder.appendReasoningSummaryValue(value: Any?) {
+    when (value) {
+        is String -> append(value)
+        is JSONObject -> {
+            val text = value.optNullableString("text")
+                .orEmpty()
+                .ifBlank { value.optNullableString("content").orEmpty() }
+            append(text)
+        }
+        is JSONArray -> {
+            for (index in 0 until value.length()) {
+                appendReasoningSummaryValue(value.opt(index))
+            }
+        }
+    }
+}
+
+private fun JSONObject.optNullableString(key: String): String? {
+    if (!has(key) || isNull(key)) return null
+    val value = opt(key) ?: return null
+    return when (value) {
+        JSONObject.NULL -> null
+        is String -> value
+        else -> value.toString()
+    }
+}
+
 private fun buildOpenAiResponsesResult(output: JSONArray): ChatCompletionResult {
     val assistantText = StringBuilder()
     val toolCalls = mutableListOf<ChatCompletionToolCall>()
@@ -1900,12 +2139,29 @@ private fun buildAnthropicResultFromContent(
 private fun buildOpenAiAssistantMessage(
     assistantText: String,
     toolCalls: List<ChatCompletionToolCall>,
+    reasoningContent: String? = null,
+    reasoning: String = "",
+    reasoningDetails: List<JSONObject> = emptyList(),
 ): JSONObject = JSONObject().apply {
     put("role", "assistant")
     if (assistantText.isBlank() && toolCalls.isNotEmpty()) {
         put("content", JSONObject.NULL)
     } else {
         put("content", assistantText)
+    }
+    if (reasoningContent != null) {
+        put("reasoning_content", reasoningContent)
+    }
+    if (reasoning.isNotBlank()) {
+        put("reasoning", reasoning)
+    }
+    if (reasoningDetails.isNotEmpty()) {
+        put(
+            "reasoning_details",
+            JSONArray().apply {
+                reasoningDetails.forEach { detail -> put(JSONObject(detail.toString())) }
+            }
+        )
     }
     if (toolCalls.isNotEmpty()) {
         put(

@@ -83,8 +83,37 @@ data class ChatToolInvocation(
 sealed interface AssistantResponseBlock {
     val id: String
 
+    val startedAtMillis: Long = 0L,
+    val completedAtMillis: Long? = null,
+    val timelineOrder: Long = 0L,
     data class Text(
         override val id: String,
+data class ReasoningSummaryChunk(
+    val id: String,
+    val title: String = "",
+    val detail: String = "",
+    val rawText: String = "",
+    val isPending: Boolean = false,
+    val createdAtMillis: Long = 0L,
+    val timelineOrder: Long = 0L,
+)
+
+data class ReasoningTrace(
+    val id: String,
+    val rawText: String = "",
+    val chunks: List<ReasoningSummaryChunk> = emptyList(),
+    val toolInvocations: List<ChatToolInvocation> = emptyList(),
+    val latestStatusText: String = "",
+    val startedAtMillis: Long = 0L,
+    val completedAtMillis: Long? = null,
+) {
+    val hasSummary: Boolean
+        get() = chunks.any { it.title.isNotBlank() || it.detail.isNotBlank() }
+
+    val hasTimelineContent: Boolean
+        get() = chunks.isNotEmpty() || toolInvocations.isNotEmpty()
+}
+
         val text: String,
     ) : AssistantResponseBlock
 
@@ -97,6 +126,11 @@ sealed interface AssistantResponseBlock {
 data class ChatMessage(
     val id: String,
     val author: MessageAuthor,
+
+    data class Reasoning(
+        override val id: String,
+        val trace: ReasoningTrace,
+    ) : AssistantResponseBlock
     val text: String,
     val createdAtMillis: Long = 0L,
     val attachments: List<ChatAttachment> = emptyList(),
@@ -107,6 +141,7 @@ data class ChatMessage(
     val assistantActionsHidden: Boolean = false,
 )
 
+    val reasoningTrace: ReasoningTrace? = null,
 data class ChatSession(
     val id: String,
     val title: String,
@@ -158,6 +193,7 @@ data class AetherUiState(
     val termuxSetupState: TermuxSetupState = TermuxSetupState(),
     val rootSetupState: RootSetupState = RootSetupState(),
     val installedSkills: List<InstalledSkill> = emptyList(),
+    val pendingStatusDetail: String = "",
     val mcpServers: List<McpServerConfig> = emptyList(),
     val providerConfigs: List<LlmProviderConfig> = emptyList(),
     val isFetchingModels: Boolean = false,

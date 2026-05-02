@@ -12,6 +12,8 @@ import com.zhousl.aether.ui.ChatMessage
 import com.zhousl.aether.ui.ChatSession
 import com.zhousl.aether.ui.ChatToolInvocation
 import com.zhousl.aether.ui.MessageAuthor
+import com.zhousl.aether.ui.ReasoningSummaryChunk
+import com.zhousl.aether.ui.ReasoningTrace
 import com.zhousl.aether.ui.syncActiveBranches
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
@@ -19,6 +21,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 private const val DraftSessionId = "draft"
+private const val PersistedReasoningRawTextMaxChars = 12_000
 
 private val Context.chatDataStore by preferencesDataStore(name = "aether_chats")
 
@@ -152,6 +155,7 @@ private fun parseMessages(messages: JSONArray?): List<ChatMessage> {
                     } else {
                         null
                     },
+                    reasoningTrace = parseReasoningTrace(message.optJSONObject("reasoningTrace")),
                     branchGroup = parseBranchGroup(message.optJSONObject("branchGroup")),
                     responseGroupId = message.optString("responseGroupId").ifBlank { null },
                     assistantActionsHidden = message.optBoolean("assistantActionsHidden"),
@@ -169,6 +173,7 @@ private fun ChatMessage.toJson(): JSONObject = JSONObject().apply {
         put("createdAtMillis", createdAtMillis)
     }
     thoughtDurationMillis?.let { put("thoughtDurationMillis", it) }
+    reasoningTrace?.let { put("reasoningTrace", it.toJson()) }
     branchGroup?.let { put("branchGroup", it.toJson()) }
     responseGroupId?.let { put("responseGroupId", it) }
     if (assistantActionsHidden) {
@@ -252,6 +257,64 @@ private fun ChatAttachment.toJson(): JSONObject = JSONObject().apply {
     sizeBytes?.let { put("sizeBytes", it) }
 }
 
+private fun parseReasoningTrace(json: JSONObject?): ReasoningTrace? {
+    if (json == null) return null
+    val id = json.optString("id").ifBlank { "reasoning-${json.optString("startedAtMillis")}" }
+    return ReasoningTrace(
+        id = id,
+        rawText = json.optString("rawText"),
+        chunks = parseReasoningSummaryChunks(json.optJSONArray("chunks")),
+        toolInvocations = parseToolInvocations(json.optJSONArray("toolInvocations")),
+        latestStatusText = json.optString("latestStatusText"),
+        startedAtMillis = json.optLong("startedAtMillis"),
+        completedAtMillis = if (json.has("completedAtMillis")) {
+            json.optLong("completedAtMillis")
+        } else {
+            null
+        },
+    )
+}
+
+private fun ReasoningTrace.toJson(): JSONObject = JSONObject().apply {
+    put("id", id)
+    put("rawText", if (hasSummary) "" else rawText.take(PersistedReasoningRawTextMaxChars))
+    put("latestStatusText", latestStatusText)
+    put("startedAtMillis", startedAtMillis)
+    completedAtMillis?.let { put("completedAtMillis", it) }
+    put("chunks", JSONArray().apply { chunks.forEach { put(it.toJson()) } })
+    put("toolInvocations", JSONArray().apply { toolInvocations.forEach { put(it.toJson()) } })
+}
+
+private fun parseReasoningSummaryChunks(chunks: JSONArray?): List<ReasoningSummaryChunk> {
+    if (chunks == null) return emptyList()
+    return buildList {
+        for (index in 0 until chunks.length()) {
+            val chunk = chunks.optJSONObject(index) ?: continue
+            add(
+                ReasoningSummaryChunk(
+                    id = chunk.optString("id").ifBlank { "reasoning-summary-$index" },
+                    title = chunk.optString("title"),
+                    detail = chunk.optString("detail"),
+                    rawText = chunk.optString("rawText"),
+                    isPending = chunk.optBoolean("isPending"),
+                    createdAtMillis = chunk.optLong("createdAtMillis"),
+                    timelineOrder = chunk.optLong("timelineOrder"),
+                )
+            )
+        }
+    }
+}
+
+private fun ReasoningSummaryChunk.toJson(): JSONObject = JSONObject().apply {
+    put("id", id)
+    put("title", title)
+    put("detail", detail)
+    put("rawText", if (title.isNotBlank() || detail.isNotBlank()) "" else rawText.take(PersistedReasoningRawTextMaxChars))
+    put("isPending", isPending)
+    put("createdAtMillis", createdAtMillis)
+    put("timelineOrder", timelineOrder)
+}
+
 private fun parseToolInvocations(toolInvocations: JSONArray?): List<ChatToolInvocation> {
     if (toolInvocations == null) return emptyList()
 
@@ -271,6 +334,13 @@ private fun parseToolInvocations(toolInvocations: JSONArray?): List<ChatToolInvo
                     } else {
                         null
                     },
+                    startedAtMillis = toolInvocation.optLong("startedAtMillis"),
+                    completedAtMillis = if (toolInvocation.has("completedAtMillis")) {
+                        toolInvocation.optLong("completedAtMillis")
+                    } else {
+                        null
+                    },
+                    timelineOrder = toolInvocation.optLong("timelineOrder"),
                 )
             )
         }
@@ -285,6 +355,9 @@ private fun ChatToolInvocation.toJson(): JSONObject = JSONObject().apply {
     put("isRunning", isRunning)
     put("startedAtUptimeMillis", startedAtUptimeMillis)
     completedAtUptimeMillis?.let { put("completedAtUptimeMillis", it) }
+    put("startedAtMillis", startedAtMillis)
+    completedAtMillis?.let { put("completedAtMillis", it) }
+    put("timelineOrder", timelineOrder)
 }
 
 private fun parseStringList(array: JSONArray?): List<String> {

@@ -48,9 +48,6 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.lazy.rememberLazyListState
-import androidx.compose.foundation.relocation.BringIntoViewRequester
-import androidx.compose.foundation.relocation.bringIntoViewRequester
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
@@ -190,12 +187,20 @@ internal fun pendingGenerationIndicator(
     isSending: Boolean,
     pendingAssistantText: String,
     pendingStatusText: String,
+    hasVisiblePendingReasoning: Boolean = false,
 ): PendingGenerationIndicator = when {
     !isSending -> PendingGenerationIndicator.None
     pendingStatusText.isNotBlank() -> PendingGenerationIndicator.Status
+    hasVisiblePendingReasoning -> PendingGenerationIndicator.None
     pendingAssistantText.isBlank() -> PendingGenerationIndicator.Thinking
     else -> PendingGenerationIndicator.None
 }
+
+internal fun hasVisibleReasoningStatus(trace: ReasoningTrace): Boolean =
+    trace.latestStatusText.isNotBlank() ||
+        trace.rawText.isNotBlank() ||
+        trace.hasTimelineContent ||
+        trace.completedAtMillis != null
 
 private fun topOverlayBodyGradient(): Brush = Brush.verticalGradient(
     colorStops = arrayOf(
@@ -218,6 +223,7 @@ private fun topOverlayTailGradient(): Brush = Brush.verticalGradient(
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun ConversationScreen(
+    conversationStateKey: String,
     messages: List<ChatMessage>,
     workspaceDirectory: String,
     pendingToolInvocations: List<ChatToolInvocation>,
@@ -225,6 +231,7 @@ fun ConversationScreen(
     pendingResponseBlocks: List<AssistantResponseBlock>,
     pendingAssistantText: String,
     pendingStatusText: String,
+    pendingStatusDetail: String,
     pendingInputs: List<PendingSessionInput>,
     inputValue: String,
     draftAttachments: List<ChatAttachment>,
@@ -276,11 +283,10 @@ fun ConversationScreen(
     onDismissStarterPromptHint: () -> Unit,
     isSending: Boolean,
 ) {
-    val listState = rememberLazyListState()
+    val listState = remember(conversationStateKey) { LazyListState() }
     val conversationItems = remember(messages) { buildConversationListItems(messages) }
-    val bottomAnchorRequester = remember { BringIntoViewRequester() }
     var previewAttachment by remember { mutableStateOf<ChatAttachment?>(null) }
-    var shouldAutoFollow by rememberSaveable { mutableStateOf(true) }
+    var shouldAutoFollow by rememberSaveable(conversationStateKey) { mutableStateOf(true) }
     var topBarBodyHeightPx by remember { mutableIntStateOf(0) }
     var composerBodyHeightPx by remember { mutableIntStateOf(0) }
     var pendingGenerationHeightPx by remember { mutableIntStateOf(0) }
@@ -324,6 +330,13 @@ fun ConversationScreen(
         }
     }
 
+    suspend fun scrollToConversationBottom() {
+        val lastItemIndex = listState.layoutInfo.totalItemsCount - 1
+        if (lastItemIndex >= 0) {
+            listState.scrollToItem(lastItemIndex)
+        }
+    }
+
     LaunchedEffect(listState, shouldAutoFollow, animatedImeBottomPx, composerBodyHeightPx) {
         if (!shouldAutoFollow) return@LaunchedEffect
         snapshotFlow {
@@ -338,8 +351,12 @@ fun ConversationScreen(
         }
             .distinctUntilChanged()
             .collect {
-                if (shouldAutoFollow && listState.layoutInfo.totalItemsCount > 0) {
-                    bottomAnchorRequester.bringIntoView()
+                if (
+                    shouldAutoFollow &&
+                    !listState.isScrollInProgress &&
+                    listState.layoutInfo.totalItemsCount > 0
+                ) {
+                    scrollToConversationBottom()
                 }
             }
     }
@@ -350,6 +367,7 @@ fun ConversationScreen(
         pendingAssistantText,
         pendingToolInvocations,
         pendingStatusText,
+        pendingStatusDetail,
         isSending,
     ) {
         buildString {
@@ -367,6 +385,22 @@ fun ConversationScreen(
                         ) { invocation ->
                             "${invocation.id}:${invocation.isRunning}:${invocation.outputJson.length}"
                         }
+                        is AssistantResponseBlock.Reasoning -> buildString {
+                            append("${block.id}:reasoning:")
+                            append(block.trace.rawText.length)
+                            append(':')
+                            append(block.trace.latestStatusText.length)
+                            append(':')
+                            append(block.trace.completedAtMillis ?: 0L)
+                            append(':')
+                            append(block.trace.chunks.joinToString(",") { chunk ->
+                                "${chunk.id}:${chunk.title.length}:${chunk.detail.length}:${chunk.isPending}:${chunk.timelineOrder}"
+                            })
+                            append(':')
+                            append(block.trace.toolInvocations.joinToString(",") { invocation ->
+                                "${invocation.id}:${invocation.isRunning}:${invocation.outputJson.length}:${invocation.startedAtMillis}:${invocation.completedAtMillis ?: 0L}:${invocation.timelineOrder}"
+                            })
+                        }
                     }
                 }
             )
@@ -381,6 +415,8 @@ fun ConversationScreen(
             append('|')
             append(pendingStatusText)
             append('|')
+            append(pendingStatusDetail)
+            append('|')
             append(isSending)
         }
     }
@@ -393,8 +429,8 @@ fun ConversationScreen(
     ) {
         if (!shouldAutoFollow || listState.layoutInfo.totalItemsCount == 0) return@LaunchedEffect
         withFrameNanos { }
-        if (shouldAutoFollow) {
-            bottomAnchorRequester.bringIntoView()
+        if (shouldAutoFollow && !listState.isScrollInProgress) {
+            scrollToConversationBottom()
         }
     }
 
@@ -487,6 +523,10 @@ fun ConversationScreen(
                                 isSending = isSending,
                                 pendingAssistantText = pendingAssistantText,
                                 pendingStatusText = pendingStatusText,
+                                hasVisiblePendingReasoning = pendingResponseBlocks.any {
+                                    it is AssistantResponseBlock.Reasoning &&
+                                        hasVisibleReasoningStatus(it.trace)
+                                },
                             )
                             Column(
                                 modifier = Modifier
@@ -511,8 +551,9 @@ fun ConversationScreen(
                                     }
 
                                     PendingGenerationIndicator.Status -> {
-                                        ShimmerStatusText(
+                                        ReconnectingStatusCard(
                                             text = pendingStatusText,
+                                            detail = pendingStatusDetail,
                                             modifier = Modifier.padding(top = 6.dp),
                                         )
                                     }
@@ -530,7 +571,6 @@ fun ConversationScreen(
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .height(1.dp)
-                                .bringIntoViewRequester(bottomAnchorRequester)
                         )
                     }
                 }
@@ -1033,6 +1073,15 @@ private fun PendingAssistantTimeline(
                         toolInvocations = block.toolInvocations,
                         stateKey = "$pendingToolInvocationStateKey-${block.id}",
                         autoExpand = isLastBlock,
+                    )
+                }
+            }
+
+            is AssistantResponseBlock.Reasoning -> {
+                if (hasVisibleReasoningStatus(block.trace)) {
+                    ReasoningTraceStatus(
+                        trace = block.trace,
+                        onOpenLink = onOpenLink,
                     )
                 }
             }

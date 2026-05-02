@@ -62,6 +62,377 @@ class OpenAiCompatibleClientStreamingTest {
     }
 
     @Test
+    fun streamChatCompletionPreservesReasoningContentForAssistantMessage() = runBlocking {
+        val server = MockWebServer()
+        server.enqueue(
+            MockResponse()
+                .addHeader("Content-Type", "text/event-stream")
+                .setBody(
+                    """
+                    data: {"choices":[{"delta":{"reasoning_content":"I should read the file first. "}}]}
+
+                    data: {"choices":[{"delta":{"reasoning_content":"Then answer from evidence."}}]}
+
+                    data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"read","arguments":"{\"path\":\"README.md\"}"}}]}}]}
+
+                    data: [DONE]
+
+                    """.trimIndent()
+                )
+        )
+        server.start()
+
+        try {
+            val settings = AppSettings(
+                provider = LlmProvider.OpenAiCompatible,
+                apiKey = "test-key",
+                baseUrl = server.url("/v1").toString(),
+                modelId = "deepseek-v4",
+            )
+            val reasoningDeltas = StringBuilder()
+
+            val result = client.streamChatCompletion(
+                settings = settings,
+                systemPrompt = "",
+                conversation = listOf(
+                    JSONObject().apply {
+                        put("role", "user")
+                        put("content", "Read README.md")
+                    }
+                ),
+                onReasoningDelta = { reasoningDeltas.append(it) },
+            ).getOrThrow()
+
+            val expectedReasoning = "I should read the file first. Then answer from evidence."
+            assertEquals(expectedReasoning, reasoningDeltas.toString())
+            assertEquals(expectedReasoning, result.reasoningText)
+            assertEquals(expectedReasoning, result.assistantMessage.getString("reasoning_content"))
+            assertEquals(JSONObject.NULL, result.assistantMessage.get("content"))
+            assertEquals("read", result.toolCalls.single().name)
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun streamChatCompletionPreservesEmptyDeepSeekReasoningContentForToolCalls() = runBlocking {
+        val server = MockWebServer()
+        server.enqueue(
+            MockResponse()
+                .addHeader("Content-Type", "text/event-stream")
+                .setBody(
+                    """
+                    data: {"choices":[{"delta":{"reasoning_content":""}}]}
+
+                    data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"read","arguments":"{\"path\":\"README.md\"}"}}]}}]}
+
+                    data: [DONE]
+
+                    """.trimIndent()
+                )
+        )
+        server.start()
+
+        try {
+            val settings = AppSettings(
+                provider = LlmProvider.OpenAiCompatible,
+                apiKey = "test-key",
+                baseUrl = server.url("/v1").toString(),
+                modelId = "deepseek-v4-flash",
+            )
+
+            val result = client.streamChatCompletion(
+                settings = settings,
+                systemPrompt = "",
+                conversation = listOf(
+                    JSONObject().apply {
+                        put("role", "user")
+                        put("content", "Read README.md")
+                    }
+                ),
+            ).getOrThrow()
+
+            assertTrue(result.assistantMessage.has("reasoning_content"))
+            assertEquals("", result.assistantMessage.getString("reasoning_content"))
+            assertEquals("read", result.toolCalls.single().name)
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun streamChatCompletionIgnoresNullReasoningContentOnBodyDeltas() = runBlocking {
+        val server = MockWebServer()
+        server.enqueue(
+            MockResponse()
+                .addHeader("Content-Type", "text/event-stream")
+                .setBody(
+                    """
+                    data: {"choices":[{"delta":{"reasoning_content":"I can greet the user."}}]}
+
+                    data: {"choices":[{"delta":{"reasoning_content":null,"content":"Hi"}}]}
+
+                    data: {"choices":[{"delta":{"reasoning_content":null,"content":"!"}}]}
+
+                    data: [DONE]
+
+                    """.trimIndent()
+                )
+        )
+        server.start()
+
+        try {
+            val settings = AppSettings(
+                provider = LlmProvider.OpenAiCompatible,
+                apiKey = "test-key",
+                baseUrl = server.url("/v1").toString(),
+                modelId = "deepseek-v4-flash",
+            )
+            val reasoningDeltas = mutableListOf<String>()
+            val textDeltas = mutableListOf<String>()
+
+            val result = client.streamChatCompletion(
+                settings = settings,
+                systemPrompt = "",
+                conversation = listOf(
+                    JSONObject().apply {
+                        put("role", "user")
+                        put("content", "Hi")
+                    }
+                ),
+                onReasoningDelta = { reasoningDeltas += it },
+                onTextDelta = { textDeltas += it },
+            ).getOrThrow()
+
+            assertEquals(listOf("I can greet the user."), reasoningDeltas)
+            assertEquals(listOf("Hi", "!"), textDeltas)
+            assertEquals("Hi!", result.assistantText)
+            assertEquals("I can greet the user.", result.reasoningText)
+            assertEquals("I can greet the user.", result.assistantMessage.getString("reasoning_content"))
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun streamChatCompletionPreservesOpenRouterReasoningDetails() = runBlocking {
+        val server = MockWebServer()
+        server.enqueue(
+            MockResponse()
+                .addHeader("Content-Type", "text/event-stream")
+                .setBody(
+                    """
+                    data: {"choices":[{"delta":{"reasoning":"Checking docs.","reasoning_details":[{"type":"reasoning.text","text":"Checking docs.","signature":"sig_1"}]}}]}
+
+                    data: {"choices":[{"delta":{"content":"Done."}}]}
+
+                    data: [DONE]
+
+                    """.trimIndent()
+                )
+        )
+        server.start()
+
+        try {
+            val settings = AppSettings(
+                provider = LlmProvider.OpenAiCompatible,
+                apiKey = "test-key",
+                baseUrl = server.url("/v1").toString(),
+                modelId = "openrouter/reasoning-model",
+            )
+            val rawReasoningDeltas = StringBuilder()
+            val summaryReasoningDeltas = StringBuilder()
+
+            val result = client.streamChatCompletion(
+                settings = settings,
+                systemPrompt = "",
+                conversation = listOf(
+                    JSONObject().apply {
+                        put("role", "user")
+                        put("content", "Check docs")
+                    }
+                ),
+                onReasoningDelta = { rawReasoningDeltas.append(it) },
+                onReasoningSummaryDelta = { summaryReasoningDeltas.append(it) },
+            ).getOrThrow()
+
+            assertEquals("Done.", result.assistantText)
+            assertEquals("Checking docs.", rawReasoningDeltas.toString())
+            assertEquals("", summaryReasoningDeltas.toString())
+            assertEquals("Checking docs.", result.reasoningText)
+            assertEquals("", result.reasoningSummaryText)
+            assertEquals("Checking docs.", result.assistantMessage.getString("reasoning"))
+            val detail = result.assistantMessage
+                .getJSONArray("reasoning_details")
+                .getJSONObject(0)
+            assertEquals("sig_1", detail.getString("signature"))
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun streamChatCompletionUsesReasoningDetailsTextAsRawReasoningWhenTopLevelReasoningIsMissing() = runBlocking {
+        val server = MockWebServer()
+        server.enqueue(
+            MockResponse()
+                .addHeader("Content-Type", "text/event-stream")
+                .setBody(
+                    """
+                    data: {"choices":[{"delta":{"reasoning_details":[{"type":"reasoning.text","text":"Checking docs from raw reasoning details.","signature":"sig_1"}]}}]}
+
+                    data: {"choices":[{"delta":{"content":"Done."}}]}
+
+                    data: [DONE]
+
+                    """.trimIndent()
+                )
+        )
+        server.start()
+
+        try {
+            val settings = AppSettings(
+                provider = LlmProvider.OpenAiCompatible,
+                apiKey = "test-key",
+                baseUrl = server.url("/v1").toString(),
+                modelId = "openrouter/raw-reasoning-model",
+            )
+            val rawReasoningDeltas = StringBuilder()
+            val summaryReasoningDeltas = StringBuilder()
+
+            val result = client.streamChatCompletion(
+                settings = settings,
+                systemPrompt = "",
+                conversation = listOf(
+                    JSONObject().apply {
+                        put("role", "user")
+                        put("content", "Check docs")
+                    }
+                ),
+                onReasoningDelta = { rawReasoningDeltas.append(it) },
+                onReasoningSummaryDelta = { summaryReasoningDeltas.append(it) },
+            ).getOrThrow()
+
+            assertEquals("Done.", result.assistantText)
+            assertEquals("Checking docs from raw reasoning details.", rawReasoningDeltas.toString())
+            assertEquals("", summaryReasoningDeltas.toString())
+            assertEquals("Checking docs from raw reasoning details.", result.reasoningText)
+            assertEquals("", result.reasoningSummaryText)
+            assertEquals("reasoning.text", result.assistantMessage
+                .getJSONArray("reasoning_details")
+                .getJSONObject(0)
+                .getString("type"))
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun streamChatCompletionUsesReasoningDetailsSummaryAsVisibleReasoningSummary() = runBlocking {
+        val server = MockWebServer()
+        server.enqueue(
+            MockResponse()
+                .addHeader("Content-Type", "text/event-stream")
+                .setBody(
+                    """
+                    data: {"choices":[{"delta":{"reasoning_details":[{"type":"reasoning.summary","summary":[{"type":"summary_text","text":"Checking official docs before answering."}]}]}}]}
+
+                    data: {"choices":[{"delta":{"content":"Done."}}]}
+
+                    data: [DONE]
+
+                    """.trimIndent()
+                )
+        )
+        server.start()
+
+        try {
+            val settings = AppSettings(
+                provider = LlmProvider.OpenAiCompatible,
+                apiKey = "test-key",
+                baseUrl = server.url("/v1").toString(),
+                modelId = "openrouter/reasoning-summary-model",
+            )
+            val rawReasoningDeltas = StringBuilder()
+            val summaryReasoningDeltas = StringBuilder()
+
+            val result = client.streamChatCompletion(
+                settings = settings,
+                systemPrompt = "",
+                conversation = listOf(
+                    JSONObject().apply {
+                        put("role", "user")
+                        put("content", "Check docs")
+                    }
+                ),
+                onReasoningDelta = { rawReasoningDeltas.append(it) },
+                onReasoningSummaryDelta = { summaryReasoningDeltas.append(it) },
+            ).getOrThrow()
+
+            assertEquals("Done.", result.assistantText)
+            assertEquals("", rawReasoningDeltas.toString())
+            assertEquals("Checking official docs before answering.", summaryReasoningDeltas.toString())
+            assertEquals("Checking official docs before answering.", result.reasoningText)
+            assertEquals("Checking official docs before answering.", result.reasoningSummaryText)
+            assertEquals("reasoning.summary", result.assistantMessage
+                .getJSONArray("reasoning_details")
+                .getJSONObject(0)
+                .getString("type"))
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun streamChatCompletionReportsErrorJsonWithoutMessage() = runBlocking {
+        val server = MockWebServer()
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(400)
+                .addHeader("Content-Type", "application/json")
+                .setBody(
+                    """
+                    {
+                      "error": {
+                        "type": "invalid_request_error",
+                        "code": "missing_reasoning_content",
+                        "param": "messages"
+                      }
+                    }
+                    """.trimIndent()
+                )
+        )
+        server.start()
+
+        try {
+            val settings = AppSettings(
+                provider = LlmProvider.OpenAiCompatible,
+                apiKey = "test-key",
+                baseUrl = server.url("/v1").toString(),
+                modelId = "deepseek-v4-flash",
+            )
+
+            val result = client.streamChatCompletion(
+                settings = settings,
+                systemPrompt = "",
+                conversation = listOf(
+                    JSONObject().apply {
+                        put("role", "user")
+                        put("content", "Hello")
+                    }
+                ),
+            )
+
+            assertTrue(result.isFailure)
+            val message = result.exceptionOrNull()?.message.orEmpty()
+            assertTrue(message.contains("missing_reasoning_content"))
+            assertTrue(message.contains("invalid_request_error"))
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
     fun streamChatCompletionFailsAfterInactivityTimeoutWithoutAnyResponseActivity() = runBlocking {
         val server = MockWebServer()
         server.enqueue(

@@ -36,8 +36,10 @@ import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -58,16 +60,22 @@ import androidx.compose.material.icons.automirrored.rounded.KeyboardArrowRight
 import androidx.compose.material.icons.automirrored.rounded.ArrowForwardIos
 import androidx.compose.material.icons.automirrored.rounded.OpenInNew
 import androidx.compose.material.icons.rounded.AttachFile
+import androidx.compose.material.icons.rounded.Build
+import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.ContentCopy
 import androidx.compose.material.icons.rounded.Description
 import androidx.compose.material.icons.rounded.Download
 import androidx.compose.material.icons.rounded.Edit
+import androidx.compose.material.icons.rounded.Language
 import androidx.compose.material.icons.rounded.Image
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Settings
+import androidx.compose.material.icons.rounded.Terminal
 import androidx.compose.material3.Icon
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -130,6 +138,10 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.io.File
+import java.net.HttpURLConnection
+import java.net.IDN
+import java.net.URI
+import java.net.URL
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
@@ -144,8 +156,17 @@ private const val StreamingChunkFadeDurationMillis = 400
 private const val StreamingInitialChunkFadeDurationMillis = 600
 private const val StreamingCjkChunkLength = 1
 private const val StreamingFallbackChunkLength = 18
+private const val FaviconFetchTimeoutMillis = 3_000
+private const val TavilyFallbackDomain = "tavily.com"
+private const val DefaultFaviconUserAgent =
+    "Mozilla/5.0 (Linux; Android 15) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Mobile Safari/537.36"
 private val ToolTransitionEasing = CubicBezierEasing(0.22f, 0.84f, 0.18f, 1f)
 private val ToolGroupIndent = 14.dp
+private val TimelineGlyphWidth = 22.dp
+private val TimelineIconSize = 18.dp
+private val TimelineLineWidth = 2.dp
+private val TimelineLineTopGap = 9.dp
+private val TimelineLineBottomGap = 0.dp
 private val MessageTimestampFormatter = DateTimeFormatter.ofPattern("MMMM d, h:mm a", Locale.US)
 
 @Composable
@@ -750,23 +771,30 @@ private fun AssistantMessageBlock(
         val agentModeFrames = remember(message.toolInvocations) {
             buildAgentModeReplayFrames(message.toolInvocations)
         }
-        message.thoughtDurationMillis?.let { duration ->
-            Text(
-                text = if (strings.appLanguage == AppLanguage.SimplifiedChinese) {
-                    "思考了 ${formatThoughtDuration(duration)}"
-                } else {
-                    "Thought for ${formatThoughtDuration(duration)}"
-                },
-                style = MaterialTheme.typography.bodySmall,
-                color = AetherOnSurfaceVariant,
+        if (message.reasoningTrace != null) {
+            ReasoningTraceStatus(
+                trace = message.reasoningTrace,
+                onOpenLink = onOpenLink,
             )
+        } else {
+            message.thoughtDurationMillis?.let { duration ->
+                Text(
+                    text = if (strings.appLanguage == AppLanguage.SimplifiedChinese) {
+                        "鎬濊€冧簡 ${formatThoughtDuration(duration)}"
+                    } else {
+                        "Thought for ${formatThoughtDuration(duration)}"
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = AetherOnSurfaceVariant,
+                )
+            }
         }
-        if (agentModeFrames.isNotEmpty()) {
+        if (message.reasoningTrace == null && agentModeFrames.isNotEmpty()) {
             AgentModeReplayPanel(
                 frames = agentModeFrames,
                 stateKey = "agent-mode-replay-${message.id}",
             )
-        } else {
+        } else if (message.reasoningTrace == null) {
             ToolInvocationList(
                 toolInvocations = message.toolInvocations,
                 stateKey = "message-tools-${message.id}",
@@ -823,12 +851,13 @@ fun ConversationAssistantGroupBubble(
     if (messages.isEmpty()) return
     val strings = rememberAetherStrings()
     val thoughtDurationMillis = messages.lastOrNull()?.thoughtDurationMillis
+    val hasReasoningTrace = messages.any { it.reasoningTrace != null }
     val showActions = messages.none { it.assistantActionsHidden }
     Column(
         modifier = Modifier.fillMaxWidth(),
         verticalArrangement = Arrangement.spacedBy(10.dp),
     ) {
-        thoughtDurationMillis?.let { duration ->
+        if (!hasReasoningTrace) thoughtDurationMillis?.let { duration ->
             Text(
                 text = if (strings.appLanguage == AppLanguage.SimplifiedChinese) {
                     "思考了 ${formatThoughtDuration(duration)}"
@@ -843,7 +872,12 @@ fun ConversationAssistantGroupBubble(
             val agentModeFrames = remember(message.toolInvocations) {
                 buildAgentModeReplayFrames(message.toolInvocations)
             }
-            if (agentModeFrames.isNotEmpty()) {
+            if (message.reasoningTrace != null) {
+                ReasoningTraceStatus(
+                    trace = message.reasoningTrace,
+                    onOpenLink = onOpenLink,
+                )
+            } else if (agentModeFrames.isNotEmpty()) {
                 AgentModeReplayPanel(
                     frames = agentModeFrames,
                     stateKey = "agent-mode-replay-${message.id}",
@@ -1038,7 +1072,9 @@ fun ToolInvocationList(
     if (toolInvocations.isEmpty()) return
 
     if (toolInvocations.size < ToolInvocationCollapseThreshold) {
-        ToolInvocationCardsColumn(toolInvocations = toolInvocations)
+        ToolInvocationCardsColumn(
+            toolInvocations = toolInvocations,
+        )
         return
     }
 
@@ -1429,12 +1465,647 @@ fun ShimmerStatusText(
     )
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun ReasoningTraceStatus(
+    trace: ReasoningTrace,
+    modifier: Modifier = Modifier,
+    onOpenLink: (String) -> Unit = {},
+) {
+    val strings = rememberAetherStrings()
+    var sheetVisible by remember(trace.id) { mutableStateOf(false) }
+    val latestDetail = remember(trace.latestStatusText, trace.chunks) {
+        trace.latestStatusText.ifBlank {
+            trace.chunks.lastOrNull { it.detail.isNotBlank() || it.title.isNotBlank() }
+            ?.let { chunk -> chunk.detail.ifBlank { chunk.title } }
+            .orEmpty()
+        }
+    }
+    val completed = trace.completedAtMillis != null
+    val statusText = if (completed) {
+        formatReasoningTraceDoneLabel(strings, trace)
+    } else {
+        latestDetail
+    }
+
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(top = 6.dp)
+            .noRippleClickable { sheetVisible = true },
+        verticalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        when {
+            completed -> Text(
+                text = statusText,
+                style = MaterialTheme.typography.bodyMedium,
+                color = AetherOnSurfaceVariant,
+            )
+
+            statusText.isNotBlank() -> ReasoningTypewriterText(
+                text = statusText,
+                styleColor = AetherOnSurfaceVariant,
+            )
+
+            else -> ShimmerStatusText(
+                text = "Thinking",
+            )
+        }
+    }
+
+    if (sheetVisible) {
+        ModalBottomSheet(
+            onDismissRequest = { sheetVisible = false },
+            containerColor = AetherSurface,
+            contentColor = AetherOnSurface,
+            dragHandle = {
+                Box(
+                    modifier = Modifier
+                        .padding(top = 10.dp, bottom = 8.dp)
+                        .width(56.dp)
+                        .height(5.dp)
+                        .clip(RoundedCornerShape(999.dp))
+                        .background(AetherOnSurfaceVariant.copy(alpha = 0.16f))
+                )
+            },
+        ) {
+            ReasoningTraceSheetContent(
+                trace = trace,
+                onOpenLink = onOpenLink,
+            )
+        }
+    }
+}
+
+@Composable
+private fun ReasoningTypewriterText(
+    text: String,
+    styleColor: Color,
+) {
+    var rendered by remember(text) { mutableStateOf("") }
+    LaunchedEffect(text) {
+        if (text.isBlank()) {
+            rendered = ""
+            return@LaunchedEffect
+        }
+        if (!text.startsWith(rendered)) {
+            rendered = ""
+        }
+        while (rendered.length < text.length) {
+            val nextEnd = (rendered.length + 3).coerceAtMost(text.length)
+            rendered = text.substring(0, nextEnd)
+            delay(18)
+        }
+    }
+    Text(
+        text = rendered.ifBlank { text },
+        style = MaterialTheme.typography.bodyMedium,
+        color = styleColor,
+    )
+}
+
+@Composable
+private fun ReasoningTraceSheetContent(
+    trace: ReasoningTrace,
+    onOpenLink: (String) -> Unit,
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .heightIn(max = 640.dp)
+            .verticalScroll(rememberScrollState())
+            .padding(start = 24.dp, top = 10.dp, end = 24.dp, bottom = 30.dp),
+        verticalArrangement = Arrangement.spacedBy(14.dp),
+    ) {
+        if (trace.hasTimelineContent || trace.completedAtMillis != null) {
+            ReasoningTimeline(
+                trace = trace,
+                onOpenLink = onOpenLink,
+            )
+        } else {
+            RawReasoningPanel(rawText = trace.rawText)
+        }
+    }
+}
+
+@Composable
+private fun RawReasoningPanel(
+    rawText: String,
+) {
+    val displayText = remember(rawText) {
+        rawText.ifBlank { "Waiting for reasoning..." }.let { text ->
+            if (text.length <= 12_000) text else text.take(12_000).trimEnd() + "\n..."
+        }
+    }
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text(
+            text = "Raw reasoning",
+            style = MaterialTheme.typography.labelMedium,
+            color = AetherOnSurfaceVariant,
+        )
+        SelectionContainer {
+            Text(
+                text = displayText,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(18.dp))
+                    .background(AetherSurfaceHigh)
+                    .padding(14.dp),
+                style = MaterialTheme.typography.bodyMedium,
+                color = AetherOnSurfaceVariant,
+            )
+        }
+    }
+}
+
+@Composable
+private fun ReasoningTimeline(
+    trace: ReasoningTrace,
+    onOpenLink: (String) -> Unit,
+) {
+    val timelineItems = remember(trace.chunks, trace.toolInvocations) {
+        reasoningTimelineItems(trace)
+    }
+    val hasDoneChunk = trace.completedAtMillis != null
+    Column(verticalArrangement = Arrangement.spacedBy(0.dp)) {
+        timelineItems.forEachIndexed { index, item ->
+            val isLast = !hasDoneChunk && index == timelineItems.lastIndex
+            when (item) {
+                is ReasoningTimelineItem.Summary -> ReasoningTimelineRow(
+                    title = item.chunk.title.ifBlank { "Summarizing reasoning" },
+                    detail = when {
+                        item.chunk.detail.isNotBlank() -> item.chunk.detail
+                        else -> "Preparing a short visible summary."
+                    },
+                    isLast = isLast,
+                )
+
+                is ReasoningTimelineItem.Tool -> ReasoningTimelineToolRow(
+                    toolInvocation = item.toolInvocation,
+                    isLast = isLast,
+                    onOpenLink = onOpenLink,
+                )
+            }
+        }
+        if (hasDoneChunk) {
+            ReasoningTimelineDoneRow(trace = trace)
+        }
+    }
+}
+
+internal sealed interface ReasoningTimelineItem {
+    val sortOrder: Long
+    val fallbackOrder: Int
+
+    data class Summary(
+        val chunk: ReasoningSummaryChunk,
+        override val sortOrder: Long,
+        override val fallbackOrder: Int,
+    ) : ReasoningTimelineItem
+
+    data class Tool(
+        val toolInvocation: ChatToolInvocation,
+        override val sortOrder: Long,
+        override val fallbackOrder: Int,
+    ) : ReasoningTimelineItem
+}
+
+internal fun reasoningTimelineItems(trace: ReasoningTrace): List<ReasoningTimelineItem> {
+    val visibleChunks = trace.chunks.filter {
+        it.title.isNotBlank() || it.detail.isNotBlank() || it.isPending || it.rawText.isNotBlank()
+    }
+    val items = buildList {
+        visibleChunks.forEachIndexed { index, chunk ->
+            add(
+                ReasoningTimelineItem.Summary(
+                    chunk = chunk,
+                    sortOrder = chunk.timelineOrder
+                        .takeIf { it > 0L }
+                        ?: chunk.createdAtMillis.takeIf { it > 0L }
+                        ?: Long.MAX_VALUE,
+                    fallbackOrder = index,
+                )
+            )
+        }
+        trace.toolInvocations.forEachIndexed { index, invocation ->
+            add(
+                ReasoningTimelineItem.Tool(
+                    toolInvocation = invocation,
+                    sortOrder = invocation.timelineOrder
+                        .takeIf { it > 0L }
+                        ?: invocation.startedAtMillis.takeIf { it > 0L }
+                        ?: Long.MAX_VALUE,
+                    fallbackOrder = visibleChunks.size + index,
+                )
+            )
+        }
+    }
+
+    return items.sortedWith(
+        compareBy<ReasoningTimelineItem> { it.sortOrder }
+            .thenBy { it.fallbackOrder }
+    )
+}
+
+@Composable
+private fun ReasoningTimelineRow(
+    title: String,
+    detail: String,
+    isLast: Boolean,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(IntrinsicSize.Min),
+        horizontalArrangement = Arrangement.spacedBy(14.dp),
+    ) {
+        TimelineGlyph(isLast = isLast)
+        Column(
+            modifier = Modifier
+                .weight(1f)
+                .padding(bottom = if (isLast) 0.dp else 22.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            Text(
+                text = title,
+                style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Medium),
+                color = AetherOnSurface,
+            )
+            if (detail.isNotBlank()) {
+                Text(
+                    text = detail,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = AetherOnSurfaceVariant,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun ReasoningTimelineToolRow(
+    toolInvocation: ChatToolInvocation,
+    isLast: Boolean,
+    onOpenLink: (String) -> Unit,
+) {
+    val strings = rememberAetherStrings()
+    val arguments = remember(toolInvocation.argumentsJson) { parseJsonObject(toolInvocation.argumentsJson) }
+    val output = remember(toolInvocation.outputJson) { parseJsonObject(toolInvocation.outputJson) }
+    val title = remember(toolInvocation, strings.appLanguage) {
+        strings.toolInvocationTitleLabel(toolInvocation.toolName, toolInvocation.isRunning, arguments)
+    }
+    val webSourceMetadata = remember(toolInvocation.toolName, toolInvocation.argumentsJson, toolInvocation.outputJson) {
+        webSourceMetadata(toolInvocation.toolName, arguments, output)
+    }
+
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(IntrinsicSize.Min),
+        horizontalArrangement = Arrangement.spacedBy(14.dp),
+    ) {
+        TimelineGlyph(
+            icon = reasoningToolIcon(toolInvocation.toolName),
+            isLast = isLast,
+        )
+        Column(
+            modifier = Modifier
+                .weight(1f)
+                .padding(bottom = if (isLast) 0.dp else 18.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            if (toolInvocation.isRunning) {
+                ShimmerStatusText(
+                    text = title,
+                    travelDurationMillis = 3200,
+                    pauseDurationMillis = 1000,
+                )
+            } else {
+                Text(
+                    text = title,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = AetherOnSurface,
+                )
+            }
+            webSourceMetadata?.let { metadata ->
+                WebSourcePill(
+                    metadata = metadata,
+                    onOpenLink = onOpenLink,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun ReasoningTimelineDoneRow(
+    trace: ReasoningTrace,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(IntrinsicSize.Min),
+        horizontalArrangement = Arrangement.spacedBy(14.dp),
+    ) {
+        TimelineGlyph(
+            icon = Icons.Rounded.CheckCircle,
+            isLast = true,
+        )
+        Column(
+            modifier = Modifier.weight(1f),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            Text(
+                text = formatReasoningTraceDoneChunkTitle(trace),
+                style = MaterialTheme.typography.bodyMedium,
+                color = AetherOnSurface,
+            )
+            Text(
+                text = "Done",
+                style = MaterialTheme.typography.bodyMedium,
+                color = AetherOnSurfaceVariant,
+            )
+        }
+    }
+}
+
+@Composable
+private fun TimelineGlyph(
+    icon: ImageVector? = null,
+    isLast: Boolean,
+) {
+    Box(
+        modifier = Modifier
+            .width(TimelineGlyphWidth)
+            .fillMaxHeight(),
+        contentAlignment = Alignment.TopCenter,
+    ) {
+        if (!isLast) {
+            Box(
+                modifier = Modifier
+                    .padding(
+                        top = TimelineIconSize + TimelineLineTopGap,
+                        bottom = TimelineLineBottomGap,
+                    )
+                    .width(TimelineLineWidth)
+                    .fillMaxHeight()
+                    .clip(RoundedCornerShape(999.dp))
+                    .background(AetherOnSurfaceVariant.copy(alpha = 0.12f))
+            )
+        }
+        if (icon != null) {
+            Icon(
+                imageVector = icon,
+                contentDescription = null,
+                tint = AetherOnSurfaceVariant,
+                modifier = Modifier.size(TimelineIconSize),
+            )
+        } else {
+            Box(
+                modifier = Modifier
+                    .padding(top = 5.dp)
+                    .size(8.dp)
+                    .clip(CircleShape)
+                    .background(AetherOnSurfaceVariant)
+            )
+        }
+    }
+}
+
+private fun reasoningToolIcon(toolName: String): ImageVector = when (toolName.lowercase()) {
+    "bash", "fetch_bash_output", "kill_bash" -> Icons.Rounded.Terminal
+    "fetch_web_url", "tavily_search" -> Icons.Rounded.Language
+    else -> Icons.Rounded.Build
+}
+
+@Composable
+private fun WebSourcePill(
+    metadata: WebSourceMetadata,
+    onOpenLink: (String) -> Unit,
+) {
+    val favicon = rememberRemoteBitmap(metadata.faviconUrl)
+    Row(
+        modifier = Modifier
+            .clip(RoundedCornerShape(999.dp))
+            .background(AetherSurfaceHigh.copy(alpha = 0.72f))
+            .noRippleClickable { onOpenLink(metadata.url) }
+            .padding(start = 10.dp, top = 7.dp, end = 12.dp, bottom = 7.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(7.dp),
+    ) {
+        if (favicon != null) {
+            Image(
+                bitmap = favicon,
+                contentDescription = null,
+                modifier = Modifier
+                    .size(16.dp)
+                    .clip(CircleShape),
+                contentScale = ContentScale.Fit,
+            )
+        } else {
+            Icon(
+                imageVector = Icons.Rounded.Language,
+                contentDescription = null,
+                tint = AetherOnSurfaceVariant,
+                modifier = Modifier.size(16.dp),
+            )
+        }
+        Text(
+            text = metadata.domain,
+            style = MaterialTheme.typography.bodyMedium,
+            color = AetherOnSurfaceVariant,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+    }
+}
+
+@Composable
+private fun rememberRemoteBitmap(
+    url: String?,
+): ImageBitmap? {
+    val bitmap by produceState<ImageBitmap?>(initialValue = null, url) {
+        value = withContext(Dispatchers.IO) {
+            val sourceUrl = url?.takeIf { it.isNotBlank() } ?: return@withContext null
+            runCatching {
+                val connection = (URL(sourceUrl).openConnection() as HttpURLConnection).apply {
+                    connectTimeout = FaviconFetchTimeoutMillis
+                    readTimeout = FaviconFetchTimeoutMillis
+                    instanceFollowRedirects = true
+                    setRequestProperty("User-Agent", DefaultFaviconUserAgent)
+                    setRequestProperty("Accept", "image/avif,image/webp,image/png,image/svg+xml,image/*;q=0.8,*/*;q=0.5")
+                }
+                connection.inputStream.use { stream ->
+                    BitmapFactory.decodeStream(stream)?.asImageBitmap()
+                }
+            }.getOrNull()
+        }
+    }
+    return bitmap
+}
+
+private fun webSourceMetadata(
+    toolName: String,
+    arguments: JSONObject?,
+    output: JSONObject?,
+): WebSourceMetadata? = when (toolName.lowercase()) {
+    "fetch_web_url" -> {
+        val sourceUrl = output?.optString("final_url").orEmpty()
+            .ifBlank { output?.optString("request_url").orEmpty() }
+            .ifBlank { arguments?.optString("url").orEmpty() }
+        webSourceMetadataFromUrl(sourceUrl)
+    }
+    "tavily_search" -> tavilySourceMetadata(arguments, output)
+    else -> null
+}
+
+private fun tavilySourceMetadata(
+    arguments: JSONObject?,
+    output: JSONObject?,
+): WebSourceMetadata {
+    val result = output?.optJSONArray("results")?.let { results ->
+        (0 until results.length())
+            .asSequence()
+            .mapNotNull(results::optJSONObject)
+            .firstOrNull { it.optString("url").isNotBlank() || it.optString("favicon").isNotBlank() }
+    }
+    val resultUrl = result?.optString("url").orEmpty()
+    val argumentDomain = firstSearchArgumentDomain(arguments)
+    val domain = normalizedDomain(resultUrl)
+        .ifBlank { argumentDomain }
+        .ifBlank { TavilyFallbackDomain }
+    val url = normalizedHttpUrl(resultUrl)
+        .ifBlank { normalizedHttpUrl(domain) }
+        .ifBlank { "https://$TavilyFallbackDomain" }
+    val faviconUrl = result?.optString("favicon").orEmpty()
+        .takeIf { (it.startsWith("http://") || it.startsWith("https://")) && !it.endsWith(".svg", ignoreCase = true) }
+        ?: faviconUrlForDomain(domain)
+    return WebSourceMetadata(
+        domain = domain,
+        url = url,
+        faviconUrl = faviconUrl,
+    )
+}
+
+private fun webSourceMetadataFromUrl(url: String): WebSourceMetadata? {
+    val domain = normalizedDomain(url)
+    if (domain.isBlank()) return null
+    return WebSourceMetadata(
+        domain = domain,
+        url = normalizedHttpUrl(url).ifBlank { "https://$domain" },
+        faviconUrl = faviconUrlForDomain(domain),
+    )
+}
+
+private fun firstSearchArgumentDomain(arguments: JSONObject?): String {
+    val includeDomains = arguments?.optJSONArray("include_domains")
+        ?: arguments?.optJSONArray("includeDomains")
+    if (includeDomains != null) {
+        for (index in 0 until includeDomains.length()) {
+            val domain = normalizedDomain(includeDomains.optString(index))
+            if (domain.isNotBlank()) return domain
+        }
+    }
+
+    val query = arguments?.optString("query").orEmpty()
+    val domainPattern = Regex("""(?:site:)?([A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z]{2,})(?:/[^\s]*)?""")
+    return domainPattern.find(query)
+        ?.groupValues
+        ?.getOrNull(1)
+        ?.let(::normalizedDomain)
+        .orEmpty()
+}
+
+private fun normalizedDomain(urlOrDomain: String): String {
+    val trimmed = urlOrDomain.trim()
+    if (trimmed.isBlank()) return ""
+    val candidate = if (trimmed.contains("://")) trimmed else "https://$trimmed"
+    val host = runCatching { URI(candidate).host }
+        .getOrNull()
+        .orEmpty()
+        .ifBlank { trimmed.substringBefore('/').substringBefore('?').substringBefore('#') }
+        .trim('.')
+    if (host.isBlank()) return ""
+    return runCatching { IDN.toUnicode(host) }
+        .getOrDefault(host)
+        .removePrefix("www.")
+        .lowercase(Locale.US)
+}
+
+private fun normalizedHttpUrl(urlOrDomain: String): String {
+    val trimmed = urlOrDomain.trim()
+    if (trimmed.isBlank()) return ""
+    val candidate = if (trimmed.contains("://")) trimmed else "https://$trimmed"
+    val uri = runCatching { URI(candidate) }.getOrNull() ?: return ""
+    val scheme = uri.scheme?.lowercase(Locale.US).orEmpty()
+    if (scheme != "http" && scheme != "https") return ""
+    val host = uri.host.orEmpty()
+    if (host.isBlank()) return ""
+    return uri.toString()
+}
+
+private fun faviconUrlForDomain(domain: String): String =
+    "https://www.google.com/s2/favicons?domain=${Uri.encode(domain)}&sz=64"
+
+@Composable
+fun ReconnectingStatusCard(
+    text: String,
+    detail: String,
+    modifier: Modifier = Modifier,
+) {
+    val strings = rememberAetherStrings()
+    var expanded by rememberSaveable(text, detail) { mutableStateOf(false) }
+    LaunchedEffect(detail) {
+        if (detail.isBlank()) {
+            expanded = false
+        }
+    }
+
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .animateContentSize(
+                animationSpec = tween(durationMillis = ToolTransitionDurationMillis, easing = ToolTransitionEasing),
+            )
+            .noRippleClickable(enabled = detail.isNotBlank()) { expanded = !expanded },
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        ShimmerStatusText(text = text)
+
+        AnimatedVisibility(
+            visible = expanded && detail.isNotBlank(),
+            enter = expandVertically(
+                animationSpec = tween(durationMillis = ToolTransitionDurationMillis, easing = ToolTransitionEasing),
+                expandFrom = Alignment.Top,
+            ) + fadeIn(
+                animationSpec = tween(
+                    durationMillis = ToolTransitionDurationMillis - 90,
+                    delayMillis = 40,
+                    easing = ToolTransitionEasing,
+                ),
+            ),
+            exit = shrinkVertically(
+                animationSpec = tween(durationMillis = 240, easing = FastOutLinearInEasing),
+                shrinkTowards = Alignment.Top,
+            ) + fadeOut(
+                animationSpec = tween(durationMillis = 160, easing = FastOutLinearInEasing),
+            ),
+        ) {
+            SyntaxHighlightedCodeBlock(
+                label = if (strings.appLanguage == AppLanguage.SimplifiedChinese) "错误" else "Error",
+                content = remember(detail) { highlightToolResult(detail) },
+            )
+        }
+    }
+}
+
 @Composable
 fun ToolInvocationCard(
     toolInvocation: ChatToolInvocation,
     topPadding: Dp = 6.dp,
 ) {
     val strings = rememberAetherStrings()
+    val arguments = remember(toolInvocation.argumentsJson) { parseJsonObject(toolInvocation.argumentsJson) }
     val detail = remember(toolInvocation, strings.appLanguage) { formatToolInvocationDetail(strings, toolInvocation) }
     var expanded by rememberSaveable(toolInvocation.id) { mutableStateOf(false) }
     LaunchedEffect(
@@ -1471,18 +2142,17 @@ fun ToolInvocationCard(
     ) {
         if (toolInvocation.isRunning) {
             ShimmerStatusText(
-                text = strings.toolInvocationTitleLabel(toolInvocation.toolName, true, parseJsonObject(toolInvocation.argumentsJson)),
+                text = strings.toolInvocationTitleLabel(toolInvocation.toolName, true, arguments),
                 travelDurationMillis = 3200,
                 pauseDurationMillis = 1000,
             )
         } else {
             Text(
-                text = strings.toolInvocationTitleLabel(toolInvocation.toolName, false, parseJsonObject(toolInvocation.argumentsJson)),
+                text = strings.toolInvocationTitleLabel(toolInvocation.toolName, false, arguments),
                 style = MaterialTheme.typography.bodyMedium,
                 color = AetherOnSurfaceVariant,
             )
         }
-
         AnimatedVisibility(
             visible = expanded && detail.command.isNotBlank(),
             enter = expandVertically(
@@ -2171,6 +2841,37 @@ private fun formatThoughtDuration(durationMillis: Long): String {
     }
 }
 
+private fun formatReasoningTraceDoneLabel(
+    strings: AetherStrings,
+    trace: ReasoningTrace,
+): String {
+    val startedAt = trace.startedAtMillis.takeIf { it > 0L }
+    val endedAt = trace.completedAtMillis ?: System.currentTimeMillis()
+    val duration = startedAt?.let { formatThoughtDuration((endedAt - it).coerceAtLeast(1L)) } ?: "0s"
+    val toolCount = trace.toolInvocations.size
+    return if (toolCount > 0) {
+        val toolLabel = if (toolCount == 1) "tool" else "tools"
+        if (strings.appLanguage == AppLanguage.SimplifiedChinese) {
+            "Thought for $duration and executed $toolCount $toolLabel"
+        } else {
+            "Thought for $duration and executed $toolCount $toolLabel"
+        }
+    } else {
+        if (strings.appLanguage == AppLanguage.SimplifiedChinese) {
+            "Thought for $duration"
+        } else {
+            "Thought for $duration"
+        }
+    }
+}
+
+private fun formatReasoningTraceDoneChunkTitle(trace: ReasoningTrace): String {
+    val startedAt = trace.startedAtMillis.takeIf { it > 0L }
+    val endedAt = trace.completedAtMillis ?: System.currentTimeMillis()
+    val duration = startedAt?.let { formatThoughtDuration((endedAt - it).coerceAtLeast(1L)) } ?: "0s"
+    return "Thought for $duration"
+}
+
 private fun formatAttachmentMetaLabel(strings: AetherStrings, attachment: ChatAttachment): String {
     val typeLabel = strings.attachmentTypeLabel(attachment.kind == AttachmentKind.Image)
     val sizeLabel = attachment.sizeBytes?.let(::formatAttachmentSize)
@@ -2586,6 +3287,12 @@ private data class AttachmentTextPreview(
 private data class ToolInvocationDetail(
     val command: String,
     val result: String?,
+)
+
+private data class WebSourceMetadata(
+    val domain: String,
+    val url: String,
+    val faviconUrl: String?,
 )
 
 private data class AgentModeReplayFrame(

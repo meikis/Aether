@@ -5,6 +5,8 @@ data class ChatCompletionResult(
     val assistantText: String,
     val toolCalls: List<ChatCompletionToolCall>,
     val assistantMessage: JSONObject,
+    val reasoningText: String = "",
+    val reasoningSummaryText: String = "",
 )
 
 data class ChatCompletionToolCall(

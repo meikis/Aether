@@ -99,6 +99,108 @@ class OpenAiCompatibleClientProviderFormatsTest {
     }
 
     @Test
+    fun disableReasoningAddsDeepSeekThinkingDisabledParameter() = runBlocking {
+        val server = MockWebServer()
+        server.enqueue(
+            MockResponse()
+                .addHeader("Content-Type", "application/json")
+                .setBody(
+                    """
+                    {
+                      "choices": [
+                        {
+                          "message": {
+                            "role": "assistant",
+                            "content": "Title"
+                          }
+                        }
+                      ]
+                    }
+                    """.trimIndent()
+                )
+        )
+        server.start()
+
+        try {
+            val settings = AppSettings(
+                provider = LlmProvider.OpenAiCompatible,
+                apiKey = "test-key",
+                baseUrl = server.url("/v1").toString(),
+                modelId = "deepseek-v4-flash",
+            )
+
+            client.createChatCompletion(
+                settings = settings,
+                systemPrompt = "",
+                conversation = listOf(
+                    JSONObject().apply {
+                        put("role", "user")
+                        put("content", "Summarize")
+                    }
+                ),
+                disableReasoning = true,
+            ).getOrThrow()
+
+            val payload = JSONObject(server.takeRequest().body.readUtf8())
+            assertEquals("disabled", payload.getJSONObject("thinking").getString("type"))
+            assertFalse(payload.has("reasoning"))
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun disableReasoningAddsOpenRouterReasoningNoneParameter() = runBlocking {
+        val server = MockWebServer()
+        server.enqueue(
+            MockResponse()
+                .addHeader("Content-Type", "application/json")
+                .setBody(
+                    """
+                    {
+                      "choices": [
+                        {
+                          "message": {
+                            "role": "assistant",
+                            "content": "Title"
+                          }
+                        }
+                      ]
+                    }
+                    """.trimIndent()
+                )
+        )
+        server.start()
+
+        try {
+            val settings = AppSettings(
+                provider = LlmProvider.OpenAiCompatible,
+                apiKey = "test-key",
+                baseUrl = server.url("/v1").toString(),
+                modelId = "openrouter/reasoning-model",
+            )
+
+            client.createChatCompletion(
+                settings = settings,
+                systemPrompt = "",
+                conversation = listOf(
+                    JSONObject().apply {
+                        put("role", "user")
+                        put("content", "Summarize")
+                    }
+                ),
+                disableReasoning = true,
+            ).getOrThrow()
+
+            val payload = JSONObject(server.takeRequest().body.readUtf8())
+            assertEquals("none", payload.getJSONObject("reasoning").getString("effort"))
+            assertFalse(payload.has("thinking"))
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
     fun openAiResponsesUsesResponsesEndpointAndToolShape() = runBlocking {
         val server = MockWebServer()
         server.enqueue(

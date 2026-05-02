@@ -13,6 +13,8 @@ import com.zhousl.aether.ui.ChatMessage
 import com.zhousl.aether.ui.ChatSession
 import com.zhousl.aether.ui.ChatToolInvocation
 import com.zhousl.aether.ui.MessageAuthor
+import com.zhousl.aether.ui.ReasoningSummaryChunk
+import com.zhousl.aether.ui.ReasoningTrace
 import com.zhousl.aether.ui.syncActiveBranches
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.coroutines.cancellation.CancellationException
@@ -26,7 +28,16 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import org.json.JSONArray
 import org.json.JSONObject
+
+private const val ReasoningInitialSummaryTokenThreshold = 100
+private const val ReasoningTimedSummaryIntervalMillis = 5_000L
+private const val ReasoningSummaryMaxInputChars = 8_000
+private const val ReasoningSummaryTitleMaxChars = 120
+private const val ReasoningSummaryDetailMaxChars = 520
+private const val ReasoningSummarySystemPrompt =
+    "You write concise user-visible progress summaries for assistant reasoning. Use a consistent first-person planning style, and never quote long private reasoning verbatim."
 
 enum class SessionFollowUpMode {
     Queue,
@@ -54,6 +65,7 @@ data class SessionExecutionState(
     val pendingResponseBlocks: List<AssistantResponseBlock> = emptyList(),
     val pendingAssistantText: String = "",
     val pendingStatusText: String = "",
+    val pendingStatusDetail: String = "",
     val pendingInputs: List<PendingSessionInput> = emptyList(),
     val activeTurnStartedAtMillis: Long? = null,
 )
@@ -77,6 +89,16 @@ data class SessionTurnEvent(
     val durationMillis: Long? = null,
 )
 
+private enum class ReasoningCompletionTrigger {
+    BodyStarted,
+    TurnFinished,
+}
+
+private data class ReasoningSummary(
+    val title: String,
+    val detail: String,
+)
+
 class SessionExecutionManager(
     private val application: Application,
     private val scope: CoroutineScope,
@@ -92,10 +114,12 @@ class SessionExecutionManager(
     private val appForegroundTracker: AppForegroundTracker,
 ) {
     private val currentSettings = MutableStateFlow(AppSettings())
+    private val currentProviderConfigs = MutableStateFlow<List<LlmProviderConfig>>(emptyList())
     private val currentExtensionsState = MutableStateFlow(AgentExtensionsState())
     private val _executionStates = MutableStateFlow<Map<String, SessionExecutionState>>(emptyMap())
     private val _turnEvents = MutableSharedFlow<SessionTurnEvent>(extraBufferCapacity = 8)
     private val executionHandles = ConcurrentHashMap<String, SessionExecutionHandle>()
+    private val queuedTurnRequestBuilder = QueuedTurnRequestBuilder(chatStateStore)
 
     val executionStates: StateFlow<Map<String, SessionExecutionState>> = _executionStates.asStateFlow()
     val turnEvents = _turnEvents.asSharedFlow()
@@ -114,6 +138,9 @@ class SessionExecutionManager(
         }
         scope.launch {
             extensionsRepository.extensionState.collect { currentExtensionsState.value = it }
+        }
+        scope.launch {
+            settingsRepository.providerConfigs.collect { currentProviderConfigs.value = it }
         }
     }
 
@@ -150,6 +177,7 @@ class SessionExecutionManager(
                 pendingResponseBlocks = emptyList(),
                 pendingAssistantText = "",
                 pendingStatusText = "",
+                pendingStatusDetail = "",
                 activeTurnStartedAtMillis = System.currentTimeMillis(),
             )
         }
@@ -197,6 +225,9 @@ class SessionExecutionManager(
             handle = handle,
             snapshot = snapshot ?: SessionExecutionState(sessionId = sessionId),
         )
+        scope.launch(Dispatchers.IO) {
+            runCatching { chatStateStore.flush() }
+        }
         handle.pauseFinalized = true
         executionHandles.remove(sessionId, handle)
         updateExecutionState(sessionId) {
@@ -207,6 +238,7 @@ class SessionExecutionManager(
                 pendingResponseBlocks = emptyList(),
                 pendingAssistantText = "",
                 pendingStatusText = "",
+                pendingStatusDetail = "",
                 pendingInputs = emptyList(),
                 activeTurnStartedAtMillis = null,
             )
@@ -256,6 +288,7 @@ class SessionExecutionManager(
                         pendingResponseBlocks = emptyList(),
                         pendingAssistantText = "",
                         pendingStatusText = "",
+                        pendingStatusDetail = "",
                         pendingInputs = emptyList(),
                         activeTurnStartedAtMillis = null,
                     )
@@ -303,6 +336,7 @@ class SessionExecutionManager(
                 pendingResponseBlocks = emptyList(),
                 pendingAssistantText = "",
                 pendingStatusText = "",
+                pendingStatusDetail = "",
                 activeTurnStartedAtMillis = turnStartedAtMillis,
             )
         }
@@ -330,6 +364,7 @@ class SessionExecutionManager(
                 servers = resolvedMcpServers,
                 workspaceDirectory = workspaceDirectory,
             )
+            val reasoningTraceToolRoutingEnabled = request.settings.supportsVisibleReasoningTrace()
 
             val result = agent.runTurn(
                 settings = request.settings,
@@ -341,24 +376,63 @@ class SessionExecutionManager(
                 agentModeEnabled = request.agentModeEnabled,
                 onToolEvent = { event ->
                     if (handle.pauseRequested) return@runTurn
-                    val now = SystemClock.uptimeMillis()
-                    val invocation = ChatToolInvocation(
+                    val nowUptime = SystemClock.uptimeMillis()
+                    val nowMillis = System.currentTimeMillis()
+                    var invocation = ChatToolInvocation(
                         id = event.id,
                         toolName = event.name,
                         argumentsJson = event.argumentsJson,
                         outputJson = event.outputJson.orEmpty(),
                         isRunning = event.outputJson == null,
-                        startedAtUptimeMillis = now,
-                        completedAtUptimeMillis = if (event.outputJson == null) null else now,
+                        startedAtUptimeMillis = nowUptime,
+                        completedAtUptimeMillis = if (event.outputJson == null) null else nowUptime,
+                        startedAtMillis = nowMillis,
+                        completedAtMillis = if (event.outputJson == null) null else nowMillis,
                     )
+                    if (event.outputJson == null) {
+                        flushActiveReasoningSummary(
+                            handle = handle,
+                        )
+                        handle.finishDirectReasoningSummaryChunk()
+                    }
+                    val currentBlocks = _executionStates.value[handle.sessionId]?.pendingResponseBlocks.orEmpty()
+                    val shouldRouteToolIntoReasoning =
+                        handle.activeReasoningBlockId != null ||
+                            reasoningTraceToolRoutingEnabled ||
+                            currentBlocks.any { it is AssistantResponseBlock.Reasoning }
+                    var reasoningBlockId = handle.activeReasoningBlockId
+                    if (reasoningBlockId == null && shouldRouteToolIntoReasoning) {
+                        reasoningBlockId = handle.nextPendingBlockId("pending-reasoning")
+                        handle.startReasoningBlock(reasoningBlockId, nowMillis)
+                    }
+                    if (shouldRouteToolIntoReasoning && invocation.timelineOrder <= 0L) {
+                        invocation = invocation.copy(timelineOrder = handle.nextReasoningTimelineOrder())
+                    }
                     updateExecutionState(handle.sessionId) { current ->
+                        val targetReasoningBlockId = reasoningBlockId
                         val pendingToolInvocations = upsertToolInvocation(
                             current.pendingToolInvocations,
                             invocation,
                         )
+                        val blocksWithReasoningTrace = if (
+                            targetReasoningBlockId != null &&
+                            current.pendingResponseBlocks.none { it is AssistantResponseBlock.Reasoning && it.id == targetReasoningBlockId }
+                        ) {
+                            current.pendingResponseBlocks + AssistantResponseBlock.Reasoning(
+                                id = targetReasoningBlockId,
+                                trace = ReasoningTrace(
+                                    id = targetReasoningBlockId,
+                                    latestStatusText = formatReasoningToolStatus(invocation),
+                                    startedAtMillis = nowMillis,
+                                ),
+                            )
+                        } else {
+                            current.pendingResponseBlocks
+                        }
                         val pendingResponseBlocks = upsertAssistantResponseToolInvocation(
-                            blocks = current.pendingResponseBlocks,
+                            blocks = blocksWithReasoningTrace,
                             toolInvocation = invocation,
+                            reasoningBlockId = targetReasoningBlockId,
                         ) { handle.nextPendingBlockId("pending-tools") }
                         current.copy(
                             pendingToolInvocations = pendingToolInvocations,
@@ -366,9 +440,31 @@ class SessionExecutionManager(
                         )
                     }
                 },
+                onAssistantReasoningDelta = { delta ->
+                    if (handle.pauseRequested) return@runTurn
+                    if (delta.isEmpty()) return@runTurn
+                    handle.finishDirectReasoningSummaryChunk()
+                    appendReasoningDelta(
+                        handle = handle,
+                        delta = delta,
+                    )
+                },
+                onAssistantReasoningSummaryDelta = { delta ->
+                    if (handle.pauseRequested) return@runTurn
+                    if (delta.isEmpty()) return@runTurn
+                    appendDirectReasoningSummaryDelta(
+                        handle = handle,
+                        delta = delta,
+                    )
+                },
                 onAssistantTextDelta = { delta ->
                     if (handle.pauseRequested) return@runTurn
                     if (delta.isEmpty()) return@runTurn
+                    handle.finishDirectReasoningSummaryChunk()
+                    completeActiveReasoning(
+                        handle = handle,
+                        trigger = ReasoningCompletionTrigger.BodyStarted,
+                    )
                     updateExecutionState(handle.sessionId) { current ->
                         val pendingResponseBlocks = appendAssistantResponseText(
                             blocks = current.pendingResponseBlocks,
@@ -376,6 +472,7 @@ class SessionExecutionManager(
                         ) { handle.nextPendingBlockId("pending-text") }
                         current.copy(
                             pendingStatusText = "",
+                            pendingStatusDetail = "",
                             pendingAssistantText = pendingTrailingAssistantText(pendingResponseBlocks),
                             pendingResponseBlocks = pendingResponseBlocks,
                         )
@@ -394,7 +491,10 @@ class SessionExecutionManager(
                 onStreamingStatus = { status ->
                     if (handle.pauseRequested) return@runTurn
                     updateExecutionState(handle.sessionId) { current ->
-                        current.copy(pendingStatusText = status.orEmpty())
+                        current.copy(
+                            pendingStatusText = status?.text.orEmpty(),
+                            pendingStatusDetail = status?.detail.orEmpty(),
+                        )
                     }
                 },
                 onSkillActivated = { activeSkill ->
@@ -424,6 +524,10 @@ class SessionExecutionManager(
                 )
             }
 
+            completeActiveReasoning(
+                handle = handle,
+                trigger = ReasoningCompletionTrigger.TurnFinished,
+            )
             val thoughtDurationMillis = (System.currentTimeMillis() - turnStartedAtMillis).coerceAtLeast(0L)
             val completion = result.fold(
                 onSuccess = { reply ->
@@ -446,7 +550,7 @@ class SessionExecutionManager(
                                 if (currentAssistantResponseBlocks(handle.sessionId).lastOrNull() is AssistantResponseBlock.Text) {
                                     append("\n\n")
                                 }
-                                append("Request failed: ${throwable.message ?: "Unknown error"}")
+                                append("Request failed: ${formatFailureMessage(throwable)}")
                             },
                         ) { handle.nextPendingBlockId("agent-text") },
                         thoughtDurationMillis = thoughtDurationMillis,
@@ -454,6 +558,7 @@ class SessionExecutionManager(
                     )
                 },
             )
+            chatStateStore.flush()
             _turnEvents.tryEmit(completion.toTurnEvent(handle.sessionId))
             completion
         } catch (_: CancellationException) {
@@ -475,6 +580,7 @@ class SessionExecutionManager(
                 )
             }
             if (!handle.pauseFinalized) {
+                chatStateStore.flush()
                 handle.pauseFinalized = true
                 _turnEvents.tryEmit(completion.toTurnEvent(handle.sessionId))
             }
@@ -499,43 +605,12 @@ class SessionExecutionManager(
     private fun buildQueuedTurnRequest(
         sessionId: String,
         queuedInput: ChatMessage,
-    ): SessionTurnRequest? {
-        var requestMessages: List<ChatMessage> = emptyList()
-        var selectedSkillIds: List<String> = emptyList()
-        var activeSkills: List<ActiveSkillContext> = emptyList()
-        var activeMcpServerIds: List<String> = emptyList()
-        var agentModeEnabled = false
-
-        chatStateStore.update { persisted ->
-            val sessionIndex = persisted.sessions.indexOfFirst { it.id == sessionId }
-            if (sessionIndex < 0) return@update persisted
-
-            val updatedSessions = persisted.sessions.toMutableList()
-            val session = updatedSessions.removeAt(sessionIndex)
-            val updatedSession = session.withDerivedMessages(
-                syncActiveBranches(session.messages + queuedInput)
-            )
-            requestMessages = updatedSession.messages
-            selectedSkillIds = updatedSession.selectedSkillIds
-            activeSkills = updatedSession.activeSkills
-            activeMcpServerIds = updatedSession.activeMcpServerIds
-            agentModeEnabled = updatedSession.agentModeEnabled
-            updatedSessions.add(0, updatedSession)
-            persisted.copy(sessions = updatedSessions)
-        }
-
-        if (requestMessages.isEmpty()) return null
-
-        return SessionTurnRequest(
-            sessionId = sessionId,
-            settings = currentSettings.value,
-            requestMessages = requestMessages,
-            selectedSkillIds = selectedSkillIds,
-            activeSkills = activeSkills,
-            activeMcpServerIds = activeMcpServerIds,
-            agentModeEnabled = agentModeEnabled,
-        )
-    }
+    ): SessionTurnRequest? = queuedTurnRequestBuilder.build(
+        sessionId = sessionId,
+        queuedInput = queuedInput,
+        baseSettings = currentSettings.value,
+        providerConfigs = currentProviderConfigs.value,
+    )
 
     private fun updateSessionSelections(
         sessionId: String,
@@ -568,12 +643,11 @@ class SessionExecutionManager(
         val installedSkillsById = currentExtensionsState.value.installedSkills
             .filter { it.isEnabled }
             .associateBy { it.id }
-        val existingById = existingActiveSkills.associateBy { it.skillId }
         return buildList {
             selectedSkillIds.distinct().forEach { skillId ->
                 val installedSkill = installedSkillsById[skillId] ?: return@forEach
                 val activeSkill = skillManager.buildActiveSkillContext(installedSkill)
-                    .getOrElse { existingById[skillId] ?: return@forEach }
+                    .getOrElse { return@forEach }
                 add(activeSkill)
             }
         }
@@ -685,14 +759,29 @@ class SessionExecutionManager(
                         )
                     }
                 }
+
+                is AssistantResponseBlock.Reasoning -> {
+                    ChatMessage(
+                        id = "agent-${messageTimestamp + index}",
+                        author = MessageAuthor.Agent,
+                        text = "",
+                        createdAtMillis = messageTimestamp + index,
+                        toolInvocations = block.trace.toolInvocations,
+                        reasoningTrace = block.trace,
+                        responseGroupId = responseGroupId,
+                        assistantActionsHidden = assistantActionsHidden,
+                    )
+                }
             }
         }.let { messages ->
             if (messages.isEmpty()) {
                 emptyList()
             } else {
                 messages.toMutableList().apply {
-                    val lastIndex = lastIndex
-                    set(lastIndex, get(lastIndex).copy(thoughtDurationMillis = thoughtDurationMillis))
+                    if (none { it.reasoningTrace != null }) {
+                        val lastIndex = lastIndex
+                        set(lastIndex, get(lastIndex).copy(thoughtDurationMillis = thoughtDurationMillis))
+                    }
                 }
             }
         }
@@ -802,6 +891,7 @@ class SessionExecutionManager(
                 pendingResponseBlocks = emptyList(),
                 pendingAssistantText = "",
                 pendingStatusText = "",
+                pendingStatusDetail = "",
             )
         }
     }
@@ -928,33 +1018,6 @@ class SessionExecutionManager(
     private fun resolveSessionTitle(sessionId: String): String =
         chatStateStore.state.value.sessions.firstOrNull { it.id == sessionId }?.title.orEmpty()
 
-    private fun ChatSession.withDerivedMessages(
-        messages: List<ChatMessage>,
-    ): ChatSession {
-        val metadata = deriveSessionMetadata(messages)
-        return copy(
-            title = if (hasCustomTitle) title else metadata.first,
-            preview = metadata.second,
-            messages = syncActiveBranches(messages),
-        )
-    }
-
-    private fun deriveSessionMetadata(messages: List<ChatMessage>): Pair<String, String> {
-        val title = messages
-            .firstOrNull { it.author == MessageAuthor.User }
-            ?.summaryText()
-            .orEmpty()
-            .ifBlank { "New chat" }
-            .take(36)
-        val preview = messages
-            .lastOrNull()
-            ?.summaryText()
-            .orEmpty()
-            .ifBlank { "No messages yet." }
-            .take(96)
-        return title to preview
-    }
-
     private fun buildRequestMessages(messages: List<ChatMessage>): List<LlmMessage> =
         messages.map(::buildRequestMessage)
 
@@ -1018,25 +1081,155 @@ class SessionExecutionManager(
         )
     }
 
+    private fun buildProviderUserMessage(
+        settings: AppSettings,
+        text: String,
+    ): JSONObject = when (settings.provider) {
+        LlmProvider.OpenAiResponses -> JSONObject().apply {
+            put("role", "user")
+            put(
+                "content",
+                JSONArray().put(
+                    JSONObject().apply {
+                        put("type", "input_text")
+                        put("text", text)
+                    }
+                )
+            )
+        }
+
+        LlmProvider.OpenAiCompatible -> JSONObject().apply {
+            put("role", "user")
+            put("content", text)
+        }
+
+        LlmProvider.VertexExpress -> JSONObject().apply {
+            put("role", "user")
+            put(
+                "parts",
+                JSONArray().put(
+                    JSONObject().apply {
+                        put("text", text)
+                    }
+                )
+            )
+        }
+
+        LlmProvider.AnthropicMessages -> JSONObject().apply {
+            put("role", "user")
+            put(
+                "content",
+                JSONArray().put(
+                    JSONObject().apply {
+                        put("type", "text")
+                        put("text", text)
+                    }
+                )
+            )
+        }
+    }
+
     private fun formatBytes(bytes: Long): String = when {
         bytes >= 1024 * 1024 -> String.format("%.1f MB", bytes / (1024f * 1024f))
         bytes >= 1024 -> String.format("%.1f KB", bytes / 1024f)
         else -> "$bytes B"
     }
 
+    private fun formatReasoningDurationLabel(trace: ReasoningTrace): String {
+        val startedAt = trace.startedAtMillis.takeIf { it > 0L } ?: return "0s"
+        val endedAt = trace.completedAtMillis ?: System.currentTimeMillis()
+        val totalSeconds = ((endedAt - startedAt).coerceAtLeast(0L) + 500L) / 1000L
+        return "${totalSeconds.coerceAtLeast(0L)}s"
+    }
+
+    private fun formatFailureMessage(throwable: Throwable): String {
+        val message = throwable.message?.trim().orEmpty()
+        if (message.isNotBlank()) return message
+        return throwable.javaClass.simpleName.ifBlank { "Unknown error" }
+    }
+
+    private fun AppSettings.supportsVisibleReasoningTrace(): Boolean {
+        if (provider != LlmProvider.OpenAiCompatible) return false
+        return baseUrl.contains("deepseek", ignoreCase = true) ||
+            baseUrl.contains("openrouter", ignoreCase = true) ||
+            modelId.contains("deepseek", ignoreCase = true) ||
+            modelId.contains("openrouter", ignoreCase = true)
+    }
+
+    private fun formatReasoningToolStatus(invocation: ChatToolInvocation): String {
+        val arguments = parseJsonObject(invocation.argumentsJson)
+        return when (invocation.toolName.lowercase()) {
+            "fetch_web_url" -> formatReasoningToolAction(
+                isRunning = invocation.isRunning,
+                runningVerb = "Fetching",
+                completedVerb = "Fetched",
+                subject = arguments?.optString("url").orEmpty(),
+                fallback = "web page",
+            )
+
+            "tavily_search" -> formatReasoningToolAction(
+                isRunning = invocation.isRunning,
+                runningVerb = "Searching",
+                completedVerb = "Searched",
+                subject = arguments?.optString("query").orEmpty(),
+                fallback = "the web",
+            )
+
+            "bash" -> if (invocation.isRunning) "Executing bash command" else "Executed bash command"
+            "fetch_bash_output" -> if (invocation.isRunning) "Fetching bash output" else "Fetched bash output"
+            "kill_bash" -> if (invocation.isRunning) "Stopping bash command" else "Stopped bash command"
+            "sleep" -> if (invocation.isRunning) "Waiting" else "Waited"
+            "read" -> if (invocation.isRunning) "Reading file" else "Read file"
+            "edit" -> if (invocation.isRunning) "Editing file" else "Edited file"
+            "write" -> if (invocation.isRunning) "Writing file" else "Wrote file"
+            "grep" -> if (invocation.isRunning) "Searching files" else "Searched files"
+            "find" -> if (invocation.isRunning) "Finding files" else "Found files"
+            "ls" -> if (invocation.isRunning) "Listing files" else "Listed files"
+            "analyze_image" -> if (invocation.isRunning) "Analyzing image" else "Analyzed image"
+            else -> if (invocation.isRunning) {
+                "Using ${invocation.toolName}"
+            } else {
+                "Used ${invocation.toolName}"
+            }
+        }
+    }
+
+    private fun formatReasoningToolAction(
+        isRunning: Boolean,
+        runningVerb: String,
+        completedVerb: String,
+        subject: String,
+        fallback: String,
+    ): String {
+        val action = if (isRunning) runningVerb else completedVerb
+        val normalizedSubject = subject.trim().take(96)
+        return if (normalizedSubject.isBlank()) {
+            "$action $fallback"
+        } else {
+            "$action $normalizedSubject"
+        }
+    }
+
     private fun upsertToolInvocation(
         invocations: List<ChatToolInvocation>,
         toolInvocation: ChatToolInvocation,
     ): List<ChatToolInvocation> {
-        val now = SystemClock.uptimeMillis()
+        val nowUptime = SystemClock.uptimeMillis()
+        val nowMillis = System.currentTimeMillis()
         val existingIndex = invocations.indexOfFirst { it.id == toolInvocation.id }
         val normalized = if (existingIndex < 0) {
             toolInvocation.copy(
-                startedAtUptimeMillis = toolInvocation.startedAtUptimeMillis.takeIf { it > 0L } ?: now,
+                startedAtUptimeMillis = toolInvocation.startedAtUptimeMillis.takeIf { it > 0L } ?: nowUptime,
                 completedAtUptimeMillis = if (toolInvocation.isRunning) {
                     null
                 } else {
-                    toolInvocation.completedAtUptimeMillis ?: now
+                    toolInvocation.completedAtUptimeMillis ?: nowUptime
+                },
+                startedAtMillis = toolInvocation.startedAtMillis.takeIf { it > 0L } ?: nowMillis,
+                completedAtMillis = if (toolInvocation.isRunning) {
+                    null
+                } else {
+                    toolInvocation.completedAtMillis ?: nowMillis
                 },
             )
         } else {
@@ -1045,14 +1238,28 @@ class SessionExecutionManager(
                 startedAtUptimeMillis = existing.startedAtUptimeMillis
                     .takeIf { it > 0L }
                     ?: toolInvocation.startedAtUptimeMillis.takeIf { it > 0L }
-                    ?: now,
+                    ?: nowUptime,
                 completedAtUptimeMillis = if (toolInvocation.isRunning) {
                     null
                 } else {
                     toolInvocation.completedAtUptimeMillis
                         ?: existing.completedAtUptimeMillis
-                        ?: now
+                        ?: nowUptime
                 },
+                startedAtMillis = existing.startedAtMillis
+                    .takeIf { it > 0L }
+                    ?: toolInvocation.startedAtMillis.takeIf { it > 0L }
+                    ?: nowMillis,
+                completedAtMillis = if (toolInvocation.isRunning) {
+                    null
+                } else {
+                    toolInvocation.completedAtMillis
+                        ?: existing.completedAtMillis
+                        ?: nowMillis
+                },
+                timelineOrder = existing.timelineOrder
+                    .takeIf { it > 0L }
+                    ?: toolInvocation.timelineOrder,
             )
         }
         return if (existingIndex < 0) {
@@ -1081,11 +1288,445 @@ class SessionExecutionManager(
         }
     }
 
+    private fun appendReasoningDelta(
+        handle: SessionExecutionHandle,
+        delta: String,
+    ) {
+        val now = System.currentTimeMillis()
+        var activeBlockId = handle.activeReasoningBlockId
+        updateExecutionState(handle.sessionId) { current ->
+            val blocks = current.pendingResponseBlocks.toMutableList()
+            val activeIndex = activeBlockId?.let { id ->
+                blocks.indexOfFirst { it is AssistantResponseBlock.Reasoning && it.id == id }
+            } ?: -1
+            if (activeIndex >= 0) {
+                val block = blocks[activeIndex] as AssistantResponseBlock.Reasoning
+                blocks[activeIndex] = block.copy(
+                    trace = block.trace.copy(rawText = block.trace.rawText + delta),
+                )
+            } else {
+                val blockId = handle.nextPendingBlockId("pending-reasoning")
+                activeBlockId = blockId
+                handle.startReasoningBlock(blockId, now)
+                blocks += AssistantResponseBlock.Reasoning(
+                    id = blockId,
+                    trace = ReasoningTrace(
+                        id = blockId,
+                        rawText = delta,
+                        startedAtMillis = now,
+                    ),
+                )
+            }
+            current.copy(
+                pendingStatusText = "",
+                pendingStatusDetail = "",
+                pendingResponseBlocks = blocks,
+            )
+        }
+
+        val blockId = activeBlockId ?: return
+        val trace = currentReasoningTrace(handle.sessionId, blockId) ?: return
+        maybeSubmitReasoningSummary(
+            handle = handle,
+            trace = trace,
+            forceRemaining = false,
+        )
+    }
+
+    private fun appendDirectReasoningSummaryDelta(
+        handle: SessionExecutionHandle,
+        delta: String,
+    ) {
+        val now = System.currentTimeMillis()
+        var activeBlockId = handle.activeReasoningBlockId
+        updateExecutionState(handle.sessionId) { current ->
+            val blocks = current.pendingResponseBlocks.toMutableList()
+            val activeIndex = activeBlockId?.let { id ->
+                blocks.indexOfFirst { it is AssistantResponseBlock.Reasoning && it.id == id }
+            } ?: -1
+            val blockIndex = if (activeIndex >= 0) {
+                activeIndex
+            } else {
+                val blockId = handle.nextPendingBlockId("pending-reasoning")
+                activeBlockId = blockId
+                handle.startReasoningBlock(blockId, now)
+                blocks += AssistantResponseBlock.Reasoning(
+                    id = blockId,
+                    trace = ReasoningTrace(
+                        id = blockId,
+                        startedAtMillis = now,
+                    ),
+                )
+                blocks.lastIndex
+            }
+
+            val block = blocks[blockIndex] as AssistantResponseBlock.Reasoning
+            val chunkId = handle.activeDirectReasoningSummaryChunkId
+                ?.takeIf { id -> block.trace.chunks.any { it.id == id } }
+                ?: handle.nextReasoningChunkId(block.id).also { newChunkId ->
+                    handle.activeDirectReasoningSummaryChunkId = newChunkId
+                }
+            val existingChunk = block.trace.chunks.firstOrNull { it.id == chunkId }
+            val updatedDetail = existingChunk?.detail.orEmpty() + delta
+            val updatedChunks = if (existingChunk == null) {
+                block.trace.chunks + ReasoningSummaryChunk(
+                    id = chunkId,
+                    title = "Reasoning",
+                    detail = updatedDetail,
+                    isPending = false,
+                    createdAtMillis = now,
+                    timelineOrder = handle.nextReasoningTimelineOrder(),
+                )
+            } else {
+                block.trace.chunks.map { chunk ->
+                    if (chunk.id == chunkId) {
+                        chunk.copy(
+                            detail = updatedDetail,
+                            isPending = false,
+                        )
+                    } else {
+                        chunk
+                    }
+                }
+            }
+            blocks[blockIndex] = block.copy(
+                trace = block.trace.copy(
+                    chunks = updatedChunks,
+                    latestStatusText = updatedDetail,
+                )
+            )
+            current.copy(
+                pendingStatusText = "",
+                pendingStatusDetail = "",
+                pendingResponseBlocks = blocks,
+            )
+        }
+    }
+
+    private fun completeActiveReasoning(
+        handle: SessionExecutionHandle,
+        trigger: ReasoningCompletionTrigger,
+    ) {
+        val blockId = handle.activeReasoningBlockId ?: return
+        val now = System.currentTimeMillis()
+        val trace = currentReasoningTrace(handle.sessionId, blockId) ?: run {
+            handle.finishReasoningBlock()
+            return
+        }
+        if (trace.rawText.isNotBlank()) {
+            maybeSubmitReasoningSummary(
+                handle = handle,
+                trace = trace,
+                forceRemaining = true,
+            )
+        }
+        updateExecutionState(handle.sessionId) { current ->
+            current.copy(
+                pendingResponseBlocks = current.pendingResponseBlocks.map { block ->
+                    if (block is AssistantResponseBlock.Reasoning && block.id == blockId) {
+                        block.copy(
+                            trace = block.trace.copy(
+                                completedAtMillis = block.trace.completedAtMillis ?: now,
+                            )
+                        )
+                    } else {
+                        block
+                    }
+                }
+            )
+        }
+        handle.finishReasoningBlock()
+    }
+
+    private fun flushActiveReasoningSummary(
+        handle: SessionExecutionHandle,
+    ) {
+        val blockId = handle.activeReasoningBlockId ?: return
+        val trace = currentReasoningTrace(handle.sessionId, blockId) ?: return
+        if (trace.rawText.isBlank()) return
+        maybeSubmitReasoningSummary(
+            handle = handle,
+            trace = trace,
+            forceRemaining = true,
+        )
+    }
+
+    private fun maybeSubmitReasoningSummary(
+        handle: SessionExecutionHandle,
+        trace: ReasoningTrace,
+        forceRemaining: Boolean,
+    ) {
+        val rawText = trace.rawText
+        if (rawText.isBlank()) return
+
+        if (!handle.reasoningFirstSummarySubmitted) {
+            val tokenCount = approximateReasoningTokenCount(rawText)
+            if (tokenCount >= ReasoningInitialSummaryTokenThreshold || forceRemaining) {
+                val chunkText = if (tokenCount >= ReasoningInitialSummaryTokenThreshold) {
+                    takeApproximateReasoningTokens(rawText, ReasoningInitialSummaryTokenThreshold)
+                } else {
+                    rawText
+                }
+                handle.reasoningFirstSummarySubmitted = true
+                handle.reasoningLastSubmittedCharIndex = chunkText.length.coerceAtMost(rawText.length)
+                handle.reasoningLastTimedSummaryAtMillis = System.currentTimeMillis()
+                submitReasoningSummary(
+                    handle = handle,
+                    blockId = trace.id,
+                    rawText = chunkText,
+                )
+            }
+            return
+        }
+
+        val startIndex = handle.reasoningLastSubmittedCharIndex.coerceIn(0, rawText.length)
+        if (startIndex >= rawText.length) return
+        val now = System.currentTimeMillis()
+        val elapsedMillis = now - handle.reasoningLastTimedSummaryAtMillis
+        if (!forceRemaining && elapsedMillis < ReasoningTimedSummaryIntervalMillis) return
+
+        val chunkText = rawText.substring(startIndex)
+        if (chunkText.isBlank()) return
+        handle.reasoningLastSubmittedCharIndex = rawText.length
+        handle.reasoningLastTimedSummaryAtMillis = now
+        submitReasoningSummary(
+            handle = handle,
+            blockId = trace.id,
+            rawText = chunkText,
+        )
+    }
+
+    private fun submitReasoningSummary(
+        handle: SessionExecutionHandle,
+        blockId: String,
+        rawText: String,
+    ) {
+        val trimmed = rawText.trim()
+        if (trimmed.isBlank()) return
+        val chunkId = handle.nextReasoningChunkId(blockId)
+        val createdAtMillis = System.currentTimeMillis()
+        val timelineOrder = handle.nextReasoningTimelineOrder()
+        updateReasoningTrace(handle.sessionId, blockId) { trace ->
+            trace.copy(
+                chunks = trace.chunks + ReasoningSummaryChunk(
+                    id = chunkId,
+                    rawText = trimmed,
+                    isPending = true,
+                    createdAtMillis = createdAtMillis,
+                    timelineOrder = timelineOrder,
+                )
+            )
+        }
+
+        scope.launch(Dispatchers.IO) {
+            val summary = summarizeReasoningChunk(trimmed) ?: fallbackReasoningSummary(trimmed)
+            updateReasoningTrace(handle.sessionId, blockId) { trace ->
+                val latestStatusText = summary.detail.ifBlank { summary.title }
+                trace.copy(
+                    chunks = trace.chunks.map { chunk ->
+                        if (chunk.id != chunkId) {
+                            chunk
+                        } else {
+                            chunk.copy(
+                                title = summary.title,
+                                detail = summary.detail,
+                                isPending = false,
+                            )
+                        }
+                    },
+                    latestStatusText = latestStatusText,
+                )
+            }
+        }
+    }
+
+    private suspend fun summarizeReasoningChunk(
+        rawText: String,
+    ): ReasoningSummary? {
+        val settings = currentSettings.value
+        val providerConfigs = currentProviderConfigs.value
+        val titleSettings = resolveModelSettings(
+            baseSettings = settings,
+            providerConfigs = providerConfigs,
+            preferredModelKey = resolveDefaultTitleModelKey(settings, providerConfigs),
+            fallbackModelKey = resolveDefaultChatModelKey(settings, providerConfigs),
+        )
+        if (!isProviderSetupValid(titleSettings.provider, titleSettings.apiKey, titleSettings.baseUrl, titleSettings.modelId)) {
+            return null
+        }
+        val prompt = buildString {
+            appendLine("Summarize this assistant reasoning excerpt for a user-visible thinking timeline.")
+            appendLine("Return exactly two short paragraphs: first a concise title, then one detail paragraph.")
+            appendLine("Title style: a short gerund or noun phrase about the purpose or outcome, without 'I', 'The assistant', or a tool-action headline.")
+            appendLine("Detail style: natural first-person planning language. 'I need to...', 'I should...', 'I will...', and 'I am...' are all acceptable when they fit.")
+            appendLine("Never write from a third-person assistant perspective such as 'The assistant is...' or 'The model is...'.")
+            appendLine("Do not mention that this is a summary, do not add bullets, and do not invent context.")
+            appendLine()
+            appendLine("Use this style:")
+            appendLine("Providing accurate and properly cited documentation")
+            appendLine()
+            appendLine("I need to make sure I include citations for all factual information, especially from official docs, since I haven't performed any live API tests. It's essential to clarify that my info is based on public documentation and mention the safety of returning raw reasoning in OpenRouter. I should avoid long CoT examples.")
+            appendLine()
+            appendLine("Reasoning excerpt:")
+            append(rawText.take(ReasoningSummaryMaxInputChars))
+        }
+        val result = OpenAiCompatibleClient().createChatCompletion(
+            settings = titleSettings,
+            systemPrompt = ReasoningSummarySystemPrompt,
+            conversation = listOf(buildProviderUserMessage(titleSettings, prompt)),
+            disableReasoning = true,
+        ).getOrNull()?.assistantText.orEmpty().trim()
+        return parseReasoningSummary(result)
+    }
+
+    private fun fallbackReasoningSummary(rawText: String): ReasoningSummary {
+        val compact = rawText
+            .lineSequence()
+            .map(String::trim)
+            .filter(String::isNotBlank)
+            .joinToString(" ")
+            .replace(Regex("\\s+"), " ")
+        return ReasoningSummary(
+            title = "Thinking through the next step",
+            detail = compact
+                .take(ReasoningSummaryDetailMaxChars)
+                .ifBlank { "Preparing the next action." },
+        )
+    }
+
+    private fun parseReasoningSummary(text: String): ReasoningSummary? {
+        val lines = text.lines().map(String::trim).filter(String::isNotBlank)
+        if (lines.isEmpty()) return null
+        val title = lines.first().trim('"').take(ReasoningSummaryTitleMaxChars)
+        val detail = lines.drop(1)
+            .joinToString(" ")
+            .trim()
+            .ifBlank { title }
+            .take(ReasoningSummaryDetailMaxChars)
+        return ReasoningSummary(title = title, detail = detail)
+    }
+
+    private fun currentReasoningTrace(
+        sessionId: String,
+        blockId: String,
+    ): ReasoningTrace? = _executionStates.value[sessionId]
+        ?.pendingResponseBlocks
+        ?.firstOrNull { it is AssistantResponseBlock.Reasoning && it.id == blockId }
+        ?.let { (it as AssistantResponseBlock.Reasoning).trace }
+
+    private fun updateReasoningTrace(
+        sessionId: String,
+        blockId: String,
+        transform: (ReasoningTrace) -> ReasoningTrace,
+    ) {
+        updateExecutionState(sessionId) { current ->
+            current.copy(
+                pendingResponseBlocks = current.pendingResponseBlocks.map { block ->
+                    if (block is AssistantResponseBlock.Reasoning && block.id == blockId) {
+                        block.copy(trace = transform(block.trace))
+                    } else {
+                        block
+                    }
+                }
+            )
+        }
+        updatePersistedReasoningTrace(
+            sessionId = sessionId,
+            blockId = blockId,
+            transform = transform,
+        )
+    }
+
+    private fun updatePersistedReasoningTrace(
+        sessionId: String,
+        blockId: String,
+        transform: (ReasoningTrace) -> ReasoningTrace,
+    ) {
+        val hasPersistedTrace = chatStateStore.state.value.sessions.any { session ->
+            session.id == sessionId && session.messages.any { it.reasoningTrace?.id == blockId }
+        }
+        if (!hasPersistedTrace) return
+
+        chatStateStore.update { persisted ->
+            val sessionIndex = persisted.sessions.indexOfFirst { it.id == sessionId }
+            if (sessionIndex < 0) return@update persisted
+
+            val session = persisted.sessions[sessionIndex]
+            var changed = false
+            val updatedMessages = session.messages.map { message ->
+                val trace = message.reasoningTrace
+                if (trace == null || trace.id != blockId) {
+                    message
+                } else {
+                    val updatedTrace = transform(trace)
+                    if (updatedTrace == trace) {
+                        message
+                    } else {
+                        changed = true
+                        message.copy(
+                            reasoningTrace = updatedTrace,
+                            toolInvocations = updatedTrace.toolInvocations,
+                        )
+                    }
+                }
+            }
+            if (!changed) return@update persisted
+
+            val updatedSessions = persisted.sessions.toMutableList()
+            updatedSessions[sessionIndex] = session.withDerivedMessages(updatedMessages)
+            persisted.copy(sessions = updatedSessions)
+        }
+    }
+
     private fun upsertAssistantResponseToolInvocation(
         blocks: List<AssistantResponseBlock>,
         toolInvocation: ChatToolInvocation,
+        reasoningBlockId: String?,
         newBlockId: () -> String,
     ): List<AssistantResponseBlock> {
+        val existingReasoningIndex = blocks.indexOfFirst { block ->
+            block is AssistantResponseBlock.Reasoning &&
+                block.trace.toolInvocations.any { it.id == toolInvocation.id }
+        }
+        if (existingReasoningIndex >= 0) {
+            val reasoningBlock = blocks[existingReasoningIndex] as AssistantResponseBlock.Reasoning
+            return blocks.toMutableList().apply {
+                set(
+                    existingReasoningIndex,
+                    reasoningBlock.copy(
+                        trace = reasoningBlock.trace.copy(
+                            toolInvocations = upsertToolInvocation(
+                                reasoningBlock.trace.toolInvocations,
+                                toolInvocation,
+                            ),
+                            latestStatusText = formatReasoningToolStatus(toolInvocation),
+                        ),
+                    )
+                )
+            }
+        }
+
+        val reasoningIndex = reasoningBlockId?.let { id ->
+            blocks.indexOfFirst { it is AssistantResponseBlock.Reasoning && it.id == id }
+        } ?: -1
+        if (reasoningIndex >= 0) {
+            val reasoningBlock = blocks[reasoningIndex] as AssistantResponseBlock.Reasoning
+            return blocks.toMutableList().apply {
+                set(
+                    reasoningIndex,
+                    reasoningBlock.copy(
+                        trace = reasoningBlock.trace.copy(
+                            toolInvocations = upsertToolInvocation(
+                                reasoningBlock.trace.toolInvocations,
+                                toolInvocation,
+                            ),
+                            latestStatusText = formatReasoningToolStatus(toolInvocation),
+                        ),
+                    )
+                )
+            }
+        }
+
         val existingIndex = blocks.indexOfFirst { block ->
             block is AssistantResponseBlock.ToolGroup &&
                 block.toolInvocations.any { it.id == toolInvocation.id }
@@ -1175,6 +1816,17 @@ class SessionExecutionManager(
                         add(block)
                     }
                 }
+
+                is AssistantResponseBlock.Reasoning -> {
+                    if (
+                        block.trace.rawText.isBlank() &&
+                        block.trace.chunks.isEmpty() &&
+                        block.trace.toolInvocations.isEmpty()
+                    ) {
+                        return@forEach
+                    }
+                    add(block)
+                }
             }
         }
     }
@@ -1184,6 +1836,7 @@ class SessionExecutionManager(
             when (block) {
                 is AssistantResponseBlock.ToolGroup -> block.toolInvocations
                 is AssistantResponseBlock.Text -> emptyList()
+                is AssistantResponseBlock.Reasoning -> block.trace.toolInvocations
             }
         }.distinctBy { it.id }
 
@@ -1193,6 +1846,12 @@ class SessionExecutionManager(
         blocks.map { block ->
             when (block) {
                 is AssistantResponseBlock.Text -> block
+                is AssistantResponseBlock.Reasoning -> block.copy(
+                    trace = block.trace.copy(
+                        toolInvocations = finalizeInterruptedToolInvocations(block.trace.toolInvocations),
+                        completedAtMillis = block.trace.completedAtMillis ?: System.currentTimeMillis(),
+                    )
+                )
                 is AssistantResponseBlock.ToolGroup -> block.copy(
                     toolInvocations = finalizeInterruptedToolInvocations(block.toolInvocations),
                 )
@@ -1210,6 +1869,11 @@ class SessionExecutionManager(
             text = "",
             toolInvocations = block.toolInvocations,
         ).summaryText()
+        is AssistantResponseBlock.Reasoning -> block.trace.chunks.lastOrNull { chunk ->
+            chunk.detail.isNotBlank() || chunk.title.isNotBlank()
+        }?.let { chunk ->
+            chunk.detail.ifBlank { chunk.title }
+        } ?: "Thought for ${formatReasoningDurationLabel(block.trace)}"
     }
 
     private fun finalizeInterruptedToolInvocations(
@@ -1222,6 +1886,7 @@ class SessionExecutionManager(
                 isRunning = false,
                 outputJson = buildInterruptedToolOutput(invocation),
                 completedAtUptimeMillis = invocation.completedAtUptimeMillis ?: SystemClock.uptimeMillis(),
+                completedAtMillis = invocation.completedAtMillis ?: System.currentTimeMillis(),
             )
         }
     }
@@ -1262,6 +1927,63 @@ class SessionExecutionManager(
     private fun parseJsonObject(rawValue: String): JSONObject? =
         if (rawValue.isBlank()) null else runCatching { JSONObject(rawValue) }.getOrNull()
 
+    private fun approximateReasoningTokenCount(text: String): Int {
+        var count = 0
+        var inToken = false
+        text.forEach { char ->
+            when {
+                char.isWhitespace() -> inToken = false
+                isCjkReasoningChar(char) -> {
+                    count += 1
+                    inToken = false
+                }
+                !inToken -> {
+                    count += 1
+                    inToken = true
+                }
+            }
+        }
+        return count
+    }
+
+    private fun takeApproximateReasoningTokens(
+        text: String,
+        maxTokens: Int,
+    ): String {
+        if (maxTokens <= 0) return ""
+        var count = 0
+        var inToken = false
+        for (index in text.indices) {
+            val char = text[index]
+            when {
+                char.isWhitespace() -> inToken = false
+                isCjkReasoningChar(char) -> {
+                    count += 1
+                    inToken = false
+                }
+                !inToken -> {
+                    count += 1
+                    inToken = true
+                }
+            }
+            if (count >= maxTokens) {
+                return text.substring(0, index + 1)
+            }
+        }
+        return text
+    }
+
+    private fun isCjkReasoningChar(char: Char): Boolean {
+        val block = Character.UnicodeBlock.of(char)
+        return block == Character.UnicodeBlock.CJK_UNIFIED_IDEOGRAPHS ||
+            block == Character.UnicodeBlock.CJK_UNIFIED_IDEOGRAPHS_EXTENSION_A ||
+            block == Character.UnicodeBlock.CJK_UNIFIED_IDEOGRAPHS_EXTENSION_B ||
+            block == Character.UnicodeBlock.CJK_COMPATIBILITY_IDEOGRAPHS ||
+            block == Character.UnicodeBlock.HIRAGANA ||
+            block == Character.UnicodeBlock.KATAKANA ||
+            block == Character.UnicodeBlock.HANGUL_SYLLABLES
+    }
+
     private data class PendingEnvelope(
         val id: String,
         val mode: SessionFollowUpMode,
@@ -1301,6 +2023,13 @@ class SessionExecutionManager(
         val queuedInputs = ArrayDeque<PendingEnvelope>()
         val steerInputs = ArrayDeque<PendingEnvelope>()
         private var pendingBlockCounter: Long = 0
+        private var reasoningChunkCounter: Long = 0
+        private var reasoningTimelineCounter: Long = 0
+        var activeReasoningBlockId: String? = null
+        var activeDirectReasoningSummaryChunkId: String? = null
+        var reasoningFirstSummarySubmitted: Boolean = false
+        var reasoningLastSubmittedCharIndex: Int = 0
+        var reasoningLastTimedSummaryAtMillis: Long = 0L
 
         @Volatile
         var pauseRequested: Boolean = false
@@ -1316,26 +2045,36 @@ class SessionExecutionManager(
             pendingBlockCounter += 1
             return "$prefix-$sessionId-$nextId"
         }
-    }
-}
 
-private fun ChatMessage.summaryText(): String {
-    val textSummary = text.trim()
-    if (textSummary.isNotBlank()) return textSummary
-    if (toolInvocations.isNotEmpty()) {
-        return if (toolInvocations.size == 1) {
-            when (toolInvocations.first().toolName.lowercase()) {
-                "bash" -> "Ran bash command"
-                "fetch_bash_output" -> "Fetched bash output"
-                "kill_bash" -> "Stopped bash command"
-                "sleep" -> "Waited"
-                else -> "Used ${toolInvocations.first().toolName}"
-            }
-        } else {
-            "Used ${toolInvocations.size} tools"
+        fun nextReasoningChunkId(blockId: String): String {
+            val nextId = reasoningChunkCounter
+            reasoningChunkCounter += 1
+            return "$blockId-summary-$nextId"
+        }
+
+        fun nextReasoningTimelineOrder(): Long {
+            reasoningTimelineCounter += 1
+            return reasoningTimelineCounter
+        }
+
+        fun startReasoningBlock(blockId: String, nowMillis: Long) {
+            activeReasoningBlockId = blockId
+            activeDirectReasoningSummaryChunkId = null
+            reasoningFirstSummarySubmitted = false
+            reasoningLastSubmittedCharIndex = 0
+            reasoningLastTimedSummaryAtMillis = nowMillis
+        }
+
+        fun finishDirectReasoningSummaryChunk() {
+            activeDirectReasoningSummaryChunkId = null
+        }
+
+        fun finishReasoningBlock() {
+            activeReasoningBlockId = null
+            activeDirectReasoningSummaryChunkId = null
+            reasoningFirstSummarySubmitted = false
+            reasoningLastSubmittedCharIndex = 0
+            reasoningLastTimedSummaryAtMillis = 0L
         }
     }
-    if (attachments.isEmpty()) return "Empty message"
-    if (attachments.size == 1) return attachments.first().name
-    return "${attachments.size} attachments"
 }

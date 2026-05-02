@@ -533,6 +533,7 @@ private fun AetherAppContent(
                     onRemoveDraftAttachment = viewModel::removeDraftAttachment,
                     onSetSkillSelected = viewModel::setComposerSkillSelected,
                     onSetMcpServerSelected = viewModel::setComposerMcpServerSelected,
+                    conversationStateKey = uiState.currentSessionId,
                     onSetAgentModeSelected = viewModel::setComposerAgentModeSelected,
                     onCancelEdit = viewModel::cancelMessageEdit,
                     onSend = viewModel::sendCurrentMessage,
@@ -540,6 +541,7 @@ private fun AetherAppContent(
                     onSteerFollowUp = viewModel::steerCurrentMessage,
                     onMenu = { scope.launch { drawerState.open() } },
                     onNewChat = viewModel::startNewChat,
+                    pendingStatusDetail = currentSessionExecution?.pendingStatusDetail.orEmpty(),
                     onPickImages = {
                         imagePicker.launch(
                             PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
