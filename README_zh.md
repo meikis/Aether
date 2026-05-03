@@ -18,6 +18,10 @@
 </p>
 
 <p align="center">
+  国内用户交流反馈群 <a href="https://qun.qq.com/universal-share/share?ac=1&authKey=WW3dV15N2Fwwx8ccHc8Vr%2BKK%2FjahXsQxSyc1PFABg445%2BQstdp8wdKJXNJ%2F4ni8H&busi_data=eyJncm91cENvZGUiOiIxMDM5NzA3MDU0IiwidG9rZW4iOiJtTERRRmdRSFFSV1ZlWmltd0ovd3cyaDEvM0pKVnRUc01GZHN4eFlHdzYxZERMU3hyUGFER3VMem1BM0M2R0NpIiwidWluIjoiMjgzOTk5NzUyMiJ9&data=b-FXnCm72XohXWQFsusW_PQJ744NdI5giZMWJidb3-IfYVb5bEvpmpK2PMJnSiAjE8O-6aOi0ns1_TcY8JDoYA&svctype=4&tempid=h5_group_info">1039707054</a>
+</p>
+
+<p align="center">
   <table>
     <tr>
       <td><img src="public/welcome.jpg" width="280"></td>
