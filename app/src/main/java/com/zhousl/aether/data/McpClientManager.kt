@@ -3,24 +3,32 @@ package com.zhousl.aether.data
 import android.util.Log
 import com.zhousl.aether.termux.TermuxBashTool
 import com.zhousl.aether.termux.TermuxContract
+import java.io.IOException
 import java.util.Base64
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
+import okhttp3.Call
+import okhttp3.Callback
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.Response
 import okio.BufferedSource
 import org.json.JSONArray
 import org.json.JSONObject
 
 private const val DefaultMcpProtocolVersion = "2025-11-25"
 private const val McpRequestPollIntervalMillis = 150L
+private const val McpDefaultConnectTimeoutMillis = 15_000L
 private const val McpDefaultRequestTimeoutMillis = 60_000L
+private const val McpProtocolVersionHeader = "MCP-Protocol-Version"
+private const val McpSessionIdHeader = "Mcp-Session-Id"
 private const val McpLogTag = "AetherMcp"
 private const val EnableMcpLogging = false
 
@@ -130,6 +138,7 @@ class DenyingMcpClientCallbacks : McpClientCallbacks {
 class McpClientManager(
     private val bashTool: TermuxBashTool,
     private val callbacks: McpClientCallbacks = DenyingMcpClientCallbacks(),
+    private val diagnosticLogger: AetherDiagnosticLogger = AetherDiagnosticLogger.NoOp,
     private val httpClient: OkHttpClient = OkHttpClient.Builder()
         .connectTimeout(30, TimeUnit.SECONDS)
         .readTimeout(0, TimeUnit.MILLISECONDS)
@@ -167,6 +176,8 @@ class McpClientManager(
                             config = transportConfig,
                             protocolVersion = DefaultMcpProtocolVersion,
                             httpClient = httpClient,
+                            connectTimeoutMillis = server.connectTimeoutMillis,
+                            requestTimeoutMillis = server.requestTimeoutMillis,
                         )
                     }
                     val session = McpServerSession(
@@ -174,6 +185,7 @@ class McpClientManager(
                         transport = transport,
                         workspaceDirectory = workspaceDirectory,
                         callbacks = callbacks,
+                        diagnosticLogger = diagnosticLogger,
                     )
                     sessions[server.id] = session
                     session.connectAndRefresh()
@@ -182,6 +194,11 @@ class McpClientManager(
     }
 
     suspend fun disconnect(serverId: String) = withContext(Dispatchers.IO) {
+        diagnosticLogger.event(
+            category = "mcp",
+            event = "disconnect",
+            details = mapOf("server_id" to serverId),
+        )
         sessions.remove(serverId)?.close()
     }
 
@@ -245,10 +262,28 @@ class McpClientManager(
         runCatching {
             val binding = resolveToolBinding(toolCallName)
                 ?: error("Unknown MCP tool '$toolCallName'.")
+            diagnosticLogger.event(
+                category = "mcp",
+                event = "tool_call_start",
+                details = mapOf(
+                    "server_id" to binding.serverId,
+                    "server_name" to binding.serverName,
+                    "tool_name" to binding.toolName,
+                    "arguments_chars" to argumentsJson.length,
+                ),
+            )
             val arguments = runCatching { JSONObject(argumentsJson) }.getOrDefault(JSONObject())
             val result = sessions[binding.serverId]
                 ?.callTool(binding.toolName, arguments)
                 ?: error("MCP server '${binding.serverId}' is not connected.")
+            diagnosticLogger.event(
+                category = "mcp",
+                event = "tool_call_end",
+                details = mapOf(
+                    "server_id" to binding.serverId,
+                    "tool_name" to binding.toolName,
+                ),
+            )
             result.toString()
         }
     }
@@ -260,9 +295,26 @@ class McpClientManager(
     ): Result<String> = withContext(Dispatchers.IO) {
         runCatching {
             val resolvedServerId = resolveServerId(serverId)
+            diagnosticLogger.event(
+                category = "mcp",
+                event = "tool_call_start",
+                details = mapOf(
+                    "server_id" to resolvedServerId,
+                    "tool_name" to toolName,
+                    "arguments_chars" to arguments.toString().length,
+                ),
+            )
             val result = sessions[resolvedServerId]
                 ?.callTool(toolName, arguments)
                 ?: error("MCP server '$serverId' is not connected.")
+            diagnosticLogger.event(
+                category = "mcp",
+                event = "tool_call_end",
+                details = mapOf(
+                    "server_id" to resolvedServerId,
+                    "tool_name" to toolName,
+                ),
+            )
             result.toString()
         }
     }
@@ -377,14 +429,25 @@ private class McpServerSession(
     private val transport: McpSessionTransport,
     val workspaceDirectory: String,
     private val callbacks: McpClientCallbacks,
+    private val diagnosticLogger: AetherDiagnosticLogger,
 ) {
     private var requestCounter = 1L
     private var initialized = false
+    private var serverCapabilities = JSONObject()
     var snapshot: McpServerSnapshot = McpServerSnapshot(config = config)
         private set
 
     suspend fun connectAndRefresh() {
         snapshot = snapshot.copy(status = McpConnectionStatus.Connecting, errorMessage = "")
+        diagnosticLogger.event(
+            category = "mcp",
+            event = "connect_start",
+            details = mapOf(
+                "server_id" to config.id,
+                "server_name" to config.displayName,
+                "transport" to config.transport.javaClass.simpleName,
+            ),
+        )
         runCatching {
             transport.open()
             val initializeResult = call(
@@ -411,6 +474,7 @@ private class McpServerSession(
             initialized = true
             sendNotification("notifications/initialized")
             val protocolVersion = initializeResult.optString("protocolVersion")
+            serverCapabilities = initializeResult.optJSONObject("capabilities") ?: JSONObject()
             val serverInfo = initializeResult.optJSONObject("serverInfo")
                 ?.let { "${it.optString("name")} ${it.optString("version")}".trim() }
                 .orEmpty()
@@ -420,11 +484,30 @@ private class McpServerSession(
                 serverInfo = serverInfo,
                 errorMessage = "",
             )
+            diagnosticLogger.event(
+                category = "mcp",
+                event = "connect_ready",
+                details = mapOf(
+                    "server_id" to config.id,
+                    "server_name" to config.displayName,
+                    "protocol_version" to protocolVersion,
+                    "server_info" to serverInfo,
+                ),
+            )
             refreshCatalog()
         }.onFailure { throwable ->
             snapshot = snapshot.copy(
                 status = McpConnectionStatus.Error,
                 errorMessage = throwable.message ?: "Couldn't connect to MCP server.",
+            )
+            diagnosticLogger.exception(
+                category = "mcp",
+                event = "connect_failed",
+                throwable = throwable,
+                details = mapOf(
+                    "server_id" to config.id,
+                    "server_name" to config.displayName,
+                ),
             )
         }
     }
@@ -432,21 +515,76 @@ private class McpServerSession(
     suspend fun refreshCatalog() {
         if (!initialized) return
         runCatching {
-            val toolsResult = call("tools/list")
-            val resourcesResult = call("resources/list")
-            val promptsResult = call("prompts/list")
+            val toolsResult = callCatalogMethod(
+                method = "tools/list",
+                capabilityName = "tools",
+                defaultEnabled = true,
+            )
+            val resourcesResult = callCatalogMethod(
+                method = "resources/list",
+                capabilityName = "resources",
+                defaultEnabled = false,
+            )
+            val promptsResult = callCatalogMethod(
+                method = "prompts/list",
+                capabilityName = "prompts",
+                defaultEnabled = false,
+            )
             snapshot = snapshot.copy(
                 status = McpConnectionStatus.Ready,
                 tools = parseTools(config.id, config.displayName, toolsResult),
                 resources = parseResources(config.id, config.displayName, resourcesResult),
                 prompts = parsePrompts(config.id, config.displayName, promptsResult),
             )
+            diagnosticLogger.event(
+                category = "mcp",
+                event = "catalog_refreshed",
+                details = mapOf(
+                    "server_id" to config.id,
+                    "tool_count" to snapshot.tools.size,
+                    "resource_count" to snapshot.resources.size,
+                    "prompt_count" to snapshot.prompts.size,
+                ),
+            )
         }.onFailure { throwable ->
             snapshot = snapshot.copy(
                 status = McpConnectionStatus.Error,
                 errorMessage = throwable.message ?: "Couldn't refresh MCP server catalog.",
             )
+            diagnosticLogger.exception(
+                category = "mcp",
+                event = "catalog_refresh_failed",
+                throwable = throwable,
+                details = mapOf("server_id" to config.id),
+            )
         }
+    }
+
+    private suspend fun callCatalogMethod(
+        method: String,
+        capabilityName: String,
+        defaultEnabled: Boolean,
+    ): JSONObject {
+        if (!isServerCapabilityEnabled(capabilityName, defaultEnabled)) {
+            return JSONObject()
+        }
+        return try {
+            call(method)
+        } catch (exception: McpResponseException) {
+            if (exception.isMethodNotFound()) {
+                JSONObject()
+            } else {
+                throw exception
+            }
+        }
+    }
+
+    private fun isServerCapabilityEnabled(
+        capabilityName: String,
+        defaultEnabled: Boolean,
+    ): Boolean {
+        if (!serverCapabilities.has(capabilityName)) return defaultEnabled
+        return !serverCapabilities.isNull(capabilityName)
     }
 
     suspend fun callTool(
@@ -535,10 +673,38 @@ private class McpServerSession(
         logMcp("[${
             config.id
         }] -> method=$method id=$requestId")
+        diagnosticLogger.event(
+            category = "mcp",
+            event = "request_start",
+            requestId = requestId,
+            details = mapOf(
+                "server_id" to config.id,
+                "method" to method,
+                "timeout_millis" to effectiveTimeoutMillis(
+                    configuredMillis = config.requestTimeoutMillis,
+                    defaultMillis = McpDefaultRequestTimeoutMillis,
+                ),
+            ),
+        )
 
-        var messages = transport.sendMessage(request)
-        val deadline = System.currentTimeMillis() + config.requestTimeoutMillis.coerceAtLeast(
-            McpDefaultRequestTimeoutMillis,
+        var messages = runCatching { transport.sendMessage(request) }
+            .getOrElse { throwable ->
+                diagnosticLogger.exception(
+                    category = "mcp",
+                    event = "request_failed",
+                    requestId = requestId,
+                    throwable = throwable,
+                    details = mapOf(
+                        "server_id" to config.id,
+                        "method" to method,
+                        "duration_millis" to System.currentTimeMillis() - startedAt,
+                    ),
+                )
+                throw throwable
+            }
+        val deadline = System.currentTimeMillis() + effectiveTimeoutMillis(
+            configuredMillis = config.requestTimeoutMillis,
+            defaultMillis = McpDefaultRequestTimeoutMillis,
         )
 
         while (System.currentTimeMillis() < deadline) {
@@ -547,6 +713,16 @@ private class McpServerSession(
                 logMcp(
                     "[${config.id}] <- method=$method id=$requestId " +
                         "duration_ms=${System.currentTimeMillis() - startedAt}",
+                )
+                diagnosticLogger.event(
+                    category = "mcp",
+                    event = "request_end",
+                    requestId = requestId,
+                    details = mapOf(
+                        "server_id" to config.id,
+                        "method" to method,
+                        "duration_millis" to System.currentTimeMillis() - startedAt,
+                    ),
                 )
                 return result
             }
@@ -557,6 +733,17 @@ private class McpServerSession(
         logMcp(
             "[${config.id}] timeout method=$method id=$requestId " +
                 "duration_ms=${System.currentTimeMillis() - startedAt}",
+        )
+        diagnosticLogger.event(
+            category = "mcp",
+            event = "request_timeout",
+            level = "warn",
+            requestId = requestId,
+            details = mapOf(
+                "server_id" to config.id,
+                "method" to method,
+                "duration_millis" to System.currentTimeMillis() - startedAt,
+            ),
         )
         error("Timed out waiting for MCP response to '$method'.")
     }
@@ -569,11 +756,15 @@ private class McpServerSession(
             if (message.optString("jsonrpc") != "2.0") continue
             if (message.has("id") && message.opt("id")?.toString() == requestId) {
                 if (message.has("error")) {
-                    val errorMessage = message.optJSONObject("error")
+                    val errorObject = message.optJSONObject("error")
+                    val errorMessage = errorObject
                         ?.optString("message")
                         .orEmpty()
                         .ifBlank { "MCP request failed." }
-                    error(errorMessage)
+                    throw McpResponseException(
+                        code = errorObject?.optInt("code") ?: 0,
+                        responseMessage = errorMessage,
+                    )
                 }
                 return message.optJSONObject("result") ?: JSONObject()
             }
@@ -693,37 +884,196 @@ private class StreamableHttpMcpTransport(
     private val config: McpTransportConfig.StreamableHttp,
     private val protocolVersion: String,
     private val httpClient: OkHttpClient,
+    connectTimeoutMillis: Long,
+    requestTimeoutMillis: Long,
 ) : McpSessionTransport {
-    override suspend fun open() = Unit
+    private val queuedMessages = ConcurrentLinkedQueue<JSONObject>()
+    private val requestHttpClient = httpClient.newBuilder()
+        .connectTimeout(
+            effectiveTimeoutMillis(connectTimeoutMillis, McpDefaultConnectTimeoutMillis),
+            TimeUnit.MILLISECONDS,
+        )
+        .readTimeout(
+            effectiveTimeoutMillis(requestTimeoutMillis, McpDefaultRequestTimeoutMillis),
+            TimeUnit.MILLISECONDS,
+        )
+        .writeTimeout(
+            effectiveTimeoutMillis(requestTimeoutMillis, McpDefaultRequestTimeoutMillis),
+            TimeUnit.MILLISECONDS,
+        )
+        .callTimeout(
+            effectiveTimeoutMillis(requestTimeoutMillis, McpDefaultRequestTimeoutMillis),
+            TimeUnit.MILLISECONDS,
+        )
+        .build()
+    private val streamHttpClient = httpClient.newBuilder()
+        .connectTimeout(
+            effectiveTimeoutMillis(connectTimeoutMillis, McpDefaultConnectTimeoutMillis),
+            TimeUnit.MILLISECONDS,
+        )
+        .readTimeout(0, TimeUnit.MILLISECONDS)
+        .writeTimeout(
+            effectiveTimeoutMillis(requestTimeoutMillis, McpDefaultRequestTimeoutMillis),
+            TimeUnit.MILLISECONDS,
+        )
+        .callTimeout(0, TimeUnit.MILLISECONDS)
+        .build()
+
+    @Volatile
+    private var sessionId: String = ""
+
+    @Volatile
+    private var closed: Boolean = true
+
+    @Volatile
+    private var receiveCall: Call? = null
+
+    @Volatile
+    private var receiveStreamUnsupported: Boolean = false
+
+    override suspend fun open() {
+        closed = false
+    }
 
     override suspend fun sendMessage(message: JSONObject): List<JSONObject> = withContext(Dispatchers.IO) {
         val request = Request.Builder()
             .url(config.url)
             .addHeader("Content-Type", "application/json")
             .addHeader("Accept", "application/json, text/event-stream")
-            .addHeader("MCP-Protocol-Version", protocolVersion)
+            .addHeader(McpProtocolVersionHeader, protocolVersion)
+            .applySessionHeader()
             .apply {
                 config.headers.forEach { addHeader(it.key, it.value) }
             }
             .post(message.toString().toRequestBody("application/json".toMediaType()))
             .build()
-        httpClient.newCall(request).execute().use { response ->
-            val body = response.body ?: error("MCP server returned an empty body.")
+        requestHttpClient.newCall(request).execute().use { response ->
+            updateSessionId(response)
+            if (response.code == 202 || response.code == 204) {
+                ensureReceiveStreamStarted()
+                return@withContext emptyList()
+            }
             if (!response.isSuccessful) {
                 error("MCP server returned HTTP ${response.code}.")
             }
+            val body = response.body ?: return@withContext emptyList()
             val contentType = response.header("Content-Type").orEmpty()
-            return@withContext if (contentType.contains("text/event-stream", ignoreCase = true)) {
+            val messages = if (contentType.contains("text/event-stream", ignoreCase = true)) {
                 parseSseMessages(body.source())
             } else {
-                listOf(JSONObject(body.string()))
+                parseJsonMessages(body.string())
             }
+            ensureReceiveStreamStarted()
+            return@withContext messages
         }
     }
 
-    override suspend fun pollMessages(): List<JSONObject> = emptyList()
+    override suspend fun pollMessages(): List<JSONObject> {
+        ensureReceiveStreamStarted()
+        return drainQueuedMessages()
+    }
 
-    override suspend fun close() = Unit
+    override suspend fun close() = withContext(Dispatchers.IO) {
+        closed = true
+        receiveCall?.cancel()
+        receiveCall = null
+        receiveStreamUnsupported = false
+        queuedMessages.clear()
+        val currentSessionId = sessionId
+        sessionId = ""
+        if (currentSessionId.isBlank()) return@withContext
+        runCatching {
+            val request = Request.Builder()
+                .url(config.url)
+                .addHeader(McpProtocolVersionHeader, protocolVersion)
+                .addHeader(McpSessionIdHeader, currentSessionId)
+                .apply {
+                    config.headers.forEach { addHeader(it.key, it.value) }
+                }
+                .delete()
+                .build()
+            requestHttpClient.newCall(request).execute().close()
+        }
+        Unit
+    }
+
+    private fun Request.Builder.applySessionHeader(): Request.Builder = apply {
+        val currentSessionId = sessionId
+        if (currentSessionId.isNotBlank()) {
+            addHeader(McpSessionIdHeader, currentSessionId)
+        }
+    }
+
+    private fun updateSessionId(response: Response) {
+        val nextSessionId = response.header(McpSessionIdHeader).orEmpty()
+        if (nextSessionId.isNotBlank() && nextSessionId != sessionId) {
+            sessionId = nextSessionId
+            receiveStreamUnsupported = false
+            receiveCall?.cancel()
+            receiveCall = null
+        }
+    }
+
+    @Synchronized
+    private fun ensureReceiveStreamStarted() {
+        if (closed || receiveStreamUnsupported || sessionId.isBlank() || receiveCall != null) return
+        val request = Request.Builder()
+            .url(config.url)
+            .addHeader("Accept", "text/event-stream")
+            .addHeader(McpProtocolVersionHeader, protocolVersion)
+            .addHeader(McpSessionIdHeader, sessionId)
+            .apply {
+                config.headers.forEach { addHeader(it.key, it.value) }
+            }
+            .get()
+            .build()
+        val call = streamHttpClient.newCall(request)
+        receiveCall = call
+        call.enqueue(
+            object : Callback {
+                override fun onFailure(
+                    call: Call,
+                    e: IOException,
+                ) {
+                    if (receiveCall == call) {
+                        receiveCall = null
+                    }
+                }
+
+                override fun onResponse(
+                    call: Call,
+                    response: Response,
+                ) {
+                    try {
+                        response.use {
+                            if (response.code == 405 || response.code == 404) {
+                                receiveStreamUnsupported = true
+                                return
+                            }
+                            if (!response.isSuccessful) return
+                            val body = response.body ?: return
+                            val contentType = response.header("Content-Type").orEmpty()
+                            if (!contentType.contains("text/event-stream", ignoreCase = true)) return
+                            readSseMessages(body.source()) { queuedMessages.add(it) }
+                        }
+                    } finally {
+                        if (receiveCall == call) {
+                            receiveCall = null
+                        }
+                    }
+                }
+            },
+        )
+    }
+
+    private fun drainQueuedMessages(): List<JSONObject> {
+        val messages = mutableListOf<JSONObject>()
+        while (true) {
+            val message = queuedMessages.poll() ?: break
+            messages += message
+        }
+        return messages
+    }
 }
 
 private class StdIoMcpTransport(
@@ -1038,14 +1388,49 @@ private fun parsePrompts(
     }
 }
 
+private class McpResponseException(
+    val code: Int,
+    responseMessage: String,
+) : RuntimeException(responseMessage) {
+    fun isMethodNotFound(): Boolean =
+        code == -32601 || message?.contains("method not found", ignoreCase = true) == true
+}
+
+private fun effectiveTimeoutMillis(
+    configuredMillis: Long,
+    defaultMillis: Long,
+): Long = configuredMillis.takeIf { it > 0L } ?: defaultMillis
+
+private fun parseJsonMessages(body: String): List<JSONObject> {
+    val trimmedBody = body.trim()
+    if (trimmedBody.isBlank()) return emptyList()
+    if (trimmedBody.startsWith("[")) {
+        val array = JSONArray(trimmedBody)
+        return buildList {
+            for (index in 0 until array.length()) {
+                array.optJSONObject(index)?.let(::add)
+            }
+        }
+    }
+    return listOf(JSONObject(trimmedBody))
+}
+
 private fun parseSseMessages(source: BufferedSource): List<JSONObject> {
     val results = mutableListOf<JSONObject>()
+    readSseMessages(source, results::add)
+    return results
+}
+
+private fun readSseMessages(
+    source: BufferedSource,
+    onMessage: (JSONObject) -> Unit,
+) {
     val eventData = StringBuilder()
     while (true) {
         val line = source.readUtf8Line() ?: break
         if (line.isEmpty()) {
             if (eventData.isNotEmpty()) {
-                runCatching { JSONObject(eventData.toString()) }.getOrNull()?.let(results::add)
+                runCatching { JSONObject(eventData.toString()) }.getOrNull()?.let(onMessage)
                 eventData.setLength(0)
             }
             continue
@@ -1058,9 +1443,8 @@ private fun parseSseMessages(source: BufferedSource): List<JSONObject> {
         eventData.append(line.removePrefix("data:").trimStart())
     }
     if (eventData.isNotEmpty()) {
-        runCatching { JSONObject(eventData.toString()) }.getOrNull()?.let(results::add)
+        runCatching { JSONObject(eventData.toString()) }.getOrNull()?.let(onMessage)
     }
-    return results
 }
 
 private fun encodeBase64(value: String): String =
