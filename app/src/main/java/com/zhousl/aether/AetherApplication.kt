@@ -14,6 +14,10 @@ import com.zhousl.aether.data.AetherDiagnosticLogger
 import com.zhousl.aether.data.ChatRepository
 import com.zhousl.aether.data.RootSetupController
 import com.zhousl.aether.data.ChatStateStore
+import com.zhousl.aether.data.ScheduledTask
+import com.zhousl.aether.data.ScheduledTaskManager
+import com.zhousl.aether.data.ScheduledTaskRepository
+import com.zhousl.aether.data.ScheduledTaskScheduler
 import com.zhousl.aether.data.SessionExecutionManager
 import com.zhousl.aether.data.SettingsRepository
 import com.zhousl.aether.data.WebToolsClient
@@ -87,6 +91,7 @@ class AetherAppRuntime(
     val settingsRepository = SettingsRepository(application)
     val chatRepository = ChatRepository(application)
     val extensionsRepository = AgentExtensionsRepository(application)
+    val scheduledTaskRepository = ScheduledTaskRepository(application)
     val bashTool = TermuxBashTool(
         context = application,
         diagnosticLogger = diagnosticLogger,
@@ -112,6 +117,14 @@ class AetherAppRuntime(
     val webToolsClient = WebToolsClient()
     val appForegroundTracker = AppForegroundTracker()
     val notificationController = AetherNotificationController(application)
+    val scheduledTaskScheduler = ScheduledTaskScheduler(
+        context = application,
+        diagnosticLogger = diagnosticLogger,
+    )
+    val scheduledTaskManager = ScheduledTaskManager(
+        repository = scheduledTaskRepository,
+        scheduler = scheduledTaskScheduler,
+    )
     val chatStateStore = ChatStateStore(
         scope = appScope,
         chatRepository = chatRepository,
@@ -127,6 +140,7 @@ class AetherAppRuntime(
         rootSetupController = rootSetupController,
         agentModeController = agentModeController,
         skillManager = skillManager,
+        scheduledTaskManager = scheduledTaskManager,
         webToolsClient = webToolsClient,
         notificationController = notificationController,
         appForegroundTracker = appForegroundTracker,
@@ -151,10 +165,85 @@ class AetherAppRuntime(
                 initializePostHog()
             }
         }
+        appScope.launch {
+            scheduledTaskManager.rescheduleAll()
+        }
     }
 
     fun initializePostHog() {
         application.initializePostHog()
+    }
+
+    fun handleScheduledTaskAlarm(
+        taskId: String,
+        pendingResult: android.content.BroadcastReceiver.PendingResult,
+    ) {
+        diagnosticLogger.event(
+            category = "scheduled_task",
+            event = "alarm_received",
+            details = mapOf("task_id" to taskId),
+        )
+        appScope.launch {
+            try {
+                val task = scheduledTaskManager.markTriggeredAndScheduleNext(taskId)
+                if (task == null) {
+                    diagnosticLogger.event(
+                        category = "scheduled_task",
+                        event = "trigger_missing_task",
+                        level = "warn",
+                        details = mapOf("task_id" to taskId),
+                    )
+                    return@launch
+                }
+                val started = startScheduledTaskFromAlarm(task)
+                diagnosticLogger.event(
+                    category = "scheduled_task",
+                    event = if (started) "trigger_started" else "trigger_skipped",
+                    level = if (started) "info" else "warn",
+                    details = mapOf("task_id" to taskId),
+                )
+            } finally {
+                pendingResult.finish()
+            }
+        }
+    }
+
+    private suspend fun startScheduledTaskFromAlarm(task: ScheduledTask): Boolean {
+        return try {
+            if (settingsRepository.settings.first().keepTasksRunningInBackground) {
+                runCatching {
+                    AetherForegroundService.ensureRunning(application)
+                }.onFailure { throwable ->
+                    diagnosticLogger.exception(
+                        category = "scheduled_task",
+                        event = "foreground_service_start_failed",
+                        throwable = throwable,
+                        details = mapOf("task_id" to task.id),
+                    )
+                }
+            }
+            sessionExecutionManager.startScheduledTask(task)
+        } catch (throwable: Throwable) {
+            diagnosticLogger.exception(
+                category = "scheduled_task",
+                event = "trigger_start_failed",
+                throwable = throwable,
+                details = mapOf("task_id" to task.id),
+            )
+            false
+        }
+    }
+
+    fun rescheduleScheduledTasks(
+        pendingResult: android.content.BroadcastReceiver.PendingResult,
+    ) {
+        appScope.launch {
+            try {
+                scheduledTaskManager.rescheduleAll()
+            } finally {
+                pendingResult.finish()
+            }
+        }
     }
 }
 

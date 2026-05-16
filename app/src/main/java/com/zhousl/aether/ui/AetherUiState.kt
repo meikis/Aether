@@ -9,6 +9,7 @@ import com.zhousl.aether.data.InstalledSkill
 import com.zhousl.aether.data.LlmProviderConfig
 import com.zhousl.aether.data.McpServerConfig
 import com.zhousl.aether.data.RootSetupState
+import com.zhousl.aether.data.ScheduledTask
 import com.zhousl.aether.data.SessionExecutionState
 import com.zhousl.aether.termux.TermuxSetupState
 
@@ -202,6 +203,7 @@ data class AetherUiState(
     val rootSetupProgressReturnPage: RootSetupProgressReturnPage? = null,
     val installedSkills: List<InstalledSkill> = emptyList(),
     val mcpServers: List<McpServerConfig> = emptyList(),
+    val scheduledTasks: List<ScheduledTask> = emptyList(),
     val providerConfigs: List<LlmProviderConfig> = emptyList(),
     val isFetchingModels: Boolean = false,
     val showStarterPromptHint: Boolean = false,

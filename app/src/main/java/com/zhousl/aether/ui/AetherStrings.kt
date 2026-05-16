@@ -476,6 +476,7 @@ fun AetherStrings.toolInvocationTitleLabel(
     "aether_mcp_manage",
     "aether_termux_manage",
     "aether_agent_mode_manage",
+    "aether_scheduled_task_manage",
     "aether_developer_manage" -> formatAetherToolTitle(toolName, isRunning, arguments)
     "agent_display" -> formatAgentDisplayTitle(isRunning, arguments)
     else -> if (isChinese) {
@@ -557,6 +558,13 @@ private fun AetherStrings.formatAetherToolTitle(
             "refresh_displays" -> if (isRunning) "Refreshing Agent Mode displays" else "Refreshed Agent Mode displays"
             else -> if (isRunning) "Checking Agent Mode authorization" else "Checked Agent Mode authorization"
         }
+        "aether_scheduled_task_manage" -> when (action.lowercase()) {
+            "create" -> formatArgumentDrivenTitle(isRunning, "Creating", "Created", arguments?.optString("name").orEmpty(), "scheduled task")
+            "update" -> formatArgumentDrivenTitle(isRunning, "Updating", "Updated", optAetherString(arguments, "task_id", "taskId"), "scheduled task")
+            "remove" -> formatArgumentDrivenTitle(isRunning, "Removing", "Removed", optAetherString(arguments, "task_id", "taskId"), "scheduled task")
+            "set_enabled" -> formatArgumentDrivenTitle(isRunning, "Updating", "Updated", optAetherString(arguments, "task_id", "taskId"), "scheduled task")
+            else -> if (isRunning) "Reading scheduled tasks" else "Read scheduled tasks"
+        }
         "aether_developer_manage" -> if (isRunning) "Reading Aether diagnostics" else "Read Aether diagnostics"
         else -> if (isRunning) "Managing Aether" else "Managed Aether"
     }
@@ -592,6 +600,13 @@ private fun AetherStrings.summarizeAetherToolCommand(
             append(action.ifBlank { "inspect_authorization" })
             if (arguments.has("enabled")) append(" enabled=").append(arguments.optBoolean("enabled"))
             appendAetherKeyValue(arguments, "method")
+        }.trim()
+        "aether_scheduled_task_manage" -> buildString {
+            append("aether_scheduled_task_manage action=")
+            append(action.ifBlank { "list" })
+            appendAetherKeyValue(arguments, "task_id", "taskId")
+            appendAetherKeyValue(arguments, "name")
+            if (arguments.has("enabled")) append(" enabled=").append(arguments.optBoolean("enabled"))
         }.trim()
         "aether_developer_manage" -> buildString {
             append("aether_developer_manage action=")

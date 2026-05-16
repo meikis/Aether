@@ -444,6 +444,7 @@ class AetherAgent(
         "aether_mcp_manage",
         "aether_termux_manage",
         "aether_agent_mode_manage",
+        "aether_scheduled_task_manage",
         "aether_developer_manage",
         "agent_display" -> false
 
@@ -504,6 +505,7 @@ class AetherAgent(
             "aether_mcp_manage",
             "aether_termux_manage",
             "aether_agent_mode_manage",
+            "aether_scheduled_task_manage",
             "aether_developer_manage" -> selfManagementTool.execute(
                 toolName = toolCall.name,
                 argumentsJson = toolCall.arguments,
@@ -752,6 +754,7 @@ class AetherAgent(
         "aether_mcp_manage",
         "aether_termux_manage",
         "aether_agent_mode_manage",
+        "aether_scheduled_task_manage",
         "aether_developer_manage",
         "agent_display" -> false
 

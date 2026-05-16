@@ -26,6 +26,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import org.json.JSONArray
@@ -110,6 +111,7 @@ class SessionExecutionManager(
     private val rootSetupController: RootSetupController,
     private val agentModeController: AgentModeController,
     private val skillManager: AgentSkillManager,
+    private val scheduledTaskManager: ScheduledTaskManager,
     private val webToolsClient: WebToolsClient,
     private val notificationController: AetherNotificationController,
     private val appForegroundTracker: AppForegroundTracker,
@@ -277,6 +279,82 @@ class SessionExecutionManager(
         }
     }
 
+    suspend fun startScheduledTask(task: ScheduledTask): Boolean {
+        if (!task.isEnabled || task.prompt.isBlank()) return false
+        val settings = settingsRepository.settings.first()
+        val providerConfigs = settingsRepository.providerConfigs.first()
+        val sessionId = task.defaultSessionId()
+        val now = System.currentTimeMillis()
+        val userMessage = ChatMessage(
+            id = "scheduled-${task.id.take(8)}-$now",
+            author = MessageAuthor.User,
+            text = task.prompt,
+            createdAtMillis = now,
+        )
+
+        if (isSessionRunning(sessionId)) {
+            return submitFollowUp(
+                sessionId = sessionId,
+                message = userMessage,
+                mode = SessionFollowUpMode.Queue,
+            )
+        }
+
+        var selectedModelKey = ""
+        var requestMessages: List<ChatMessage> = emptyList()
+        var selectedSkillIds: List<String> = emptyList()
+        var activeSkills: List<ActiveSkillContext> = emptyList()
+        var activeMcpServerIds: List<String> = emptyList()
+        var agentModeEnabled = false
+
+        chatStateStore.updateAndFlush { persisted ->
+            val updatedSessions = persisted.sessions.toMutableList()
+            val existingIndex = updatedSessions.indexOfFirst { it.id == sessionId }
+            val updatedSession = if (existingIndex >= 0) {
+                val existing = updatedSessions.removeAt(existingIndex)
+                existing.withDerivedMessages(existing.messages + userMessage)
+            } else {
+                ChatSession(
+                    id = sessionId,
+                    title = task.name.ifBlank { "Scheduled task" },
+                    preview = userMessage.summaryText(),
+                    hasCustomTitle = true,
+                    messages = listOf(userMessage),
+                    selectedModelKey = resolveDefaultChatModelKey(settings, providerConfigs),
+                )
+            }
+            selectedModelKey = updatedSession.selectedModelKey
+            requestMessages = updatedSession.messages
+            selectedSkillIds = updatedSession.selectedSkillIds
+            activeSkills = updatedSession.activeSkills
+            activeMcpServerIds = updatedSession.activeMcpServerIds
+            agentModeEnabled = updatedSession.agentModeEnabled
+            updatedSessions.add(0, updatedSession)
+            persisted.copy(
+                sessions = updatedSessions,
+                currentSessionId = sessionId,
+            )
+        }
+
+        startTurn(
+            SessionTurnRequest(
+                sessionId = sessionId,
+                settings = resolveModelSettings(
+                    baseSettings = settings,
+                    providerConfigs = providerConfigs,
+                    preferredModelKey = selectedModelKey,
+                    fallbackModelKey = resolveDefaultChatModelKey(settings, providerConfigs),
+                ),
+                requestMessages = requestMessages,
+                selectedSkillIds = selectedSkillIds,
+                activeSkills = activeSkills,
+                activeMcpServerIds = activeMcpServerIds,
+                agentModeEnabled = agentModeEnabled,
+            )
+        )
+        return true
+    }
+
     private suspend fun runSession(
         handle: SessionExecutionHandle,
         initialRequest: SessionTurnRequest,
@@ -372,6 +450,7 @@ class SessionExecutionManager(
                 rootSetupController = rootSetupController,
                 agentModeController = agentModeController,
                 mcpClientManager = mcpClientManager,
+                scheduledTaskManager = scheduledTaskManager,
                 diagnosticLogger = diagnosticLogger,
             ),
             diagnosticLogger = diagnosticLogger,

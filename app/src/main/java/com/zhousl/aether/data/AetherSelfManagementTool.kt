@@ -18,6 +18,7 @@ class AetherSelfManagementTool(
     private val rootSetupController: RootSetupController,
     private val agentModeController: AgentModeController,
     private val mcpClientManager: McpClientManager,
+    private val scheduledTaskManager: ScheduledTaskManager,
     private val diagnosticLogger: AetherDiagnosticLogger = AetherDiagnosticLogger.NoOp,
 ) {
     fun toolDefinitions(): List<JSONObject> = listOf(
@@ -45,6 +46,7 @@ class AetherSelfManagementTool(
                                             "mcp_servers",
                                             "termux",
                                             "agent_mode",
+                                            "scheduled_tasks",
                                             "developer",
                                         )
                                     ),
@@ -179,6 +181,36 @@ class AetherSelfManagementTool(
             required = listOf("action"),
         ),
         buildAetherToolDefinition(
+            name = "aether_scheduled_task_manage",
+            description = "List, create, update, enable, disable, or remove Aether scheduled tasks. Scheduled tasks wake Aether at the next matching time and run the prompt as an automated Agent turn.",
+            properties = JSONObject().apply {
+                put(
+                    "action",
+                    JSONObject().apply {
+                        put("type", "string")
+                        put("enum", JSONArray(listOf("list", "create", "update", "remove", "set_enabled")))
+                    },
+                )
+                put("task_id", JSONObject().apply { put("type", "string") })
+                put("name", JSONObject().apply { put("type", "string") })
+                put("prompt", JSONObject().apply { put("type", "string") })
+                put("session_id", JSONObject().apply { put("type", "string") })
+                put("enabled", JSONObject().apply { put("type", "boolean") })
+                put(
+                    "schedule",
+                    JSONObject().apply {
+                        put("type", "object")
+                        put(
+                            "description",
+                            "Schedule object. interval: {type:'interval', interval_minutes:30, active_start_time:'13:00', active_end_time:'18:00'}; daily: {type:'daily', times:['09:00','17:30']}; weekly: {type:'weekly', days_of_week:['mon','fri'], time:'10:00'}.",
+                        )
+                        put("additionalProperties", true)
+                    },
+                )
+            },
+            required = listOf("action"),
+        ),
+        buildAetherToolDefinition(
             name = "aether_developer_manage",
             description = "Read Aether developer diagnostics such as recent diagnostic events or last crash details. Sensitive values are redacted.",
             properties = JSONObject().apply {
@@ -212,6 +244,7 @@ class AetherSelfManagementTool(
         "aether_mcp_manage" -> executeMcpManage(argumentsJson)
         "aether_termux_manage" -> executeTermuxManage(argumentsJson)
         "aether_agent_mode_manage" -> executeAgentModeManage(argumentsJson)
+        "aether_scheduled_task_manage" -> executeScheduledTaskManage(argumentsJson)
         "aether_developer_manage" -> executeDeveloperManage(argumentsJson)
         else -> failure("Unknown Aether self-management tool '$toolName'.")
     }
@@ -236,6 +269,7 @@ class AetherSelfManagementTool(
                 "mcp_servers" -> payload.put("mcp_servers", mcpServersJson(extensionState.mcpServers))
                 "termux" -> payload.put("termux", termuxStatusJson())
                 "agent_mode" -> payload.put("agent_mode", agentModeSettingsJson(settings))
+                "scheduled_tasks" -> payload.put("scheduled_tasks", scheduledTasksJson(scheduledTaskManager.snapshot()))
                 "developer" -> payload.put("developer", developerSummaryJson())
                 else -> return failure("Unsupported category '$category'.")
             }
@@ -598,6 +632,87 @@ class AetherSelfManagementTool(
         }
     }
 
+    private suspend fun executeScheduledTaskManage(argumentsJson: String): String {
+        val arguments = parseArguments(argumentsJson) ?: return invalidJson()
+        return when (val action = arguments.optString("action").trim().lowercase(Locale.US)) {
+            "list" -> {
+                val tasks = scheduledTaskManager.snapshot()
+                success(JSONObject().put("tasks", scheduledTasksJson(tasks))) {
+                    put("stdout", "Listed ${tasks.size} scheduled tasks.")
+                }
+            }
+
+            "create" -> {
+                val name = arguments.optString("name").trim().ifBlank { "Scheduled task" }
+                val prompt = arguments.optString("prompt").trim()
+                if (prompt.isBlank()) return failure("prompt is required for create.")
+                val schedule = parseScheduledTaskSchedule(arguments.optJSONObject("schedule"))
+                    ?: return failure("schedule is required and must be a valid interval, daily, or weekly schedule.")
+                val task = scheduledTaskManager.upsertTask(
+                    ScheduledTask(
+                        name = name,
+                        prompt = prompt,
+                        schedule = schedule,
+                        isEnabled = arguments.optNullableBoolean("enabled") ?: true,
+                        sessionId = optAetherString(arguments, "session_id", "sessionId"),
+                        createdBy = ScheduledTaskCreator.Agent,
+                    )
+                )
+                success(JSONObject().put("task", task.toPublicJson())) {
+                    put("stdout", "Created scheduled task '${task.name}'.")
+                }
+            }
+
+            "update" -> {
+                val taskId = optAetherString(arguments, "task_id", "taskId")
+                if (taskId.isBlank()) return failure("task_id is required for update.")
+                val existing = scheduledTaskManager.findTask(taskId)
+                    ?: return failure("Scheduled task '$taskId' was not found.")
+                val schedule = if (arguments.has("schedule") && !arguments.isNull("schedule")) {
+                    parseScheduledTaskSchedule(arguments.optJSONObject("schedule"))
+                        ?: return failure("schedule must be a valid interval, daily, or weekly schedule.")
+                } else {
+                    existing.schedule
+                }
+                val enabled = arguments.optNullableBoolean("enabled") ?: existing.isEnabled
+                val updated = scheduledTaskManager.upsertTask(
+                    existing.copy(
+                        name = arguments.optString("name").trim().ifBlank { existing.name },
+                        prompt = arguments.optString("prompt").trim().ifBlank { existing.prompt },
+                        schedule = schedule,
+                        isEnabled = enabled,
+                        sessionId = optAetherString(arguments, "session_id", "sessionId").ifBlank { existing.sessionId },
+                    )
+                )
+                success(JSONObject().put("task", updated.toPublicJson())) {
+                    put("stdout", "Updated scheduled task '${updated.name}'.")
+                }
+            }
+
+            "remove" -> {
+                val taskId = optAetherString(arguments, "task_id", "taskId")
+                if (taskId.isBlank()) return failure("task_id is required for remove.")
+                scheduledTaskManager.removeTask(taskId)
+                success(JSONObject().put("task_id", taskId)) {
+                    put("stdout", "Removed scheduled task '$taskId'.")
+                }
+            }
+
+            "set_enabled" -> {
+                val taskId = optAetherString(arguments, "task_id", "taskId")
+                if (taskId.isBlank()) return failure("task_id is required for set_enabled.")
+                if (!arguments.has("enabled")) return failure("enabled is required for set_enabled.")
+                val task = scheduledTaskManager.setTaskEnabled(taskId, arguments.optBoolean("enabled"))
+                    ?: return failure("Scheduled task '$taskId' was not found.")
+                success(JSONObject().put("task", task.toPublicJson())) {
+                    put("stdout", "Set scheduled task '${task.name}' enabled=${task.isEnabled}.")
+                }
+            }
+
+            else -> failure("Unsupported scheduled task action '$action'.")
+        }
+    }
+
     private fun executeDeveloperManage(argumentsJson: String): String {
         val arguments = parseArguments(argumentsJson) ?: return invalidJson()
         return when (val action = arguments.optString("action").trim().lowercase(Locale.US)) {
@@ -666,6 +781,12 @@ class AetherSelfManagementTool(
             .put("diagnostic_events_available", diagnosticLogger.readEventsText().isNotBlank())
             .put("last_crash_available", diagnosticLogger.readLastCrashText().isNotBlank())
             .put("tools", JSONArray(listOf("aether_developer_manage")))
+
+    private fun scheduledTasksJson(tasks: List<ScheduledTask>): JSONArray =
+        JSONArray().apply {
+            tasks.sortedWith(compareBy<ScheduledTask> { it.nextRunAtMillis ?: Long.MAX_VALUE }.thenBy { it.name.lowercase(Locale.US) })
+                .forEach { put(it.toPublicJson()) }
+        }
 
     private fun skillsJson(skills: List<InstalledSkill>): JSONArray =
         JSONArray().apply {
@@ -926,6 +1047,14 @@ class AetherSelfManagementTool(
     private fun JSONObject.optNullableLong(name: String): Long? =
         if (has(name)) optLong(name) else null
 
+    private fun optAetherString(
+        arguments: JSONObject,
+        primary: String,
+        secondary: String,
+    ): String = arguments.optString(primary).trim().ifBlank {
+        arguments.optString(secondary).trim()
+    }
+
     private companion object {
         val SupportedConfigCategories = listOf(
             "general",
@@ -935,6 +1064,7 @@ class AetherSelfManagementTool(
             "mcp_servers",
             "termux",
             "agent_mode",
+            "scheduled_tasks",
             "developer",
         )
         val SensitiveKeyFragments = listOf(
