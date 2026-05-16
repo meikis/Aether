@@ -255,16 +255,6 @@ fun usesOfficialVertexEndpoint(
         host.endsWith("-aiplatform.googleapis.com")
 }
 
-fun shouldShowResumeSetupBanner(
-    settings: AppSettings,
-    messageCount: Int,
-    draftInput: String,
-    hasDraftAttachments: Boolean,
-): Boolean = messageCount == 0 &&
-    !settings.isOnboardingComplete() &&
-    draftInput.isBlank() &&
-    !hasDraftAttachments
-
 fun shouldMarkOnboardingCompleted(
     settings: AppSettings,
     isSuccessfulAssistantReply: Boolean,

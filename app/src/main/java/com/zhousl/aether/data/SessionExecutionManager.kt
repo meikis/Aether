@@ -136,7 +136,7 @@ class SessionExecutionManager(
                     settings.keepTasksRunningInBackground &&
                     _executionStates.value.values.any { it.isRunning }
                 ) {
-                    AetherForegroundService.ensureRunning(application)
+                    ensureForegroundServiceRunning()
                 }
             }
         }
@@ -1185,7 +1185,19 @@ class SessionExecutionManager(
             currentSettings.value.keepTasksRunningInBackground &&
             _executionStates.value.values.any { it.isRunning }
         ) {
+            ensureForegroundServiceRunning()
+        }
+    }
+
+    private fun ensureForegroundServiceRunning() {
+        try {
             AetherForegroundService.ensureRunning(application)
+        } catch (throwable: Throwable) {
+            diagnosticLogger.exception(
+                category = "session",
+                event = "foreground_service_start_failed",
+                throwable = throwable,
+            )
         }
     }
 
@@ -1267,6 +1279,7 @@ class SessionExecutionManager(
                 append("Type: ${attachment.mimeType.ifBlank { "unknown" }}\n")
                 attachment.sizeBytes?.let { append("Size: ${formatBytes(it)}\n") }
                 append("Path: ${attachment.workspacePath}\n")
+                append("This file was uploaded in the current session.\n")
                 append(accessHint)
             }
         )

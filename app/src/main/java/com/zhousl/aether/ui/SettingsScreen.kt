@@ -1,4 +1,4 @@
-package com.zhousl.aether.ui
+﻿package com.zhousl.aether.ui
 
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
@@ -58,6 +58,7 @@ import androidx.compose.material.icons.rounded.Info
 import androidx.compose.material.icons.rounded.Link
 import androidx.compose.material.icons.rounded.Person
 import androidx.compose.material.icons.rounded.Refresh
+import androidx.compose.material.icons.rounded.Schedule
 import androidx.compose.material.icons.rounded.Terminal
 import androidx.compose.material.icons.rounded.WbSunny
 import androidx.compose.material3.Button
@@ -106,20 +107,28 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import com.zhousl.aether.BuildConfig
 import com.zhousl.aether.R
+import java.util.Locale
 import com.zhousl.aether.data.AetherPrivacyPolicyUrl
 import com.zhousl.aether.data.AetherWebsiteUrl
 import com.zhousl.aether.data.AgentModeAuthorizationIssue
 import com.zhousl.aether.data.AgentModeAuthorizationMethod
 import com.zhousl.aether.data.AgentModeAuthorizationState
 import com.zhousl.aether.data.AgentModeDisplayState
+import com.zhousl.aether.data.AgentWorkspaceMode
 import com.zhousl.aether.data.AutomaticModelPurpose
 import com.zhousl.aether.data.AppLanguage
 import com.zhousl.aether.data.AppThemeMode
 import com.zhousl.aether.data.LlmProvider
 import com.zhousl.aether.data.LlmProviderConfig
+import com.zhousl.aether.data.McpServerTestOperation
 import com.zhousl.aether.data.ProviderModelOption
 import com.zhousl.aether.data.RootSetupIssue
 import com.zhousl.aether.data.RootSetupState
+import com.zhousl.aether.data.ScheduledTask
+import com.zhousl.aether.data.ScheduledTaskCreator
+import com.zhousl.aether.data.ScheduledTaskSchedule
+import com.zhousl.aether.data.formatScheduledTaskTime
+import com.zhousl.aether.data.summary
 import com.zhousl.aether.data.availableModelOptions
 import com.zhousl.aether.data.availableModels
 import com.zhousl.aether.data.enabledModels
@@ -162,6 +171,9 @@ private enum class SettingsPage {
     McpServers,
     AddMcpServer,
     EditMcpServer,
+    ScheduledTasks,
+    AddScheduledTask,
+    EditScheduledTask,
     Termux,
     AgentMode,
     RootSetupProgress,
@@ -180,6 +192,7 @@ private fun SettingsPage.depth(): Int = when (this) {
     SettingsPage.Reliability,
     SettingsPage.Skills,
     SettingsPage.McpServers,
+    SettingsPage.ScheduledTasks,
     SettingsPage.Termux,
     SettingsPage.AgentMode,
     SettingsPage.Developer,
@@ -190,6 +203,8 @@ private fun SettingsPage.depth(): Int = when (this) {
     SettingsPage.AddSkill,
     SettingsPage.AddMcpServer,
     SettingsPage.EditMcpServer,
+    SettingsPage.AddScheduledTask,
+    SettingsPage.EditScheduledTask,
     SettingsPage.RootSetupProgress -> 2
     SettingsPage.DefaultChatModel,
     SettingsPage.DefaultTitleModel,
@@ -207,6 +222,44 @@ private fun RootSetupProgressReturnPage.toSettingsPage(): SettingsPage =
         RootSetupProgressReturnPage.Termux -> SettingsPage.Termux
         RootSetupProgressReturnPage.AgentMode -> SettingsPage.AgentMode
     }
+
+private fun formatTaskMinute(minuteOfDay: Int): String {
+    val normalized = minuteOfDay.coerceIn(0, 1_439)
+    return "%02d:%02d".format(Locale.US, normalized / 60, normalized % 60)
+}
+
+private fun parseTaskMinute(value: String): Int? {
+    val parts = value.trim().split(':')
+    if (parts.size != 2) return null
+    val hour = parts[0].toIntOrNull() ?: return null
+    val minute = parts[1].toIntOrNull() ?: return null
+    if (hour !in 0..23 || minute !in 0..59) return null
+    return hour * 60 + minute
+}
+
+private fun parseTaskTimes(value: String): List<Int> =
+    value.split(',', ';', '\n')
+        .mapNotNull(::parseTaskMinute)
+        .distinct()
+        .sorted()
+
+private fun parseTaskDays(value: String): List<Int> =
+    value.split(',', ';', ' ')
+        .mapNotNull { raw ->
+            val normalized = raw.trim().lowercase(Locale.US)
+            when (normalized.take(3)) {
+                "mon" -> 1
+                "tue" -> 2
+                "wed" -> 3
+                "thu" -> 4
+                "fri" -> 5
+                "sat" -> 6
+                "sun" -> 7
+                else -> normalized.toIntOrNull()
+            }?.takeIf { it in 1..7 }
+        }
+        .distinct()
+        .sorted()
 
 // -----------------------------------------------------------------------------
 // Animation constants
@@ -253,6 +306,7 @@ fun SettingsScreen(
     llmInactivityReconnectTimeoutSeconds: Int,
     keepTasksRunningInBackground: Boolean,
     notifyOnTaskCompletion: Boolean,
+    agentWorkspaceMode: AgentWorkspaceMode,
     agentModeAuthorizationEnabled: Boolean,
     agentModeAuthorizationMethod: AgentModeAuthorizationMethod,
     agentModeAuthorizationState: AgentModeAuthorizationState,
@@ -265,6 +319,7 @@ fun SettingsScreen(
     defaultNamingModelKey: String,
     agentModeDisplayState: AgentModeDisplayState,
     providerConfigs: List<LlmProviderConfig>,
+    scheduledTasks: List<ScheduledTask>,
     termuxSetupState: TermuxSetupState,
     developerTermuxReadyOverride: Boolean?,
     installedSkills: List<com.zhousl.aether.data.InstalledSkill>,
@@ -282,6 +337,7 @@ fun SettingsScreen(
         Int,
         Boolean,
         Boolean,
+        AgentWorkspaceMode,
         Boolean,
         AgentModeAuthorizationMethod,
         AppLanguage,
@@ -302,9 +358,13 @@ fun SettingsScreen(
     onToggleSkillEnabled: (String, Boolean) -> Unit,
     onRemoveSkill: (String) -> Unit,
     onSaveHttpMcpServer: (String?, String, String, String) -> Unit,
-    onSaveStdIoMcpServer: (String?, String, String, String, String) -> Unit,
+    onSaveStdIoMcpServer: (String?, String, String, String, String, String) -> Unit,
     onToggleMcpServerEnabled: (String, Boolean) -> Unit,
     onRemoveMcpServer: (String) -> Unit,
+    onTestMcpServer: (String, McpServerTestOperation, (String) -> Unit) -> Unit,
+    onSaveScheduledTask: (String?, String, String, ScheduledTaskSchedule, Boolean) -> Unit,
+    onToggleScheduledTaskEnabled: (String, Boolean) -> Unit,
+    onRemoveScheduledTask: (String) -> Unit,
     onRequestTermuxPermission: () -> Unit,
     onImportAppData: () -> Unit,
     onExportAppData: () -> Unit,
@@ -353,6 +413,9 @@ fun SettingsScreen(
     var notifyOnTaskCompletionValue by rememberSaveable {
         mutableStateOf(notifyOnTaskCompletion)
     }
+    var agentWorkspaceModeValue by rememberSaveable {
+        mutableStateOf(agentWorkspaceMode)
+    }
     var agentModeAuthorizationEnabledValue by rememberSaveable {
         mutableStateOf(agentModeAuthorizationEnabled)
     }
@@ -374,6 +437,7 @@ fun SettingsScreen(
     // Track which provider is being edited
     var editingProviderId by rememberSaveable { mutableStateOf<String?>(null) }
     var editingMcpServerId by rememberSaveable { mutableStateOf<String?>(null) }
+    var editingScheduledTaskId by rememberSaveable { mutableStateOf<String?>(null) }
     var lastObservedRootSetupIssue by rememberSaveable { mutableStateOf(rootSetupState.issue) }
 
     LaunchedEffect(rootSetupState.issue) {
@@ -402,6 +466,7 @@ fun SettingsScreen(
             ),
             keepTasksRunningInBackgroundValue,
             notifyOnTaskCompletionValue,
+            agentWorkspaceModeValue,
             agentModeAuthorizationEnabledValue,
             agentModeAuthorizationMethodValue,
             languageValue,
@@ -428,6 +493,7 @@ fun SettingsScreen(
             ),
             keepTasksRunningInBackgroundValue,
             notifyOnTaskCompletionValue,
+            agentWorkspaceModeValue,
             agentModeAuthorizationEnabledValue,
             agentModeAuthorizationMethodValue,
             languageValue,
@@ -454,6 +520,7 @@ fun SettingsScreen(
             ),
             keepTasksRunningInBackgroundValue,
             notifyOnTaskCompletionValue,
+            agentWorkspaceModeValue,
             agentModeAuthorizationEnabledValue,
             agentModeAuthorizationMethodValue,
             languageValue,
@@ -502,6 +569,7 @@ fun SettingsScreen(
         SettingsPage.AddProvider, SettingsPage.EditProvider -> SettingsPage.Providers
         SettingsPage.AddSkill -> SettingsPage.Skills
         SettingsPage.AddMcpServer, SettingsPage.EditMcpServer -> SettingsPage.McpServers
+        SettingsPage.AddScheduledTask, SettingsPage.EditScheduledTask -> SettingsPage.ScheduledTasks
         SettingsPage.RootSetupProgress -> rootSetupReturnPageValue()
         else -> SettingsPage.Hub
     }
@@ -567,6 +635,7 @@ fun SettingsScreen(
                 termuxReady = termuxSetupState.isReady,
                 skillCount = installedSkills.size,
                 mcpServerCount = mcpServers.size,
+                scheduledTaskCount = scheduledTasks.size,
                 onReplayOnboarding = ::persistAndReplayOnboarding,
                 onNavigate = { page ->
                     if (page == SettingsPage.AgentMode && !termuxSetupState.isReady) {
@@ -751,6 +820,7 @@ fun SettingsScreen(
                 mcpServers = mcpServers,
                 onToggleMcpServerEnabled = onToggleMcpServerEnabled,
                 onRemoveMcpServer = onRemoveMcpServer,
+                onTestMcpServer = onTestMcpServer,
                 onEdit = { serverId ->
                     editingMcpServerId = serverId
                     currentPage = SettingsPage.EditMcpServer.name
@@ -766,8 +836,8 @@ fun SettingsScreen(
                     onSaveHttpMcpServer(serverId, name, url, headers)
                     currentPage = SettingsPage.McpServers.name
                 },
-                onSaveStdIoMcpServer = { serverId, name, cmd, wd, env ->
-                    onSaveStdIoMcpServer(serverId, name, cmd, wd, env)
+                onSaveStdIoMcpServer = { serverId, name, cmd, args, wd, env ->
+                    onSaveStdIoMcpServer(serverId, name, cmd, args, wd, env)
                     currentPage = SettingsPage.McpServers.name
                 },
                 onBack = { currentPage = SettingsPage.McpServers.name },
@@ -780,17 +850,49 @@ fun SettingsScreen(
                     onSaveHttpMcpServer(serverId, name, url, headers)
                     currentPage = SettingsPage.McpServers.name
                 },
-                onSaveStdIoMcpServer = { serverId, name, cmd, wd, env ->
-                    onSaveStdIoMcpServer(serverId, name, cmd, wd, env)
+                onSaveStdIoMcpServer = { serverId, name, cmd, args, wd, env ->
+                    onSaveStdIoMcpServer(serverId, name, cmd, args, wd, env)
                     currentPage = SettingsPage.McpServers.name
                 },
                 onBack = { currentPage = SettingsPage.McpServers.name },
+            )
+
+            SettingsPage.ScheduledTasks -> ScheduledTasksPage(
+                tasks = scheduledTasks,
+                onToggleEnabled = onToggleScheduledTaskEnabled,
+                onRemove = onRemoveScheduledTask,
+                onEdit = { taskId ->
+                    editingScheduledTaskId = taskId
+                    currentPage = SettingsPage.EditScheduledTask.name
+                },
+                onAddNew = { currentPage = SettingsPage.AddScheduledTask.name },
+                onBack = { currentPage = SettingsPage.Hub.name },
+            )
+
+            SettingsPage.AddScheduledTask -> ScheduledTaskEditPage(
+                existingTask = null,
+                onSave = { name, prompt, schedule, enabled ->
+                    onSaveScheduledTask(null, name, prompt, schedule, enabled)
+                    currentPage = SettingsPage.ScheduledTasks.name
+                },
+                onBack = { currentPage = SettingsPage.ScheduledTasks.name },
+            )
+
+            SettingsPage.EditScheduledTask -> ScheduledTaskEditPage(
+                existingTask = scheduledTasks.firstOrNull { it.id == editingScheduledTaskId },
+                onSave = { name, prompt, schedule, enabled ->
+                    onSaveScheduledTask(editingScheduledTaskId, name, prompt, schedule, enabled)
+                    currentPage = SettingsPage.ScheduledTasks.name
+                },
+                onBack = { currentPage = SettingsPage.ScheduledTasks.name },
             )
 
             SettingsPage.Termux -> TermuxSettingsPage(
                 title = strings.termux,
                 termuxSetupState = termuxSetupState,
                 rootSetupState = rootSetupState,
+                selectedWorkspaceMode = agentWorkspaceModeValue,
+                onWorkspaceModeSelected = { agentWorkspaceModeValue = it },
                 onRequestTermuxPermission = onRequestTermuxPermission,
                 onOpenAppPermissions = onOpenAppPermissions,
                 onOpenTermuxSettings = onOpenTermuxSettings,
@@ -879,6 +981,7 @@ private fun SettingsHub(
     termuxReady: Boolean,
     skillCount: Int,
     mcpServerCount: Int,
+    scheduledTaskCount: Int,
     onReplayOnboarding: () -> Unit,
     onNavigate: (SettingsPage) -> Unit,
     onBack: () -> Unit,
@@ -973,6 +1076,17 @@ private fun SettingsHub(
                     title = strings.mcpServers,
                     subtitle = strings.serverCountSummary(mcpServerCount),
                     onClick = { onNavigate(SettingsPage.McpServers) },
+                )
+                CardDivider()
+                SettingsNavRow(
+                    icon = Icons.Rounded.Schedule,
+                    title = tr(strings, "Scheduled Tasks", "定时任务"),
+                    subtitle = if (scheduledTaskCount == 0) {
+                        tr(strings, "No scheduled tasks", "暂无定时任务")
+                    } else {
+                        tr(strings, "$scheduledTaskCount configured", "已配置 $scheduledTaskCount 个")
+                    },
+                    onClick = { onNavigate(SettingsPage.ScheduledTasks) },
                 )
                 CardDivider()
                 SettingsNavRow(
@@ -2035,11 +2149,13 @@ private fun McpServersListPage(
     mcpServers: List<com.zhousl.aether.data.McpServerConfig>,
     onToggleMcpServerEnabled: (String, Boolean) -> Unit,
     onRemoveMcpServer: (String) -> Unit,
+    onTestMcpServer: (String, McpServerTestOperation, (String) -> Unit) -> Unit,
     onEdit: (String) -> Unit,
     onAddNew: () -> Unit,
     onBack: () -> Unit,
 ) {
     val strings = rememberAetherStrings()
+    var testResultText by rememberSaveable { mutableStateOf("") }
     SubPageScaffold(
         title = title,
         onBack = onBack,
@@ -2088,8 +2204,23 @@ private fun McpServersListPage(
                     onToggleEnabled = { enabled -> onToggleMcpServerEnabled(server.id, enabled) },
                     onEdit = { onEdit(server.id) },
                     onRemove = { onRemoveMcpServer(server.id) },
+                    onTest = { operation ->
+                        onTestMcpServer(server.id, operation) { result ->
+                            testResultText = result
+                        }
+                    },
                 )
                 Spacer(Modifier.height(12.dp))
+            }
+            if (testResultText.isNotBlank()) {
+                SettingsCardGroup {
+                    Text(
+                        text = testResultText,
+                        modifier = Modifier.padding(16.dp),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = AetherOnSurfaceVariant,
+                    )
+                }
             }
         }
     }
@@ -2101,6 +2232,7 @@ private fun McpServerCard(
     onToggleEnabled: (Boolean) -> Unit,
     onEdit: () -> Unit,
     onRemove: () -> Unit,
+    onTest: (McpServerTestOperation) -> Unit,
 ) {
     val strings = rememberAetherStrings()
     var expanded by rememberSaveable(server.id) { mutableStateOf(false) }
@@ -2167,6 +2299,23 @@ private fun McpServerCard(
         )
         if (expanded) {
             Spacer(Modifier.height(14.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                SettingsSubtleActionButton(
+                    label = tr(strings, "Tools", "工具"),
+                    onClick = { onTest(McpServerTestOperation.ListTools) },
+                    modifier = Modifier.weight(1f),
+                )
+                SettingsSubtleActionButton(
+                    label = tr(strings, "Resources", "资源"),
+                    onClick = { onTest(McpServerTestOperation.ListResources) },
+                    modifier = Modifier.weight(1f),
+                )
+                SettingsSubtleActionButton(
+                    label = tr(strings, "Prompts", "提示词"),
+                    onClick = { onTest(McpServerTestOperation.ListPrompts) },
+                    modifier = Modifier.weight(1f),
+                )
+            }
             Spacer(Modifier.height(14.dp))
             DetailLine(tr(strings, "Server ID", "服务器 ID"), server.id)
             DetailLine(tr(strings, "Quick action", "快捷操作"), server.quickActionLabel())
@@ -2192,6 +2341,351 @@ private fun McpServerCard(
 }
 
 // -----------------------------------------------------------------------------
+// Scheduled Tasks
+// -----------------------------------------------------------------------------
+
+@Composable
+private fun ScheduledTasksPage(
+    tasks: List<ScheduledTask>,
+    onToggleEnabled: (String, Boolean) -> Unit,
+    onRemove: (String) -> Unit,
+    onEdit: (String) -> Unit,
+    onAddNew: () -> Unit,
+    onBack: () -> Unit,
+) {
+    val strings = rememberAetherStrings()
+    SubPageScaffold(
+        title = tr(strings, "Scheduled Tasks", "定时任务"),
+        onBack = onBack,
+        trailingIcon = Icons.Rounded.Add,
+        onTrailingAction = onAddNew,
+    ) {
+        Text(
+            text = tr(
+                strings,
+                "Aether wakes at the next matching time and runs the task prompt as an automated Agent turn.",
+                "Aether 会在匹配的时间唤起，并把任务提示词作为一次自动 Agent 运行。",
+            ),
+            style = MaterialTheme.typography.bodySmall,
+            color = AetherOnSurfaceVariant,
+            modifier = Modifier.padding(horizontal = 4.dp),
+        )
+        Spacer(Modifier.height(16.dp))
+
+        if (tasks.isEmpty()) {
+            SettingsCardGroup {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(24.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                ) {
+                    Text(
+                        text = tr(strings, "No scheduled tasks", "暂无定时任务"),
+                        style = MaterialTheme.typography.titleMedium,
+                        color = AetherOnSurface,
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        text = tr(strings, "Create one manually, or ask the Agent to create one with its scheduling tool.", "可以手动创建，也可以让 Agent 通过定时任务工具创建。"),
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = AetherOnSurfaceVariant,
+                    )
+                    Spacer(Modifier.height(16.dp))
+                    SettingsActionButton(
+                        label = tr(strings, "Add Task", "新建任务"),
+                        onClick = onAddNew,
+                    )
+                }
+            }
+        } else {
+            tasks.sortedWith(compareBy<ScheduledTask> { it.nextRunAtMillis ?: Long.MAX_VALUE }.thenBy { it.name })
+                .forEach { task ->
+                    ScheduledTaskCard(
+                        task = task,
+                        onToggleEnabled = { enabled -> onToggleEnabled(task.id, enabled) },
+                        onEdit = { onEdit(task.id) },
+                        onRemove = { onRemove(task.id) },
+                    )
+                    Spacer(Modifier.height(12.dp))
+                }
+        }
+    }
+}
+
+@Composable
+private fun ScheduledTaskCard(
+    task: ScheduledTask,
+    onToggleEnabled: (Boolean) -> Unit,
+    onEdit: () -> Unit,
+    onRemove: () -> Unit,
+) {
+    val strings = rememberAetherStrings()
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(16.dp))
+            .background(AetherSurfaceHigh)
+            .padding(16.dp),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = task.name,
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    color = AetherOnSurface,
+                )
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    text = task.schedule.summary(),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = AetherOnSurfaceVariant,
+                )
+            }
+            IconButton(onClick = onEdit, modifier = Modifier.size(36.dp)) {
+                Icon(
+                    Icons.Rounded.Edit,
+                    contentDescription = strings.editMessage,
+                    tint = AetherOnSurface,
+                    modifier = Modifier.size(18.dp),
+                )
+            }
+            IconButton(onClick = onRemove, modifier = Modifier.size(36.dp)) {
+                Icon(
+                    Icons.Rounded.Delete,
+                    contentDescription = strings.delete,
+                    tint = Color(0xFFD25757),
+                    modifier = Modifier.size(20.dp),
+                )
+            }
+        }
+        Spacer(Modifier.height(12.dp))
+        Text(
+            text = task.prompt.take(160),
+            style = MaterialTheme.typography.bodySmall,
+            color = AetherOnSurface,
+        )
+        Spacer(Modifier.height(12.dp))
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.Bottom,
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = task.nextRunAtMillis?.formatScheduledTaskTime()
+                        ?.let { tr(strings, "Next run: $it", "下次运行：$it") }
+                        ?: tr(strings, "No next run scheduled", "未安排下次运行"),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = AetherOnSurfaceVariant,
+                )
+                Text(
+                    text = if (task.createdBy == ScheduledTaskCreator.Agent) {
+                        tr(strings, "Created by Agent", "由 Agent 创建")
+                    } else {
+                        tr(strings, "Created manually", "手动创建")
+                    },
+                    style = MaterialTheme.typography.labelSmall,
+                    color = AetherOnSurfaceVariant,
+                )
+            }
+            Switch(
+                checked = task.isEnabled,
+                onCheckedChange = onToggleEnabled,
+            )
+        }
+    }
+}
+
+@Composable
+private fun ScheduledTaskEditPage(
+    existingTask: ScheduledTask?,
+    onSave: (String, String, ScheduledTaskSchedule, Boolean) -> Unit,
+    onBack: () -> Unit,
+) {
+    val strings = rememberAetherStrings()
+    val existingInterval = existingTask?.schedule as? ScheduledTaskSchedule.Interval
+    val existingDaily = existingTask?.schedule as? ScheduledTaskSchedule.Daily
+    val existingWeekly = existingTask?.schedule as? ScheduledTaskSchedule.Weekly
+    var nameValue by rememberSaveable(existingTask?.id, stateSaver = TextFieldValue.Saver) {
+        mutableStateOf(TextFieldValue(existingTask?.name.orEmpty()))
+    }
+    var promptValue by rememberSaveable(existingTask?.id, stateSaver = TextFieldValue.Saver) {
+        mutableStateOf(TextFieldValue(existingTask?.prompt.orEmpty()))
+    }
+    var enabledValue by rememberSaveable(existingTask?.id) {
+        mutableStateOf(existingTask?.isEnabled ?: true)
+    }
+    var scheduleMode by rememberSaveable(existingTask?.id) {
+        mutableIntStateOf(
+            when (existingTask?.schedule) {
+                is ScheduledTaskSchedule.Daily -> 1
+                is ScheduledTaskSchedule.Weekly -> 2
+                else -> 0
+            }
+        )
+    }
+    var intervalMinutesValue by rememberSaveable(existingTask?.id, stateSaver = TextFieldValue.Saver) {
+        mutableStateOf(TextFieldValue(((existingInterval?.intervalMillis ?: 60L * 60L * 1000L) / 60_000L).toString()))
+    }
+    var activeStartValue by rememberSaveable(existingTask?.id, stateSaver = TextFieldValue.Saver) {
+        mutableStateOf(TextFieldValue(existingInterval?.activeStartMinuteOfDay?.let(::formatTaskMinute).orEmpty()))
+    }
+    var activeEndValue by rememberSaveable(existingTask?.id, stateSaver = TextFieldValue.Saver) {
+        mutableStateOf(TextFieldValue(existingInterval?.activeEndMinuteOfDay?.let(::formatTaskMinute).orEmpty()))
+    }
+    var dailyTimesValue by rememberSaveable(existingTask?.id, stateSaver = TextFieldValue.Saver) {
+        mutableStateOf(TextFieldValue(existingDaily?.timesMinutesOfDay?.joinToString(",") { formatTaskMinute(it) } ?: "09:00"))
+    }
+    var weeklyDaysValue by rememberSaveable(existingTask?.id, stateSaver = TextFieldValue.Saver) {
+        mutableStateOf(TextFieldValue(existingWeekly?.daysOfWeek?.joinToString(",") ?: "1"))
+    }
+    var weeklyTimeValue by rememberSaveable(existingTask?.id, stateSaver = TextFieldValue.Saver) {
+        mutableStateOf(TextFieldValue(existingWeekly?.minuteOfDay?.let(::formatTaskMinute) ?: "09:00"))
+    }
+
+    fun buildSchedule(): ScheduledTaskSchedule? = when (scheduleMode) {
+        0 -> ScheduledTaskSchedule.Interval(
+            intervalMillis = (intervalMinutesValue.text.trim().toLongOrNull() ?: 60L).coerceAtLeast(1L) * 60_000L,
+            activeStartMinuteOfDay = parseTaskMinute(activeStartValue.text),
+            activeEndMinuteOfDay = parseTaskMinute(activeEndValue.text),
+        )
+        1 -> parseTaskTimes(dailyTimesValue.text).takeIf { it.isNotEmpty() }?.let { times ->
+            ScheduledTaskSchedule.Daily(timesMinutesOfDay = times)
+        }
+        else -> {
+            val days = parseTaskDays(weeklyDaysValue.text)
+            val time = parseTaskMinute(weeklyTimeValue.text)
+            if (days.isEmpty() || time == null) null else ScheduledTaskSchedule.Weekly(days, time)
+        }
+    }
+
+    SubPageScaffold(
+        title = if (existingTask == null) {
+            tr(strings, "Add Scheduled Task", "新建定时任务")
+        } else {
+            tr(strings, "Edit Scheduled Task", "编辑定时任务")
+        },
+        onBack = onBack,
+        trailingIcon = Icons.Rounded.Check,
+        trailingEnabled = nameValue.text.isNotBlank() && promptValue.text.isNotBlank(),
+        onTrailingAction = {
+            buildSchedule()?.let { schedule ->
+                onSave(nameValue.text, promptValue.text, schedule, enabledValue)
+            }
+        },
+    ) {
+        SettingsCardGroup {
+            ChatGptTextField(
+                label = tr(strings, "Name", "名称"),
+                value = nameValue,
+                onValueChange = { nameValue = it },
+            )
+            CardDivider()
+            ChatGptTextField(
+                label = tr(strings, "Prompt", "提示词"),
+                value = promptValue,
+                minLines = 4,
+                onValueChange = { promptValue = it },
+            )
+        }
+        Spacer(Modifier.height(16.dp))
+        SettingsCardGroup {
+            Column(
+                modifier = Modifier.padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(14.dp),
+            ) {
+                SettingsToggleRow(
+                    title = tr(strings, "Enabled", "启用"),
+                    subtitle = tr(strings, "Disabled tasks stay saved but do not wake Aether.", "关闭后任务仍会保存，但不会唤起 Aether。"),
+                    checked = enabledValue,
+                    onCheckedChange = { enabledValue = it },
+                )
+            }
+        }
+        Spacer(Modifier.height(16.dp))
+        SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
+            listOf(
+                tr(strings, "Interval", "间隔"),
+                tr(strings, "Daily", "每天"),
+                tr(strings, "Weekly", "每周"),
+            ).forEachIndexed { index, label ->
+                SegmentedButton(
+                    shape = SegmentedButtonDefaults.itemShape(index = index, count = 3),
+                    onClick = { scheduleMode = index },
+                    selected = scheduleMode == index,
+                    colors = SegmentedButtonDefaults.colors(
+                        activeContainerColor = AetherPrimary,
+                        activeContentColor = Color.White,
+                        inactiveContainerColor = AetherSurfaceHigh,
+                        inactiveContentColor = AetherOnSurface,
+                    ),
+                ) {
+                    Text(label)
+                }
+            }
+        }
+        Spacer(Modifier.height(16.dp))
+        SettingsCardGroup {
+            when (scheduleMode) {
+                0 -> {
+                    ChatGptTextField(
+                        label = tr(strings, "Every N minutes", "每隔多少分钟"),
+                        value = intervalMinutesValue,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                        onValueChange = { intervalMinutesValue = it.copy(text = it.text.filter(Char::isDigit)) },
+                    )
+                    CardDivider()
+                    ChatGptTextField(
+                        label = tr(strings, "Active start HH:mm", "开始时间 HH:mm"),
+                        value = activeStartValue,
+                        onValueChange = { activeStartValue = it },
+                    )
+                    CardDivider()
+                    ChatGptTextField(
+                        label = tr(strings, "Active end HH:mm", "结束时间 HH:mm"),
+                        value = activeEndValue,
+                        onValueChange = { activeEndValue = it },
+                    )
+                }
+                1 -> ChatGptTextField(
+                    label = tr(strings, "Times HH:mm, comma separated", "时间 HH:mm，用逗号分隔"),
+                    value = dailyTimesValue,
+                    onValueChange = { dailyTimesValue = it },
+                )
+                else -> {
+                    ChatGptTextField(
+                        label = tr(strings, "Days 1-7 or mon,tue", "星期 1-7 或 mon,tue"),
+                        value = weeklyDaysValue,
+                        onValueChange = { weeklyDaysValue = it },
+                    )
+                    CardDivider()
+                    ChatGptTextField(
+                        label = tr(strings, "Time HH:mm", "时间 HH:mm"),
+                        value = weeklyTimeValue,
+                        onValueChange = { weeklyTimeValue = it },
+                    )
+                }
+            }
+        }
+        Spacer(Modifier.height(8.dp))
+        Text(
+            text = tr(
+                strings,
+                "Interval windows are optional. Leave start and end blank to run all day.",
+                "间隔任务的时间窗口是可选的。开始和结束留空则全天运行。",
+            ),
+            style = MaterialTheme.typography.bodySmall,
+            color = AetherOnSurfaceVariant,
+            modifier = Modifier.padding(horizontal = 4.dp),
+        )
+    }
+}
+
+// -----------------------------------------------------------------------------
 // Add MCP Server Page
 // -----------------------------------------------------------------------------
 
@@ -2200,7 +2694,7 @@ private fun AddMcpServerPage(
     title: String,
     existingServer: com.zhousl.aether.data.McpServerConfig?,
     onSaveHttpMcpServer: (String?, String, String, String) -> Unit,
-    onSaveStdIoMcpServer: (String?, String, String, String, String) -> Unit,
+    onSaveStdIoMcpServer: (String?, String, String, String, String, String) -> Unit,
     onBack: () -> Unit,
 ) {
     val strings = rememberAetherStrings()
@@ -2232,6 +2726,9 @@ private fun AddMcpServerPage(
     }
     var stdioCommandValue by rememberSaveable(existingServer?.id, stateSaver = TextFieldValue.Saver) {
         mutableStateOf(TextFieldValue(existingStdIoTransport?.command.orEmpty()))
+    }
+    var stdioArgumentsValue by rememberSaveable(existingServer?.id, stateSaver = TextFieldValue.Saver) {
+        mutableStateOf(TextFieldValue(existingStdIoTransport?.arguments?.joinToString(" ").orEmpty()))
     }
     var stdioWorkingDirectoryValue by rememberSaveable(existingServer?.id, stateSaver = TextFieldValue.Saver) {
         mutableStateOf(TextFieldValue(existingStdIoTransport?.workingDirectory.orEmpty()))
@@ -2324,6 +2821,8 @@ private fun AddMcpServerPage(
                     CardDivider()
                     ChatGptTextField(tr(strings, "Command", "命令"), stdioCommandValue, minLines = 2) { stdioCommandValue = it }
                     CardDivider()
+                    ChatGptTextField(tr(strings, "Arguments", "参数"), stdioArgumentsValue, minLines = 2) { stdioArgumentsValue = it }
+                    CardDivider()
                     ChatGptTextField(tr(strings, "Working directory", "工作目录"), stdioWorkingDirectoryValue) { stdioWorkingDirectoryValue = it }
                     CardDivider()
                     ChatGptTextField(tr(strings, "Environment", "环境变量"), stdioEnvValue, minLines = 2) { stdioEnvValue = it }
@@ -2344,6 +2843,7 @@ private fun AddMcpServerPage(
                                 existingServer?.id,
                                 stdioServerNameValue.text,
                                 stdioCommandValue.text,
+                                stdioArgumentsValue.text,
                                 stdioWorkingDirectoryValue.text,
                                 stdioEnvValue.text,
                             )
@@ -2365,6 +2865,8 @@ private fun TermuxSettingsPage(
     title: String,
     termuxSetupState: TermuxSetupState,
     rootSetupState: RootSetupState,
+    selectedWorkspaceMode: AgentWorkspaceMode,
+    onWorkspaceModeSelected: (AgentWorkspaceMode) -> Unit,
     onRequestTermuxPermission: () -> Unit,
     onOpenAppPermissions: () -> Unit,
     onOpenTermuxSettings: () -> Unit,
@@ -2425,6 +2927,14 @@ private fun TermuxSettingsPage(
 
         Spacer(Modifier.height(16.dp))
 
+        WorkspaceModeSettingsSection(
+            strings = strings,
+            selectedWorkspaceMode = selectedWorkspaceMode,
+            onWorkspaceModeSelected = onWorkspaceModeSelected,
+        )
+
+        Spacer(Modifier.height(16.dp))
+
         SettingsCardGroup {
             RootSetupSettingsSection(
                 title = tr(strings, "Root automatic setup", "Root 自动配置"),
@@ -2459,6 +2969,52 @@ private fun TermuxSettingsPage(
                 onRefresh = onRefreshTermuxSetup,
                 showRefreshAction = false,
             )
+        }
+    }
+}
+
+@Composable
+private fun WorkspaceModeSettingsSection(
+    strings: AetherStrings,
+    selectedWorkspaceMode: AgentWorkspaceMode,
+    onWorkspaceModeSelected: (AgentWorkspaceMode) -> Unit,
+) {
+    SettingsCardGroup {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Text(
+                text = strings.workspaceMode,
+                style = MaterialTheme.typography.titleMedium,
+                color = AetherOnSurface,
+            )
+            Spacer(Modifier.height(6.dp))
+            Text(
+                text = strings.workspaceModeDescription,
+                style = MaterialTheme.typography.bodySmall,
+                color = AetherOnSurfaceVariant,
+            )
+            Spacer(Modifier.height(14.dp))
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                SettingsChoiceRow(
+                    title = tr(strings, "Single Workspace", "单一 Workspace"),
+                    subtitle = tr(
+                        strings,
+                        "All sessions start in ~/.aether/workspace and uploads are kept under uploads/.",
+                        "所有 Session 默认从 ~/.aether/workspace 开始，上传文件保存在 uploads/ 下。",
+                    ),
+                    selected = selectedWorkspaceMode == AgentWorkspaceMode.Shared,
+                    onClick = { onWorkspaceModeSelected(AgentWorkspaceMode.Shared) },
+                )
+                SettingsChoiceRow(
+                    title = tr(strings, "Independent Workspaces", "独立 Workspace"),
+                    subtitle = tr(
+                        strings,
+                        "Each session keeps using its own directory under ~/.aether/workspaces/.",
+                        "每个 Session 继续使用 ~/.aether/workspaces/ 下的独立目录。",
+                    ),
+                    selected = selectedWorkspaceMode == AgentWorkspaceMode.PerSession,
+                    onClick = { onWorkspaceModeSelected(AgentWorkspaceMode.PerSession) },
+                )
+            }
         }
     }
 }

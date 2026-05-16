@@ -13,6 +13,7 @@ import com.zhousl.aether.data.AetherAnalytics
 import com.zhousl.aether.data.AppUpdateManager
 import com.zhousl.aether.data.AutomaticModelPurpose
 import com.zhousl.aether.data.AgentModeAuthorizationMethod
+import com.zhousl.aether.data.AgentWorkspaceMode
 import com.zhousl.aether.data.AppLanguage
 import com.zhousl.aether.data.AppSettings
 import com.zhousl.aether.data.AppThemeMode
@@ -26,6 +27,7 @@ import com.zhousl.aether.data.ProviderModelOption
 import com.zhousl.aether.data.availableModelOptions
 import com.zhousl.aether.data.McpClientManager
 import com.zhousl.aether.data.McpServerConfig
+import com.zhousl.aether.data.McpServerTestOperation
 import com.zhousl.aether.data.normalizeSelectableModelKey
 import com.zhousl.aether.data.normalizeLlmInactivityReconnectTimeoutSeconds
 import com.zhousl.aether.data.normalizeTavilyBaseUrl
@@ -33,6 +35,9 @@ import com.zhousl.aether.data.OnboardingStarterPrompt
 import com.zhousl.aether.data.OpenAiCompatibleClient
 import com.zhousl.aether.data.RootSetupIssue
 import com.zhousl.aether.data.RootSetupState
+import com.zhousl.aether.data.ScheduledTask
+import com.zhousl.aether.data.ScheduledTaskCreator
+import com.zhousl.aether.data.ScheduledTaskSchedule
 import com.zhousl.aether.data.SessionFollowUpMode
 import com.zhousl.aether.data.SessionTurnEvent
 import com.zhousl.aether.data.SessionTurnOutcome
@@ -93,6 +98,7 @@ class AetherViewModel(
     private val workspaceFileBridge = runtime.workspaceFileBridge
     private val agentModeController = runtime.agentModeController
     private val skillManager = runtime.skillManager
+    private val scheduledTaskManager = runtime.scheduledTaskManager
     private val mcpClientManager = McpClientManager(
         bashTool = bashTool,
         diagnosticLogger = diagnosticLogger,
@@ -103,6 +109,7 @@ class AetherViewModel(
     private var pendingTermuxSetupSource: String? = null
     private val _uiState = MutableStateFlow(AetherUiState())
     private val _transientMessages = MutableSharedFlow<String>(extraBufferCapacity = 4)
+    private var didEvaluateWorkspaceMode = false
 
     val uiState: StateFlow<AetherUiState> = _uiState.asStateFlow()
     val transientMessages = _transientMessages.asSharedFlow()
@@ -140,6 +147,7 @@ class AetherViewModel(
                     maybeCheckForUpdates(settings)
                 }
                 agentModeController.refreshAuthorization(settings)
+                maybeInitializeWorkspaceMode(settings)
             }
         }
 
@@ -247,6 +255,11 @@ class AetherViewModel(
         viewModelScope.launch {
             settingsRepository.providerConfigs.collect { configs ->
                 _uiState.update { current -> current.copy(providerConfigs = configs) }
+            }
+        }
+        viewModelScope.launch {
+            scheduledTaskManager.scheduledTasks.collect { tasks ->
+                _uiState.update { current -> current.copy(scheduledTasks = tasks) }
             }
         }
         viewModelScope.launch {
@@ -1382,6 +1395,7 @@ class AetherViewModel(
         llmInactivityReconnectTimeoutSeconds: Int,
         keepTasksRunningInBackground: Boolean,
         notifyOnTaskCompletion: Boolean,
+        agentWorkspaceMode: AgentWorkspaceMode,
         agentModeAuthorizationEnabled: Boolean,
         agentModeAuthorizationMethod: AgentModeAuthorizationMethod,
         language: AppLanguage,
@@ -1423,9 +1437,10 @@ class AetherViewModel(
                     llmInactivityReconnectTimeoutSeconds =
                         normalizeLlmInactivityReconnectTimeoutSeconds(
                             llmInactivityReconnectTimeoutSeconds
-                        ),
+                    ),
                     keepTasksRunningInBackground = keepTasksRunningInBackground,
                     notifyOnTaskCompletion = notifyOnTaskCompletion,
+                    agentWorkspaceMode = agentWorkspaceMode,
                     agentModeAuthorizationEnabled = agentModeAuthorizationEnabled,
                     agentModeAuthorizationMethod = agentModeAuthorizationMethod,
                     language = language,
@@ -1438,7 +1453,7 @@ class AetherViewModel(
         }
     }
 
-    // 鈹€鈹€ Multi-Provider methods 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    // ── Multi-Provider methods ────────────────────────────────────────────────
 
     fun updateAppLanguage(language: AppLanguage) {
         viewModelScope.launch {
@@ -1728,6 +1743,7 @@ class AetherViewModel(
         serverId: String?,
         displayName: String,
         command: String,
+        argumentsRaw: String,
         workingDirectory: String,
         environmentRaw: String,
     ) {
@@ -1747,6 +1763,7 @@ class AetherViewModel(
                     ),
                     transport = com.zhousl.aether.data.McpTransportConfig.StdIo(
                         command = trimmedCommand,
+                        arguments = parseNonBlankLines(argumentsRaw),
                         workingDirectory = workingDirectory.trim(),
                         environment = parseKeyValueLines(environmentRaw),
                     ),
@@ -1763,6 +1780,94 @@ class AetherViewModel(
             captureAnalyticsEvent(
                 event = "mcp server added",
                 properties = mapOf("transport" to "stdio"),
+            )
+        }
+    }
+
+    fun saveScheduledTask(
+        existingTaskId: String?,
+        name: String,
+        prompt: String,
+        schedule: ScheduledTaskSchedule,
+        enabled: Boolean,
+    ) {
+        viewModelScope.launch {
+            val existing = existingTaskId
+                ?.takeIf(String::isNotBlank)
+                ?.let { scheduledTaskManager.findTask(it) }
+            val task = (existing ?: ScheduledTask(
+                name = name.trim().ifBlank { "Scheduled task" },
+                prompt = prompt.trim(),
+                schedule = schedule,
+                createdBy = ScheduledTaskCreator.User,
+            )).copy(
+                name = name.trim().ifBlank { "Scheduled task" },
+                prompt = prompt.trim(),
+                schedule = schedule,
+                isEnabled = enabled,
+            )
+            if (task.prompt.isBlank()) {
+                emitTransientMessage("Scheduled task prompt is required.")
+                return@launch
+            }
+            scheduledTaskManager.upsertTask(task)
+        }
+    }
+
+    fun setScheduledTaskEnabled(
+        taskId: String,
+        enabled: Boolean,
+    ) {
+        viewModelScope.launch {
+            scheduledTaskManager.setTaskEnabled(taskId, enabled)
+        }
+    }
+
+    fun removeScheduledTask(taskId: String) {
+        viewModelScope.launch {
+            scheduledTaskManager.removeTask(taskId)
+        }
+    }
+
+    private fun maybeInitializeWorkspaceMode(settings: AppSettings) {
+        if (didEvaluateWorkspaceMode) return
+        didEvaluateWorkspaceMode = true
+        viewModelScope.launch {
+            if (settingsRepository.isWorkspaceModeInitialized()) return@launch
+            val mode = if (withContext(Dispatchers.IO) { workspaceFileBridge.hasLegacySessionWorkspaces() }) {
+                AgentWorkspaceMode.PerSession
+            } else {
+                AgentWorkspaceMode.Shared
+            }
+            settingsRepository.updateSettings(settings.copy(agentWorkspaceMode = mode))
+        }
+    }
+
+    fun testMcpServer(
+        serverId: String,
+        operation: McpServerTestOperation,
+        onComplete: (String) -> Unit,
+    ) {
+        val server = findMcpServerById(serverId)
+        if (server == null) {
+            onComplete("MCP server '$serverId' was not found.")
+            return
+        }
+        viewModelScope.launch {
+            val workspaceDirectory = workspaceFileBridge.workspaceDirectory(
+                sessionId = "mcp-test",
+                mode = _uiState.value.settings.agentWorkspaceMode,
+            )
+            val result = mcpClientManager.testServer(
+                server = server,
+                workspaceDirectory = workspaceDirectory,
+                operation = operation,
+            )
+            onComplete(
+                result.fold(
+                    onSuccess = { output -> formatMcpTestOutput(operation, output) },
+                    onFailure = { throwable -> "Test failed: ${throwable.message ?: "Unknown MCP error."}" },
+                )
             )
         }
     }
@@ -3016,6 +3121,83 @@ class AetherViewModel(
             }
             .toList()
 
+    private fun parseNonBlankLines(rawValue: String): List<String> =
+        rawValue.lineSequence()
+            .map(String::trim)
+            .filter(String::isNotBlank)
+            .toList()
+
+    private fun formatMcpTestOutput(
+        operation: McpServerTestOperation,
+        outputJson: String,
+    ): String {
+        val json = runCatching { JSONObject(outputJson) }.getOrNull()
+            ?: return outputJson.take(4_000)
+        val serverInfo = json.optString("server_info").ifBlank { json.optString("server_name") }
+        return when (operation) {
+            McpServerTestOperation.ListTools -> formatMcpNamedItems(
+                title = "Tools",
+                serverInfo = serverInfo,
+                items = json.optJSONArray("tools"),
+                nameKey = "name",
+            )
+
+            McpServerTestOperation.ListResources -> formatMcpNamedItems(
+                title = "Resources",
+                serverInfo = serverInfo,
+                items = json.optJSONArray("resources"),
+                nameKey = "uri",
+            )
+
+            McpServerTestOperation.ListPrompts -> formatMcpNamedItems(
+                title = "Prompts",
+                serverInfo = serverInfo,
+                items = json.optJSONArray("prompts"),
+                nameKey = "name",
+            )
+        }
+    }
+
+    private fun formatMcpNamedItems(
+        title: String,
+        serverInfo: String,
+        items: JSONArray?,
+        nameKey: String,
+    ): String {
+        val count = items?.length() ?: 0
+        return buildString {
+            append(title)
+            append(": ")
+            append(count)
+            if (serverInfo.isNotBlank()) {
+                append(" on ")
+                append(serverInfo)
+            }
+            if (count > 0 && items != null) {
+                appendLine()
+                val visibleCount = minOf(count, 8)
+                for (index in 0 until visibleCount) {
+                    val item = items.optJSONObject(index) ?: continue
+                    val name = item.optString(nameKey)
+                        .ifBlank { item.optString("name") }
+                    val description = item.optString("description")
+                    append("- ")
+                    append(name)
+                    if (description.isNotBlank()) {
+                        append(": ")
+                        append(description.take(160))
+                    }
+                    appendLine()
+                }
+                if (count > visibleCount) {
+                    append("... and ")
+                    append(count - visibleCount)
+                    append(" more")
+                }
+            }
+        }.trim()
+    }
+
     private fun performSkillInstall(
         onComplete: (Boolean) -> Unit = {},
         installBlock: suspend () -> Result<InstalledSkill>,
@@ -3177,6 +3359,7 @@ class AetherViewModel(
             put("keepTasksRunningInBackground", snapshot.settings.keepTasksRunningInBackground)
             put("notifyOnTaskCompletion", snapshot.settings.notifyOnTaskCompletion)
             put("termuxSetupCompleted", snapshot.settings.termuxSetupCompleted)
+            put("termuxSetupNoticeDismissed", snapshot.settings.termuxSetupNoticeDismissed)
             put("basicFunctionCallingCompatibilityMode", snapshot.settings.basicFunctionCallingCompatibilityMode)
             put("privacyPolicyAccepted", snapshot.settings.privacyPolicyAccepted)
             put("termux", JSONObject().apply {
@@ -3238,6 +3421,7 @@ class AetherViewModel(
                         when (val transport = server.transport) {
                             is com.zhousl.aether.data.McpTransportConfig.StdIo -> {
                                 put("commandSummary", transport.command.lineSequence().firstOrNull().orEmpty().take(160))
+                                put("argumentCount", transport.arguments.size)
                                 put("workingDirectory", transport.workingDirectory)
                                 put("environmentKeyCount", transport.environment.size)
                             }
@@ -3429,7 +3613,9 @@ class AetherViewModel(
         put("llmInactivityReconnectTimeoutSeconds", llmInactivityReconnectTimeoutSeconds)
         put("keepTasksRunningInBackground", keepTasksRunningInBackground)
         put("notifyOnTaskCompletion", notifyOnTaskCompletion)
+        put("agentWorkspaceMode", agentWorkspaceMode.storageValue)
         put("termuxSetupCompleted", termuxSetupCompleted)
+        put("termuxSetupNoticeDismissed", termuxSetupNoticeDismissed)
         put("agentModeAuthorizationEnabled", agentModeAuthorizationEnabled)
         put("agentModeAuthorizationMethod", agentModeAuthorizationMethod.storageValue)
         put("language", language.storageValue)
@@ -3475,9 +3661,16 @@ class AetherViewModel(
                 "notifyOnTaskCompletion",
                 defaults.notifyOnTaskCompletion,
             ),
+            agentWorkspaceMode = AgentWorkspaceMode.fromStorage(
+                json.optString("agentWorkspaceMode", defaults.agentWorkspaceMode.storageValue),
+            ),
             termuxSetupCompleted = json.optBoolean(
                 "termuxSetupCompleted",
                 defaults.termuxSetupCompleted,
+            ),
+            termuxSetupNoticeDismissed = json.optBoolean(
+                "termuxSetupNoticeDismissed",
+                defaults.termuxSetupNoticeDismissed,
             ),
             agentModeAuthorizationEnabled = json.optBoolean(
                 "agentModeAuthorizationEnabled",
@@ -3533,13 +3726,6 @@ class AetherViewModel(
     private fun emitTransientMessage(message: String) {
         _transientMessages.tryEmit(message)
     }
-
-    private fun termuxBackgroundLaunchMessage(): String =
-        if (_uiState.value.settings.language == AppLanguage.SimplifiedChinese) {
-            "Aether 打开 Termux 是为了让它在后台运行。"
-        } else {
-            "Aether opened Termux so it can keep running in the background."
-        }
 
     private fun Throwable.userFacingMessage(): String =
         message?.trim().takeUnless { it.isNullOrBlank() } ?: javaClass.simpleName

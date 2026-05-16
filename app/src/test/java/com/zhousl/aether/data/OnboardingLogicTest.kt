@@ -14,39 +14,23 @@ class OnboardingLogicTest {
     }
 
     @Test
-    fun seenButIncompleteSetupDoesNotRelaunchAndStillShowsResumeBanner() {
+    fun seenButIncompleteSetupDoesNotRelaunchOnboarding() {
         val settings = AppSettings(
             onboardingSeenVersion = CurrentOnboardingVersion,
             onboardingCompletedVersion = 0,
         )
 
         assertFalse(settings.shouldLaunchOnboarding())
-        assertTrue(
-            shouldShowResumeSetupBanner(
-                settings = settings,
-                messageCount = 0,
-                draftInput = "",
-                hasDraftAttachments = false,
-            )
-        )
     }
 
     @Test
-    fun completedOnboardingSuppressesResumeBannerAndFurtherCompletionTriggers() {
+    fun completedOnboardingSuppressesFurtherCompletionTriggers() {
         val settings = AppSettings(
             onboardingSeenVersion = CurrentOnboardingVersion,
             onboardingCompletedVersion = CurrentOnboardingVersion,
         )
 
         assertTrue(settings.isOnboardingComplete())
-        assertFalse(
-            shouldShowResumeSetupBanner(
-                settings = settings,
-                messageCount = 0,
-                draftInput = "",
-                hasDraftAttachments = false,
-            )
-        )
         assertFalse(
             shouldMarkOnboardingCompleted(
                 settings = settings,

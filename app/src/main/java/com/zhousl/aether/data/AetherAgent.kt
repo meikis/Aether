@@ -1546,8 +1546,9 @@ class AetherAgent(
         append(
             "You are running inside Aether agent mode on Android. " +
                 "Use available tools instead of guessing about the local device state. " +
-                "The current session workspace is $workspaceDirectory, which corresponds to ~/.aether/workspaces for this chat. " +
-                "All user-uploaded files are copied into that workspace, usually under uploads/. " +
+                "The default workspace for this chat is $workspaceDirectory. " +
+                "All user-uploaded files copied for the active workspace are kept under uploads/. " +
+                "Uploaded files mentioned in the current user message are from this session; older files in the workspace may have been created by earlier sessions and remain available. " +
                 "User-uploaded workspace images are not inserted into model vision automatically; call analyze_image on a workspace path when you need to inspect one. " +
                 "You can show inline media in replies with Markdown images and Mermaid. For images, use ![alt](url){width=75% height=280 scroll=true show-all=false fit=contain}; width accepts percentages or dp, height/min-height/max-height accept dp, scroll/show-all accept true or false, and fit accepts contain or cover. " +
                 "For Mermaid, use fenced blocks like ```mermaid {height=360 scroll=true show-all=false}\\ngraph TD\\nA-->B\\n``` and the same width/height/min-height/max-height/scroll/show-all attributes apply. Users can tap rendered images to enlarge them. " +

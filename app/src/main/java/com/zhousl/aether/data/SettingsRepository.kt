@@ -39,6 +39,7 @@ class SettingsRepository(
                 defaults.agentWorkspaceMode
             },
             termuxSetupCompleted = preferences[TERMUX_SETUP_COMPLETED] ?: false,
+            termuxSetupNoticeDismissed = preferences[TERMUX_SETUP_NOTICE_DISMISSED] ?: false,
             agentModeAuthorizationEnabled = preferences[AGENT_MODE_AUTHORIZATION_ENABLED] ?: false,
             agentModeAuthorizationMethod = AgentModeAuthorizationMethod.fromStorage(
                 preferences[AGENT_MODE_AUTHORIZATION_METHOD],

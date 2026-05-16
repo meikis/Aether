@@ -116,7 +116,6 @@ import com.zhousl.aether.data.availableModelOptions
 import com.zhousl.aether.data.buildModelOptionKey
 import com.zhousl.aether.data.isOnboardingComplete
 import com.zhousl.aether.data.resolveAutomaticModelKey
-import com.zhousl.aether.data.shouldShowResumeSetupBanner
 import com.zhousl.aether.termux.TermuxContract
 import com.zhousl.aether.termux.TermuxSetupIssue
 import com.zhousl.aether.termux.TermuxSetupState
@@ -211,11 +210,6 @@ private fun AetherAppContent(
         setupState = uiState.termuxSetupState,
         developerOverride = uiState.developerTermuxReadyOverride,
         termuxSetupCompleted = uiState.settings.termuxSetupCompleted,
-        rootBackgroundLaunchEnabled = uiState.rootSetupState.isReady ||
-            (
-                uiState.settings.agentModeAuthorizationEnabled &&
-                    uiState.settings.agentModeAuthorizationMethod == AgentModeAuthorizationMethod.Root
-                ),
     )
     val agentModeReady = uiState.settings.agentModeAuthorizationEnabled &&
         effectiveTermuxSetupState.isReady &&
@@ -581,14 +575,10 @@ private fun AetherAppContent(
                             ),
                     isEditing = uiState.editingMessageId != null,
                     termuxSetupState = effectiveTermuxSetupState,
-                    showResumeSetupBanner = shouldShowResumeSetupBanner(
-                        settings = uiState.settings,
-                        messageCount = currentMessages.size,
-                        draftInput = uiState.draftInput,
-                        hasDraftAttachments = uiState.draftAttachments.isNotEmpty(),
-                    ),
                     showStarterPromptHint = uiState.showStarterPromptHint,
-                    showTermuxSetupNotice = !uiState.awaitingFollowUpTour && !uiState.showFollowUpTourCard,
+                    showTermuxSetupNotice = !uiState.awaitingFollowUpTour &&
+                        !uiState.showFollowUpTourCard &&
+                        !uiState.settings.termuxSetupNoticeDismissed,
                     onInputChanged = viewModel::updateDraftInput,
                     onModelSelected = viewModel::setCurrentChatModelSelection,
                     onRemoveDraftAttachment = viewModel::removeDraftAttachment,
@@ -691,6 +681,7 @@ private fun AetherAppContent(
                     defaultNamingModelKey = uiState.settings.defaultNamingModelKey,
                     agentModeDisplayState = uiState.agentModeDisplayState,
                     providerConfigs = uiState.providerConfigs,
+                    scheduledTasks = uiState.scheduledTasks,
                     termuxSetupState = effectiveTermuxSetupState,
                     developerTermuxReadyOverride = uiState.developerTermuxReadyOverride,
                     installedSkills = uiState.installedSkills,
@@ -718,6 +709,10 @@ private fun AetherAppContent(
                     onSaveStdIoMcpServer = viewModel::saveStdIoMcpServer,
                     onToggleMcpServerEnabled = viewModel::setMcpServerEnabled,
                     onRemoveMcpServer = viewModel::removeMcpServer,
+                    onTestMcpServer = viewModel::testMcpServer,
+                    onSaveScheduledTask = viewModel::saveScheduledTask,
+                    onToggleScheduledTaskEnabled = viewModel::setScheduledTaskEnabled,
+                    onRemoveScheduledTask = viewModel::removeScheduledTask,
                     onRequestTermuxPermission = { requestTermuxPermission("settings_termux_permission") },
                     onImportAppData = {
                         appDataImportLauncher.launch(arrayOf("application/json", "text/*", "*/*"))
@@ -1090,6 +1085,7 @@ private fun buildConversationModelOptions(
             apiKey = settings.apiKey,
             baseUrl = settings.baseUrl,
             modelId = settings.modelId,
+            customHeaders = settings.customHeaders,
             basicFunctionCallingCompatibilityMode = settings.basicFunctionCallingCompatibilityMode,
             fullLabel = "${settings.provider.storageValue}/${settings.modelId}",
             chatLabel = settings.modelId,
@@ -1666,17 +1662,14 @@ private fun effectiveTermuxSetupState(
     setupState: TermuxSetupState,
     developerOverride: Boolean?,
     termuxSetupCompleted: Boolean,
-    rootBackgroundLaunchEnabled: Boolean,
 ): TermuxSetupState = when (developerOverride) {
-    true -> TermuxSetupState(previouslyConfigured = termuxSetupCompleted && !rootBackgroundLaunchEnabled)
+    true -> TermuxSetupState(previouslyConfigured = termuxSetupCompleted)
     false -> TermuxSetupState(
         issue = TermuxSetupIssue.DispatchFailed,
         detail = "Developer override: Termux is treated as not ready.",
-        previouslyConfigured = termuxSetupCompleted && !rootBackgroundLaunchEnabled,
+        previouslyConfigured = termuxSetupCompleted,
     )
-    null -> if (rootBackgroundLaunchEnabled) {
-        TermuxSetupState(previouslyConfigured = true)
-    } else if (termuxSetupCompleted && setupState.issue == TermuxSetupIssue.ExternalAppsDisabled) {
+    null -> if (termuxSetupCompleted && setupState.issue == TermuxSetupIssue.ExternalAppsDisabled) {
         setupState.copy(
             issue = TermuxSetupIssue.DispatchFailed,
             detail = "",
