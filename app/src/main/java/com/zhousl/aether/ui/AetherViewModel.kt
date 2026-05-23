@@ -38,6 +38,8 @@ import com.zhousl.aether.data.RootSetupState
 import com.zhousl.aether.data.ScheduledTask
 import com.zhousl.aether.data.ScheduledTaskCreator
 import com.zhousl.aether.data.ScheduledTaskSchedule
+import com.zhousl.aether.data.TermuxEnvironmentVariable
+import com.zhousl.aether.data.normalizeTermuxEnvironmentVariables
 import com.zhousl.aether.data.SessionFollowUpMode
 import com.zhousl.aether.data.SessionTurnEvent
 import com.zhousl.aether.data.SessionTurnOutcome
@@ -148,7 +150,8 @@ class AetherViewModel(
                         current.copy(settings = settings)
                     }
                 }
-                syncRootBackgroundLaunch()
+                syncTermuxSettings()
+                bashTool.setEnvironmentVariables(settings.termuxEnvironmentVariables)
                 if (!didEvaluateStartupUpdateCheck && settings.privacyPolicyAccepted) {
                     didEvaluateStartupUpdateCheck = true
                     maybeCheckForUpdates(settings)
@@ -314,7 +317,7 @@ class AetherViewModel(
                 }
                 current.copy(rootSetupState = rootState)
             }
-            syncRootBackgroundLaunch()
+            syncTermuxSettings()
         }
     }
 
@@ -393,7 +396,7 @@ class AetherViewModel(
     }
 
     private suspend fun inspectTermuxSetupWithRootRepair(): TermuxSetupState {
-        syncRootBackgroundLaunch()
+        syncTermuxSettings()
         val setupState = bashTool.inspectSetup()
         if (setupState.isReady) return rememberTermuxSetupCompleted(setupState)
         return setupState.withRememberedTermuxConfiguration()
@@ -424,7 +427,7 @@ class AetherViewModel(
             copy(previouslyConfigured = previouslyConfigured || _uiState.value.settings.termuxSetupCompleted)
         }
 
-    private fun syncRootBackgroundLaunch() {
+    private fun syncTermuxSettings() {
         val snapshot = _uiState.value
         bashTool.setRootBackgroundLaunchEnabled(
             snapshot.rootSetupState.isReady ||
@@ -433,6 +436,7 @@ class AetherViewModel(
                         snapshot.settings.agentModeAuthorizationMethod == AgentModeAuthorizationMethod.Root
                     ),
         )
+        bashTool.setEnvironmentVariables(snapshot.settings.termuxEnvironmentVariables)
     }
 
     fun refreshAgentModeAuthorization() {
@@ -1405,6 +1409,7 @@ class AetherViewModel(
         keepTasksRunningInBackground: Boolean,
         notifyOnTaskCompletion: Boolean,
         agentWorkspaceMode: AgentWorkspaceMode,
+        termuxEnvironmentVariables: List<TermuxEnvironmentVariable>,
         agentModeAuthorizationEnabled: Boolean,
         agentModeAuthorizationMethod: AgentModeAuthorizationMethod,
         language: AppLanguage,
@@ -1451,6 +1456,7 @@ class AetherViewModel(
                     keepTasksRunningInBackground = keepTasksRunningInBackground,
                     notifyOnTaskCompletion = notifyOnTaskCompletion,
                     agentWorkspaceMode = agentWorkspaceMode,
+                    termuxEnvironmentVariables = normalizeTermuxEnvironmentVariables(termuxEnvironmentVariables),
                     agentModeAuthorizationEnabled = agentModeAuthorizationEnabled,
                     agentModeAuthorizationMethod = agentModeAuthorizationMethod,
                     language = language,
@@ -3862,6 +3868,19 @@ class AetherViewModel(
         put("agentWorkspaceMode", agentWorkspaceMode.storageValue)
         put("termuxSetupCompleted", termuxSetupCompleted)
         put("termuxSetupNoticeDismissed", termuxSetupNoticeDismissed)
+        put(
+            "termuxEnvironmentVariables",
+            JSONArray().apply {
+                termuxEnvironmentVariables.forEach { variable ->
+                    put(
+                        JSONObject().apply {
+                            put("name", variable.name)
+                            put("value", variable.value)
+                        }
+                    )
+                }
+            },
+        )
         put("agentModeAuthorizationEnabled", agentModeAuthorizationEnabled)
         put("agentModeAuthorizationMethod", agentModeAuthorizationMethod.storageValue)
         put("language", language.storageValue)
@@ -3919,6 +3938,9 @@ class AetherViewModel(
                 "termuxSetupNoticeDismissed",
                 defaults.termuxSetupNoticeDismissed,
             ),
+            termuxEnvironmentVariables = parseImportedTermuxEnvironmentVariables(
+                json.optJSONArray("termuxEnvironmentVariables")
+            ),
             agentModeAuthorizationEnabled = json.optBoolean(
                 "agentModeAuthorizationEnabled",
                 defaults.agentModeAuthorizationEnabled,
@@ -3972,6 +3994,25 @@ class AetherViewModel(
                 }
             }
         }.distinct()
+    }
+
+    private fun parseImportedTermuxEnvironmentVariables(
+        array: JSONArray?,
+    ): List<TermuxEnvironmentVariable> {
+        if (array == null) return emptyList()
+        return normalizeTermuxEnvironmentVariables(
+            buildList {
+                for (index in 0 until array.length()) {
+                    val item = array.optJSONObject(index) ?: continue
+                    add(
+                        TermuxEnvironmentVariable(
+                            name = item.optString("name"),
+                            value = item.optString("value"),
+                        )
+                    )
+                }
+            }
+        )
     }
 
     private fun emitTransientMessage(message: String) {

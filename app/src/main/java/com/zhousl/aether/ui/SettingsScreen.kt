@@ -127,6 +127,7 @@ import com.zhousl.aether.data.RootSetupState
 import com.zhousl.aether.data.ScheduledTask
 import com.zhousl.aether.data.ScheduledTaskCreator
 import com.zhousl.aether.data.ScheduledTaskSchedule
+import com.zhousl.aether.data.TermuxEnvironmentVariable
 import com.zhousl.aether.data.formatScheduledTaskTime
 import com.zhousl.aether.data.summary
 import com.zhousl.aether.data.availableModelOptions
@@ -309,6 +310,7 @@ fun SettingsScreen(
     keepTasksRunningInBackground: Boolean,
     notifyOnTaskCompletion: Boolean,
     agentWorkspaceMode: AgentWorkspaceMode,
+    termuxEnvironmentVariables: List<TermuxEnvironmentVariable>,
     agentModeAuthorizationEnabled: Boolean,
     agentModeAuthorizationMethod: AgentModeAuthorizationMethod,
     agentModeAuthorizationState: AgentModeAuthorizationState,
@@ -341,6 +343,7 @@ fun SettingsScreen(
         Boolean,
         Boolean,
         AgentWorkspaceMode,
+        List<TermuxEnvironmentVariable>,
         Boolean,
         AgentModeAuthorizationMethod,
         AppLanguage,
@@ -420,6 +423,9 @@ fun SettingsScreen(
     var agentWorkspaceModeValue by rememberSaveable {
         mutableStateOf(agentWorkspaceMode)
     }
+    var termuxEnvironmentVariablesValue by rememberSaveable {
+        mutableStateOf(termuxEnvironmentVariables)
+    }
     var agentModeAuthorizationEnabledValue by rememberSaveable {
         mutableStateOf(agentModeAuthorizationEnabled)
     }
@@ -472,6 +478,7 @@ fun SettingsScreen(
             keepTasksRunningInBackgroundValue,
             notifyOnTaskCompletionValue,
             agentWorkspaceModeValue,
+            termuxEnvironmentVariablesValue,
             agentModeAuthorizationEnabledValue,
             agentModeAuthorizationMethodValue,
             languageValue,
@@ -500,6 +507,7 @@ fun SettingsScreen(
             keepTasksRunningInBackgroundValue,
             notifyOnTaskCompletionValue,
             agentWorkspaceModeValue,
+            termuxEnvironmentVariablesValue,
             agentModeAuthorizationEnabledValue,
             agentModeAuthorizationMethodValue,
             languageValue,
@@ -528,6 +536,7 @@ fun SettingsScreen(
             keepTasksRunningInBackgroundValue,
             notifyOnTaskCompletionValue,
             agentWorkspaceModeValue,
+            termuxEnvironmentVariablesValue,
             agentModeAuthorizationEnabledValue,
             agentModeAuthorizationMethodValue,
             languageValue,
@@ -920,7 +929,9 @@ fun SettingsScreen(
                 termuxSetupState = termuxSetupState,
                 rootSetupState = rootSetupState,
                 selectedWorkspaceMode = agentWorkspaceModeValue,
+                environmentVariables = termuxEnvironmentVariablesValue,
                 onWorkspaceModeSelected = { agentWorkspaceModeValue = it },
+                onEnvironmentVariablesChanged = { termuxEnvironmentVariablesValue = it },
                 onRequestTermuxPermission = onRequestTermuxPermission,
                 onOpenAppPermissions = onOpenAppPermissions,
                 onOpenTermuxSettings = onOpenTermuxSettings,
@@ -2912,7 +2923,9 @@ private fun TermuxSettingsPage(
     termuxSetupState: TermuxSetupState,
     rootSetupState: RootSetupState,
     selectedWorkspaceMode: AgentWorkspaceMode,
+    environmentVariables: List<TermuxEnvironmentVariable>,
     onWorkspaceModeSelected: (AgentWorkspaceMode) -> Unit,
+    onEnvironmentVariablesChanged: (List<TermuxEnvironmentVariable>) -> Unit,
     onRequestTermuxPermission: () -> Unit,
     onOpenAppPermissions: () -> Unit,
     onOpenTermuxSettings: () -> Unit,
@@ -2977,6 +2990,13 @@ private fun TermuxSettingsPage(
             strings = strings,
             selectedWorkspaceMode = selectedWorkspaceMode,
             onWorkspaceModeSelected = onWorkspaceModeSelected,
+        )
+
+        Spacer(Modifier.height(16.dp))
+
+        TermuxEnvironmentVariablesSection(
+            variables = environmentVariables,
+            onVariablesChanged = onEnvironmentVariablesChanged,
         )
 
         Spacer(Modifier.height(16.dp))

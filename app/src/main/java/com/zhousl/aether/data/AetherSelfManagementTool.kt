@@ -65,7 +65,7 @@ class AetherSelfManagementTool(
                     "category",
                     JSONObject().apply {
                         put("type", "string")
-                        put("enum", JSONArray(listOf("general", "web_tools", "reliability", "agent_mode")))
+                        put("enum", JSONArray(listOf("general", "web_tools", "reliability", "termux", "agent_mode")))
                         put("description", "Allowed settings category to update.")
                     },
                 )
@@ -350,6 +350,17 @@ class AetherSelfManagementTool(
                     )
                 } else {
                     current.notifyOnTaskCompletion
+                },
+            )
+
+            "termux" -> current.copy(
+                termuxEnvironmentVariables = if (patch.hasAny("environment_variables", "environmentVariables")) {
+                    parseTermuxEnvironmentVariablesPatch(
+                        patch.optJSONArray("environment_variables")
+                            ?: patch.optJSONArray("environmentVariables")
+                    )
+                } else {
+                    current.termuxEnvironmentVariables
                 },
             )
 
@@ -748,6 +759,21 @@ class AetherSelfManagementTool(
         JSONObject()
             .put("setup", termuxSetupStateJson(bashTool.inspectSetup()))
             .put("root_setup", rootSetupStateJson(rootSetupController.inspect()))
+            .put(
+                "environment_variables",
+                JSONArray().apply {
+                    settingsRepository.settings.first().termuxEnvironmentVariables.forEach { variable ->
+                        put(
+                            JSONObject()
+                                .put("name", variable.name)
+                                .put(
+                                    "value",
+                                    if (shouldRedactKey(variable.name)) redactSecret(variable.value) else variable.value,
+                                )
+                        )
+                    }
+                },
+            )
 
     private fun generalSettingsJson(settings: AppSettings): JSONObject =
         JSONObject()
@@ -870,6 +896,25 @@ class AetherSelfManagementTool(
                     )
             )
         }
+    }
+
+    private fun parseTermuxEnvironmentVariablesPatch(
+        array: JSONArray?,
+    ): List<TermuxEnvironmentVariable> {
+        if (array == null) return emptyList()
+        return normalizeTermuxEnvironmentVariables(
+            buildList {
+                for (index in 0 until array.length()) {
+                    val item = array.optJSONObject(index) ?: continue
+                    add(
+                        TermuxEnvironmentVariable(
+                            name = item.optString("name").ifBlank { item.optString("key") },
+                            value = item.optString("value"),
+                        )
+                    )
+                }
+            }
+        )
     }
 
     private fun termuxSetupStateJson(state: TermuxSetupState): JSONObject =

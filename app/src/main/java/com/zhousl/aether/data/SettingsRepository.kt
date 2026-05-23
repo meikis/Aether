@@ -11,6 +11,7 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import org.json.JSONArray
+import org.json.JSONObject
 
 private val Context.dataStore by preferencesDataStore(name = "aether_settings")
 
@@ -40,6 +41,9 @@ class SettingsRepository(
             },
             termuxSetupCompleted = preferences[TERMUX_SETUP_COMPLETED] ?: false,
             termuxSetupNoticeDismissed = preferences[TERMUX_SETUP_NOTICE_DISMISSED] ?: false,
+            termuxEnvironmentVariables = parseTermuxEnvironmentVariables(
+                preferences[TERMUX_ENVIRONMENT_VARIABLES].orEmpty()
+            ),
             agentModeAuthorizationEnabled = preferences[AGENT_MODE_AUTHORIZATION_ENABLED] ?: false,
             agentModeAuthorizationMethod = AgentModeAuthorizationMethod.fromStorage(
                 preferences[AGENT_MODE_AUTHORIZATION_METHOD],
@@ -156,6 +160,8 @@ class SettingsRepository(
             it[WORKSPACE_MODE_INITIALIZED] = true
             it[TERMUX_SETUP_COMPLETED] = settings.termuxSetupCompleted
             it[TERMUX_SETUP_NOTICE_DISMISSED] = settings.termuxSetupNoticeDismissed
+            it[TERMUX_ENVIRONMENT_VARIABLES] =
+                serializeTermuxEnvironmentVariables(settings.termuxEnvironmentVariables)
             it[AGENT_MODE_AUTHORIZATION_ENABLED] = settings.agentModeAuthorizationEnabled
             it[AGENT_MODE_AUTHORIZATION_METHOD] = settings.agentModeAuthorizationMethod.storageValue
             it[LANGUAGE] = settings.language.storageValue
@@ -226,6 +232,8 @@ class SettingsRepository(
             it[WORKSPACE_MODE_INITIALIZED] = true
             it[TERMUX_SETUP_COMPLETED] = settings.termuxSetupCompleted
             it[TERMUX_SETUP_NOTICE_DISMISSED] = settings.termuxSetupNoticeDismissed
+            it[TERMUX_ENVIRONMENT_VARIABLES] =
+                serializeTermuxEnvironmentVariables(settings.termuxEnvironmentVariables)
             it[AGENT_MODE_AUTHORIZATION_ENABLED] = settings.agentModeAuthorizationEnabled
             it[AGENT_MODE_AUTHORIZATION_METHOD] = settings.agentModeAuthorizationMethod.storageValue
             it[LANGUAGE] = settings.language.storageValue
@@ -306,6 +314,8 @@ class SettingsRepository(
             booleanPreferencesKey("termux_setup_completed")
         val TERMUX_SETUP_NOTICE_DISMISSED =
             booleanPreferencesKey("termux_setup_notice_dismissed")
+        val TERMUX_ENVIRONMENT_VARIABLES =
+            stringPreferencesKey("termux_environment_variables")
         val AGENT_MODE_AUTHORIZATION_ENABLED =
             booleanPreferencesKey("agent_mode_authorization_enabled")
         val AGENT_MODE_AUTHORIZATION_METHOD =
@@ -372,6 +382,56 @@ private fun serializeStoredStringList(values: List<String>): String =
             .filter(String::isNotEmpty)
             .distinct()
             .forEach(::put)
+    }.toString()
+
+private val TermuxEnvironmentVariableNamePattern = Regex("^[A-Za-z_][A-Za-z0-9_]*$")
+
+fun normalizeTermuxEnvironmentVariables(
+    variables: List<TermuxEnvironmentVariable>,
+): List<TermuxEnvironmentVariable> =
+    variables
+        .mapNotNull { variable ->
+            val name = variable.name.trim()
+            if (!TermuxEnvironmentVariableNamePattern.matches(name)) {
+                null
+            } else {
+                TermuxEnvironmentVariable(name = name, value = variable.value)
+            }
+        }
+        .distinctBy { it.name }
+
+private fun parseTermuxEnvironmentVariables(rawValue: String): List<TermuxEnvironmentVariable> {
+    if (rawValue.isBlank()) return emptyList()
+    return runCatching {
+        val array = JSONArray(rawValue)
+        normalizeTermuxEnvironmentVariables(
+            buildList {
+                for (index in 0 until array.length()) {
+                    val item = array.optJSONObject(index) ?: continue
+                    add(
+                        TermuxEnvironmentVariable(
+                            name = item.optString("name"),
+                            value = item.optString("value"),
+                        )
+                    )
+                }
+            }
+        )
+    }.getOrDefault(emptyList())
+}
+
+private fun serializeTermuxEnvironmentVariables(
+    variables: List<TermuxEnvironmentVariable>,
+): String =
+    JSONArray().apply {
+        normalizeTermuxEnvironmentVariables(variables).forEach { variable ->
+            put(
+                JSONObject().apply {
+                    put("name", variable.name)
+                    put("value", variable.value)
+                }
+            )
+        }
     }.toString()
 
 private val ShizukuManagerPackages = listOf(

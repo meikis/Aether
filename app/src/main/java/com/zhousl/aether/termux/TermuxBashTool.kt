@@ -9,8 +9,11 @@ import android.util.Log
 import androidx.core.content.ContextCompat
 import com.zhousl.aether.BuildConfig
 import com.zhousl.aether.data.AetherDiagnosticLogger
+import com.zhousl.aether.data.TermuxEnvironmentVariable
+import com.zhousl.aether.data.normalizeTermuxEnvironmentVariables
 import java.util.Base64
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
@@ -50,6 +53,12 @@ class TermuxBashTool(
     private val context: Context,
     private val diagnosticLogger: AetherDiagnosticLogger = AetherDiagnosticLogger.NoOp,
 ) {
+    private val environmentVariables = AtomicReference<List<TermuxEnvironmentVariable>>(emptyList())
+
+    fun setEnvironmentVariables(variables: List<TermuxEnvironmentVariable>) {
+        environmentVariables.set(normalizeTermuxEnvironmentVariables(variables))
+    }
+
     @Suppress("UNUSED_PARAMETER")
     fun setRootBackgroundLaunchEnabled(enabled: Boolean) {
         // Root setup can configure Termux files, but command dispatch should not
@@ -420,7 +429,10 @@ class TermuxBashTool(
             action = TermuxContract.RunCommandAction
             putExtra(TermuxContract.RunCommandPathExtra, TermuxContract.BashPath)
             putExtra(TermuxContract.RunCommandArgumentsExtra, arrayOf("-s"))
-            putExtra(TermuxContract.RunCommandStdinExtra, buildTermuxDispatchScript(command))
+            putExtra(
+                TermuxContract.RunCommandStdinExtra,
+                buildTermuxDispatchScript(command, environmentVariables.get()),
+            )
             putExtra(TermuxContract.RunCommandWorkdirExtra, workingDirectory)
             putExtra(TermuxContract.RunCommandBackgroundExtra, true)
             putExtra(TermuxContract.RunCommandPendingIntentExtra, pendingIntent)
@@ -895,6 +907,7 @@ class TermuxBashTool(
         appendTermuxShellEnvironment(
             builder = builder,
             includeShellStartupPath = true,
+            environmentVariables = environmentVariables.get(),
         )
         builder.appendLine("now_ms() {")
         builder.appendLine("  date +%s%3N")
@@ -1079,10 +1092,14 @@ internal object TermuxManagedRuns {
     fun nextRunId(): String = "run-${System.currentTimeMillis()}-${nextId.getAndIncrement()}"
 }
 
-private fun buildTermuxDispatchScript(command: String): String = buildString {
+private fun buildTermuxDispatchScript(
+    command: String,
+    environmentVariables: List<TermuxEnvironmentVariable>,
+): String = buildString {
     appendTermuxShellEnvironment(
         builder = this,
         includeShellStartupPath = false,
+        environmentVariables = environmentVariables,
     )
     appendLine(command)
 }
@@ -1090,6 +1107,7 @@ private fun buildTermuxDispatchScript(command: String): String = buildString {
 internal fun appendTermuxShellEnvironment(
     builder: StringBuilder,
     includeShellStartupPath: Boolean,
+    environmentVariables: List<TermuxEnvironmentVariable> = emptyList(),
 ) {
     builder.appendLine("export PREFIX='${TermuxContract.PrefixDirectory}'")
     builder.appendLine("export HOME='${TermuxContract.HomeDirectory}'")
@@ -1135,8 +1153,14 @@ internal fun appendTermuxShellEnvironment(
         builder.appendLine("unset -f aether_capture_shell_path")
     }
     builder.appendLine("export PATH")
+    normalizeTermuxEnvironmentVariables(environmentVariables).forEach { variable ->
+        builder.appendLine("export ${variable.name}='${escapeTermuxEnvValue(variable.value)}'")
+    }
     builder.appendLine("unset -f aether_dedupe_path")
 }
+
+private fun escapeTermuxEnvValue(value: String): String =
+    value.replace("'", "'\"'\"'")
 
 internal object TermuxContract {
     const val PackageName = "com.termux"
