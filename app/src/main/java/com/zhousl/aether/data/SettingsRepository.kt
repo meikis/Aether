@@ -50,6 +50,7 @@ class SettingsRepository(
             defaultChatModelKey = preferences[DEFAULT_CHAT_MODEL_KEY].orEmpty(),
             defaultTitleModelKey = preferences[DEFAULT_TITLE_MODEL_KEY].orEmpty(),
             defaultNamingModelKey = preferences[DEFAULT_NAMING_MODEL_KEY].orEmpty(),
+            defaultCompactingModelKey = preferences[DEFAULT_COMPACTING_MODEL_KEY].orEmpty(),
             unsupportedParallelToolCallProviderKeys = parseStoredStringList(
                 preferences[UNSUPPORTED_PARALLEL_TOOL_CALL_PROVIDER_KEYS].orEmpty()
             ),
@@ -162,6 +163,7 @@ class SettingsRepository(
             it[DEFAULT_CHAT_MODEL_KEY] = settings.defaultChatModelKey
             it[DEFAULT_TITLE_MODEL_KEY] = settings.defaultTitleModelKey
             it[DEFAULT_NAMING_MODEL_KEY] = settings.defaultNamingModelKey
+            it[DEFAULT_COMPACTING_MODEL_KEY] = settings.defaultCompactingModelKey
             it[UNSUPPORTED_PARALLEL_TOOL_CALL_PROVIDER_KEYS] =
                 serializeStoredStringList(settings.unsupportedParallelToolCallProviderKeys)
             it[BASIC_FUNCTION_CALLING_COMPATIBILITY_MODE] = settings.basicFunctionCallingCompatibilityMode
@@ -231,6 +233,7 @@ class SettingsRepository(
             it[DEFAULT_CHAT_MODEL_KEY] = settings.defaultChatModelKey
             it[DEFAULT_TITLE_MODEL_KEY] = settings.defaultTitleModelKey
             it[DEFAULT_NAMING_MODEL_KEY] = settings.defaultNamingModelKey
+            it[DEFAULT_COMPACTING_MODEL_KEY] = settings.defaultCompactingModelKey
             it[UNSUPPORTED_PARALLEL_TOOL_CALL_PROVIDER_KEYS] =
                 serializeStoredStringList(settings.unsupportedParallelToolCallProviderKeys)
             it[BASIC_FUNCTION_CALLING_COMPATIBILITY_MODE] = settings.basicFunctionCallingCompatibilityMode
@@ -312,6 +315,7 @@ class SettingsRepository(
         val DEFAULT_CHAT_MODEL_KEY = stringPreferencesKey("default_chat_model_key")
         val DEFAULT_TITLE_MODEL_KEY = stringPreferencesKey("default_title_model_key")
         val DEFAULT_NAMING_MODEL_KEY = stringPreferencesKey("default_naming_model_key")
+        val DEFAULT_COMPACTING_MODEL_KEY = stringPreferencesKey("default_compacting_model_key")
         val UNSUPPORTED_PARALLEL_TOOL_CALL_PROVIDER_KEYS =
             stringPreferencesKey("unsupported_parallel_tool_call_provider_keys")
         val BASIC_FUNCTION_CALLING_COMPATIBILITY_MODE =

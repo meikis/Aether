@@ -56,6 +56,7 @@ import com.zhousl.aether.data.shouldMarkOnboardingCompleted
 import com.zhousl.aether.data.shouldLaunchOnboarding
 import com.zhousl.aether.data.shouldRevealFollowUpTourCard
 import com.zhousl.aether.data.resolveDefaultChatModelKey
+import com.zhousl.aether.data.resolveDefaultCompactingModelKey
 import com.zhousl.aether.data.resolveDefaultTitleModelKey
 import com.zhousl.aether.data.resolveAutomaticModelKey
 import com.zhousl.aether.data.resolveModelSettings
@@ -82,6 +83,10 @@ private const val AppUpdateCheckIntervalMillis = 3L * 24L * 60L * 60L * 1000L
 private const val LogcatReadTimeoutSeconds = 4L
 private const val SessionTitleSystemPrompt =
     "Generate a concise chat title for this conversation. Return only the title, in the user's language when possible, with no quotes, no emoji, and at most 6 words."
+private const val CompactCommand = "/compact"
+private const val CompactingMaxInputChars = 120_000
+private const val SessionCompactingSystemPrompt =
+    "You are Aether's conversation compactor. Summarize the provided conversation so a future assistant can continue seamlessly. Preserve user goals, constraints, decisions, important facts, open tasks, files/paths mentioned, tool results, errors, and next steps. Do not invent details. Return only the compacted context."
 
 class AetherViewModel(
     application: Application,
@@ -1403,6 +1408,7 @@ class AetherViewModel(
         defaultChatModelKey: String,
         defaultTitleModelKey: String,
         defaultNamingModelKey: String,
+        defaultCompactingModelKey: String,
     ) {
         viewModelScope.launch {
             val currentState = _uiState.value
@@ -1448,6 +1454,7 @@ class AetherViewModel(
                     defaultChatModelKey = normalizeSelectableModelKey(defaultChatModelKey, modelOptions),
                     defaultTitleModelKey = normalizeSelectableModelKey(defaultTitleModelKey, modelOptions),
                     defaultNamingModelKey = normalizeSelectableModelKey(defaultNamingModelKey, modelOptions),
+                    defaultCompactingModelKey = normalizeSelectableModelKey(defaultCompactingModelKey, modelOptions),
                 )
             )
         }
@@ -2034,6 +2041,10 @@ class AetherViewModel(
 
         if (content.isEmpty() && attachments.isEmpty()) return
         if (attachments.any { it.workspaceState != AttachmentWorkspaceState.Ready }) return
+        if (isCompactCommand(content)) {
+            compactCurrentSession(snapshot)
+            return
+        }
 
         val targetSessionId = snapshot.editingSessionId ?: when {
             snapshot.currentSessionId != DraftSessionId -> snapshot.currentSessionId
@@ -2867,14 +2878,15 @@ class AetherViewModel(
     }
 
     private fun deriveSessionMetadata(messages: List<ChatMessage>): SessionMetadata {
+        val visibleMessages = messages.filter { it.displayKind != MessageDisplayKind.HiddenContext }
         val title = messages
-            .firstOrNull { it.author == MessageAuthor.User }
+            .firstOrNull { it.author == MessageAuthor.User && it.displayKind == MessageDisplayKind.Standard }
             ?.summaryText()
             .orEmpty()
             .ifBlank { "New chat" }
             .take(36)
 
-        val preview = messages
+        val preview = visibleMessages
             .lastOrNull()
             ?.summaryText()
             .orEmpty()
@@ -2946,6 +2958,217 @@ class AetherViewModel(
             }
         }
     }.trim()
+
+    private fun isCompactCommand(content: String): Boolean =
+        content.trim().equals(CompactCommand, ignoreCase = true)
+
+    private fun compactCurrentSession(snapshot: AetherUiState) {
+        if (snapshot.editingSessionId != null) {
+            emitTransientMessage("Finish editing before compacting this conversation.")
+            return
+        }
+        val sessionId = snapshot.currentSessionId
+        if (sessionId == DraftSessionId) {
+            emitTransientMessage("There is no conversation to compact yet.")
+            return
+        }
+        if (sessionExecutionManager.isSessionRunning(sessionId)) {
+            emitTransientMessage("Pause this session before compacting it.")
+            return
+        }
+        val session = snapshot.sessions.firstOrNull { it.id == sessionId }
+        if (session == null || session.messages.size < 2) {
+            emitTransientMessage("There is not enough conversation to compact yet.")
+            return
+        }
+        val compactInput = buildCompactConversationInput(session)
+        if (compactInput.isBlank()) {
+            emitTransientMessage("There is no text to compact.")
+            return
+        }
+
+        _uiState.update { current ->
+            current.copy(
+                draftInput = "",
+                draftAttachments = emptyList(),
+                draftWorkspaceId = null,
+                editingSessionId = null,
+                editingMessageId = null,
+                showStarterPromptHint = false,
+                compactingSessionId = sessionId,
+            )
+        }
+
+        viewModelScope.launch {
+            try {
+                val providerConfigs = _uiState.value.providerConfigs
+                val compactSettings = resolveModelSettings(
+                    baseSettings = snapshot.settings,
+                    providerConfigs = providerConfigs,
+                    preferredModelKey = resolveDefaultCompactingModelKey(snapshot.settings, providerConfigs),
+                    fallbackModelKey = resolveDefaultChatModelKey(snapshot.settings, providerConfigs),
+                )
+                if (!isProviderSetupValid(
+                        compactSettings.provider,
+                        compactSettings.apiKey,
+                        compactSettings.baseUrl,
+                        compactSettings.modelId,
+                    )
+                ) {
+                    emitTransientMessage("Configure a provider before compacting.")
+                    return@launch
+                }
+
+                val compaction = compactConversation(
+                    settings = compactSettings,
+                    session = session,
+                    compactInput = compactInput,
+                ).getOrElse { throwable ->
+                    emitTransientMessage("Compaction failed: ${throwable.userFacingMessage()}")
+                    return@launch
+                }
+
+                val now = System.currentTimeMillis()
+                val compactedMessages = session.messages + listOf(
+                    ChatMessage(
+                        id = "compact-context-$now",
+                        author = MessageAuthor.User,
+                        text = buildCompactedContextMessage(compaction.summary),
+                        createdAtMillis = now,
+                        providerPayloadJson = compaction.providerPayloadJson,
+                        displayKind = MessageDisplayKind.HiddenContext,
+                    ),
+                    ChatMessage(
+                        id = "compact-status-$now",
+                        author = MessageAuthor.Agent,
+                        text = "Context compacted",
+                        createdAtMillis = now + 1,
+                        assistantActionsHidden = true,
+                        displayKind = MessageDisplayKind.CompactStatus,
+                    ),
+                )
+                val updatedSession = session.withMessages(compactedMessages)
+                _uiState.update { current ->
+                    val sessionIndex = current.sessions.indexOfFirst { it.id == sessionId }
+                    if (sessionIndex < 0) return@update current
+                    val updatedSessions = current.sessions.toMutableList().apply {
+                        set(sessionIndex, updatedSession)
+                    }
+                    current.copy(sessions = updatedSessions)
+                }
+                persistSessionSnapshot(updatedSession, currentSessionId = sessionId)
+            } finally {
+                _uiState.update { current ->
+                    if (current.compactingSessionId == sessionId) {
+                        current.copy(compactingSessionId = null)
+                    } else {
+                        current
+                    }
+                }
+            }
+        }
+    }
+
+    private suspend fun compactConversation(
+        settings: AppSettings,
+        session: ChatSession,
+        compactInput: String,
+    ): Result<CompactedConversation> {
+        if (settings.provider == LlmProvider.OpenAiResponses) {
+            val input = client.buildConversation(
+                settings = settings,
+                messages = session.messages
+                    .filter { it.displayKind != MessageDisplayKind.CompactStatus }
+                    .map(::buildCompactRequestMessage),
+            )
+            val remoteResult = client.createOpenAiResponsesCompaction(
+                settings = settings,
+                input = input,
+            )
+            remoteResult.getOrNull()?.let { compaction ->
+                return Result.success(
+                    CompactedConversation(
+                        summary = compaction.assistantText.trim()
+                            .ifBlank { "OpenAI compacted this conversation into provider-native context." },
+                        providerPayloadJson = compaction.providerPayload.toString(),
+                    )
+                )
+            }
+        }
+
+        val result = client.createChatCompletion(
+            settings = settings,
+            systemPrompt = SessionCompactingSystemPrompt,
+            conversation = listOf(buildProviderUserMessage(settings, compactInput)),
+            disableReasoning = true,
+        )
+        val summary = result.getOrNull()?.assistantText?.trim().orEmpty()
+        if (summary.isBlank()) {
+            return Result.failure(
+                result.exceptionOrNull() ?: IllegalStateException("empty model response")
+            )
+        }
+        return Result.success(CompactedConversation(summary = summary))
+    }
+
+    private fun buildCompactRequestMessage(message: ChatMessage): com.zhousl.aether.data.LlmMessage =
+        com.zhousl.aether.data.LlmMessage(
+            role = if (message.author == MessageAuthor.User) "user" else "assistant",
+            contentParts = listOf(com.zhousl.aether.data.LlmTextPart(formatMessageForCompaction(message))),
+            providerPayload = runCatching {
+                message.providerPayloadJson.takeIf(String::isNotBlank)?.let(::JSONObject)
+            }.getOrNull(),
+        )
+
+    private fun buildCompactConversationInput(session: ChatSession): String {
+        val raw = buildString {
+            appendLine("Conversation to compact:")
+            session.messages
+                .filter { it.displayKind != MessageDisplayKind.CompactStatus }
+                .forEachIndexed { index, message ->
+                    appendLine()
+                    appendLine("## ${index + 1}. ${message.author.name}")
+                    appendLine(formatMessageForCompaction(message))
+                }
+        }.trim()
+        return raw.takeLast(CompactingMaxInputChars)
+    }
+
+    private fun formatMessageForCompaction(message: ChatMessage): String = buildString {
+        if (message.text.isNotBlank()) {
+            appendLine(message.text.trim())
+        }
+        message.reasoningTrace?.let { trace ->
+            val summary = trace.chunks
+                .mapNotNull { chunk -> chunk.detail.ifBlank { chunk.title }.takeIf(String::isNotBlank) }
+                .joinToString("\n")
+            if (summary.isNotBlank()) {
+                if (isNotEmpty()) appendLine()
+                appendLine("Reasoning summary:")
+                appendLine(summary)
+            }
+        }
+        if (message.attachments.isNotEmpty()) {
+            if (isNotEmpty()) appendLine()
+            appendLine("Attachments:")
+            message.attachments.forEach { attachment ->
+                appendLine("- ${attachment.name} (${attachment.mimeType}) ${attachment.workspacePath}".trimEnd())
+            }
+        }
+        if (message.toolInvocations.isNotEmpty()) {
+            if (isNotEmpty()) appendLine()
+            appendLine("Tool activity:")
+            message.toolInvocations.forEach { invocation ->
+                appendLine("- ${invocation.toolName}: ${invocation.argumentsJson.take(600)}")
+                if (invocation.outputJson.isNotBlank()) {
+                    appendLine("  output: ${invocation.outputJson.take(1200)}")
+                }
+            }
+        }
+    }.trim().ifBlank { "[Empty message]" }
+
+    private fun buildCompactedContextMessage(summary: String): String =
+        "This conversation was compacted. Continue from this retained context:\n\n$summary"
 
     private fun buildProviderUserMessage(
         settings: AppSettings,
@@ -3029,6 +3252,7 @@ class AetherViewModel(
     }
 
     private fun ChatMessage.summaryText(): String {
+        if (displayKind == MessageDisplayKind.CompactStatus) return text.ifBlank { "Context compacted" }
         val textSummary = text.trim()
         if (textSummary.isNotBlank()) return textSummary
         reasoningTrace?.let { trace ->
@@ -3623,6 +3847,7 @@ class AetherViewModel(
         put("defaultChatModelKey", defaultChatModelKey)
         put("defaultTitleModelKey", defaultTitleModelKey)
         put("defaultNamingModelKey", defaultNamingModelKey)
+        put("defaultCompactingModelKey", defaultCompactingModelKey)
         put(
             "unsupportedParallelToolCallProviderKeys",
             JSONArray().apply { unsupportedParallelToolCallProviderKeys.forEach(::put) },
@@ -3688,6 +3913,10 @@ class AetherViewModel(
             defaultChatModelKey = json.optString("defaultChatModelKey", defaults.defaultChatModelKey),
             defaultTitleModelKey = json.optString("defaultTitleModelKey", defaults.defaultTitleModelKey),
             defaultNamingModelKey = json.optString("defaultNamingModelKey", defaults.defaultNamingModelKey),
+            defaultCompactingModelKey = json.optString(
+                "defaultCompactingModelKey",
+                defaults.defaultCompactingModelKey,
+            ),
             unsupportedParallelToolCallProviderKeys = parseImportedStringArray(
                 json.optJSONArray("unsupportedParallelToolCallProviderKeys")
             ),
@@ -3733,6 +3962,11 @@ class AetherViewModel(
     private data class SessionMetadata(
         val title: String,
         val preview: String,
+    )
+
+    private data class CompactedConversation(
+        val summary: String,
+        val providerPayloadJson: String = "",
     )
 
     private data class AttachmentMetadata(

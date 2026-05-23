@@ -247,11 +247,81 @@ class OpenAiCompatibleClient(
         settings: AppSettings,
         messages: List<LlmMessage>,
     ): List<JSONObject> = messages.map { message ->
+        message.providerPayload?.takeIf { isProviderPayloadFor(settings, it) }?.let { payload ->
+            return@map JSONObject(payload.toString())
+        }
         when (settings.provider) {
             LlmProvider.OpenAiResponses -> serializeOpenAiResponsesConversationMessage(message)
             LlmProvider.OpenAiCompatible -> serializeOpenAiConversationMessage(message)
             LlmProvider.VertexExpress -> serializeVertexConversationMessage(message)
             LlmProvider.AnthropicMessages -> serializeAnthropicConversationMessage(message)
+        }
+    }
+
+    suspend fun createOpenAiResponsesCompaction(
+        settings: AppSettings,
+        input: List<JSONObject>,
+    ): Result<OpenAiResponsesCompactionResult> {
+        if (settings.provider != LlmProvider.OpenAiResponses) {
+            return Result.failure(IllegalArgumentException("Compaction endpoint requires OpenAI Responses provider."))
+        }
+        val requestId = nextLlmRequestId()
+        diagnosticLogger.event(
+            category = "llm",
+            event = "compact_request_start",
+            requestId = requestId,
+            details = llmDiagnosticDetails(settings) + mapOf(
+                "conversation_message_count" to input.size,
+            ),
+        )
+        return try {
+            val responsePayload = executeRequest(
+                buildOpenAiResponsesCompactionRequest(
+                    settings = settings,
+                    input = input,
+                )
+            )
+            val json = parseJsonObject(responsePayload.bodyString)
+            if (!responsePayload.isSuccessful) {
+                val errorMessage = extractLlmErrorMessage(json, responsePayload)
+                throw buildLlmRequestException(responsePayload, errorMessage)
+            }
+            if (json == null) {
+                error(buildUnexpectedResponseMessage(responsePayload))
+            }
+            val output = json.optJSONArray("output")
+                ?: error("Missing compaction output in response.")
+            val assistantText = extractOpenAiResponsesOutputText(output)
+            val result = OpenAiResponsesCompactionResult(
+                assistantText = assistantText,
+                providerPayload = JSONObject().apply {
+                    put(OpenAiResponsesProviderPayloadKey, JSONArray(output.toString()))
+                },
+            )
+            diagnosticLogger.event(
+                category = "llm",
+                event = "compact_request_end",
+                requestId = requestId,
+                details = mapOf(
+                    "http_code" to responsePayload.code,
+                    "content_type" to responsePayload.contentType,
+                    "request_url" to responsePayload.requestUrl,
+                    "output_item_count" to output.length(),
+                    "assistant_text_chars" to assistantText.length,
+                ),
+            )
+            Result.success(result)
+        } catch (cancellationException: CancellationException) {
+            throw cancellationException
+        } catch (throwable: Throwable) {
+            diagnosticLogger.exception(
+                category = "llm",
+                event = "compact_request_failed",
+                requestId = requestId,
+                throwable = throwable,
+                details = llmDiagnosticDetails(settings),
+            )
+            Result.failure(throwable)
         }
     }
 
@@ -386,6 +456,13 @@ class OpenAiCompatibleClient(
             "inactivity_reconnect_timeout_seconds" to settings.llmInactivityReconnectTimeoutSeconds,
             "basic_tool_compatibility" to settings.basicFunctionCallingCompatibilityMode,
         )
+
+    private fun isProviderPayloadFor(
+        settings: AppSettings,
+        payload: JSONObject,
+    ): Boolean =
+        settings.provider == LlmProvider.OpenAiResponses &&
+            payload.has(OpenAiResponsesProviderPayloadKey)
 
     private fun parseOpenAiChatCompletion(json: JSONObject): ChatCompletionResult {
         val message = json.optJSONArray("choices")
@@ -843,6 +920,40 @@ class OpenAiCompatibleClient(
             .build()
     }
 
+    private fun buildOpenAiResponsesCompactionRequest(
+        settings: AppSettings,
+        input: List<JSONObject>,
+    ): Request {
+        val endpoint = buildOpenAiResponsesCompactionEndpoint(settings.baseUrl)
+        val trimmedApiKey = settings.apiKey.trim()
+        if (settings.provider.requiresApiKey(settings.baseUrl) && trimmedApiKey.isBlank()) {
+            error("API Key is required for ${settings.provider.displayName}.")
+        }
+        val payload = JSONObject().apply {
+            put("model", settings.modelId.trim())
+            put(
+                "input",
+                JSONArray().apply {
+                    input.forEach { item ->
+                        appendOpenAiResponsesInputItem(item)
+                    }
+                },
+            )
+        }
+
+        return Request.Builder()
+            .url(endpoint)
+            .addHeader("Content-Type", "application/json")
+            .apply {
+                if (trimmedApiKey.isNotBlank()) {
+                    addHeader("Authorization", "Bearer $trimmedApiKey")
+                }
+            }
+            .applyAetherLlmHeaders(settings.customHeaders)
+            .post(payload.toString().toRequestBody(JsonMediaType))
+            .build()
+    }
+
     private fun buildOpenAiRequest(
         settings: AppSettings,
         systemPrompt: String,
@@ -1084,6 +1195,9 @@ class OpenAiCompatibleClient(
             .toString()
     }
 
+    private fun buildOpenAiResponsesCompactionEndpoint(baseUrl: String): String =
+        buildOpenAiResponsesEndpoint(baseUrl).trimEnd('/') + "/compact"
+
     private fun buildOpenAiChatCompletionEndpoint(baseUrl: String): String {
         val normalizedBaseUrl = parseAbsoluteBaseUrl(baseUrl)
         val pathSegments = normalizedBaseUrl.pathSegments.filter { it.isNotBlank() }
@@ -1254,6 +1368,13 @@ class OpenAiCompatibleClient(
     }
 
     private fun JSONArray.appendOpenAiResponsesInputItem(item: JSONObject) {
+        val providerPayloadItems = item.optJSONArray(OpenAiResponsesProviderPayloadKey)
+        if (providerPayloadItems != null) {
+            for (index in 0 until providerPayloadItems.length()) {
+                providerPayloadItems.optJSONObject(index)?.let(::put)
+            }
+            return
+        }
         val wrappedItems = item.optJSONArray(OpenAiResponsesItemsKey)
         if (wrappedItems != null) {
             for (index in 0 until wrappedItems.length()) {
@@ -2191,6 +2312,37 @@ private fun buildOpenAiResponsesResult(output: JSONArray): ChatCompletionResult 
     )
 }
 
+private fun extractOpenAiResponsesOutputText(output: JSONArray): String = buildString {
+    for (index in 0 until output.length()) {
+        val item = output.optJSONObject(index) ?: continue
+        when (item.optString("type")) {
+            "message" -> {
+                val content = item.optJSONArray("content") ?: JSONArray()
+                for (contentIndex in 0 until content.length()) {
+                    val block = content.optJSONObject(contentIndex) ?: continue
+                    val text = when (block.optString("type")) {
+                        "output_text", "text" -> block.optString("text")
+                        else -> ""
+                    }
+                    if (text.isBlank()) continue
+                    if (isNotEmpty()) append('\n')
+                    append(text)
+                }
+            }
+
+            "compaction" -> {
+                val text = item.optString("summary")
+                    .ifBlank { item.optString("text") }
+                    .ifBlank { item.optString("content") }
+                if (text.isNotBlank()) {
+                    if (isNotEmpty()) append('\n')
+                    append(text)
+                }
+            }
+        }
+    }
+}
+
 private fun buildAnthropicResultFromContent(
     assistantText: String,
     content: JSONArray,
@@ -2563,3 +2715,4 @@ private const val DefaultStreamingWriteTimeoutMillis = 30_000L
 private const val DefaultAnthropicMaxTokens = 4096
 private const val AnthropicVersion = "2023-06-01"
 private const val OpenAiResponsesItemsKey = "aether_response_items"
+private const val OpenAiResponsesProviderPayloadKey = "aether_openai_responses_compaction_items"

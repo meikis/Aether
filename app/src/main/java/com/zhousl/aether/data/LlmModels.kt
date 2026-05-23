@@ -21,6 +21,11 @@ data class ChatCompletionToolResult(
     val output: String,
 )
 
+data class OpenAiResponsesCompactionResult(
+    val assistantText: String,
+    val providerPayload: JSONObject,
+)
+
 sealed interface LlmContentPart
 
 data class LlmTextPart(
@@ -35,4 +40,5 @@ data class LlmImagePart(
 data class LlmMessage(
     val role: String,
     val contentParts: List<LlmContentPart>,
+    val providerPayload: JSONObject? = null,
 )

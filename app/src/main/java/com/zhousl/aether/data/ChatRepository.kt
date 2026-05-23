@@ -12,6 +12,7 @@ import com.zhousl.aether.ui.ChatMessage
 import com.zhousl.aether.ui.ChatSession
 import com.zhousl.aether.ui.ChatToolInvocation
 import com.zhousl.aether.ui.MessageAuthor
+import com.zhousl.aether.ui.MessageDisplayKind
 import com.zhousl.aether.ui.ReasoningSummaryChunk
 import com.zhousl.aether.ui.ReasoningTrace
 import com.zhousl.aether.ui.syncActiveBranches
@@ -159,6 +160,10 @@ private fun parseMessages(messages: JSONArray?): List<ChatMessage> {
                     branchGroup = parseBranchGroup(message.optJSONObject("branchGroup")),
                     responseGroupId = message.optString("responseGroupId").ifBlank { null },
                     assistantActionsHidden = message.optBoolean("assistantActionsHidden"),
+                    providerPayloadJson = message.optString("providerPayloadJson"),
+                    displayKind = MessageDisplayKind.entries.firstOrNull {
+                        it.name == message.optString("displayKind")
+                    } ?: MessageDisplayKind.Standard,
                 )
             )
         }
@@ -178,6 +183,12 @@ private fun ChatMessage.toJson(): JSONObject = JSONObject().apply {
     responseGroupId?.let { put("responseGroupId", it) }
     if (assistantActionsHidden) {
         put("assistantActionsHidden", true)
+    }
+    if (providerPayloadJson.isNotBlank()) {
+        put("providerPayloadJson", providerPayloadJson)
+    }
+    if (displayKind != MessageDisplayKind.Standard) {
+        put("displayKind", displayKind.name)
     }
     put("toolInvocations", JSONArray().apply { toolInvocations.forEach { put(it.toJson()) } })
     put("attachments", JSONArray().apply { attachments.forEach { put(it.toJson()) } })

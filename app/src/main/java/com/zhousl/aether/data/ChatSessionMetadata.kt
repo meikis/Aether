@@ -2,6 +2,7 @@ package com.zhousl.aether.data
 
 import com.zhousl.aether.ui.ChatMessage
 import com.zhousl.aether.ui.ChatSession
+import com.zhousl.aether.ui.MessageDisplayKind
 import com.zhousl.aether.ui.MessageAuthor
 import com.zhousl.aether.ui.syncActiveBranches
 
@@ -17,13 +18,14 @@ internal fun ChatSession.withDerivedMessages(
 }
 
 private fun deriveSessionMetadata(messages: List<ChatMessage>): Pair<String, String> {
+    val visibleMessages = messages.filter { it.displayKind != MessageDisplayKind.HiddenContext }
     val title = messages
-        .firstOrNull { it.author == MessageAuthor.User }
+        .firstOrNull { it.author == MessageAuthor.User && it.displayKind == MessageDisplayKind.Standard }
         ?.summaryText()
         .orEmpty()
         .ifBlank { "New chat" }
         .take(36)
-    val preview = messages
+    val preview = visibleMessages
         .lastOrNull()
         ?.summaryText()
         .orEmpty()
@@ -33,6 +35,7 @@ private fun deriveSessionMetadata(messages: List<ChatMessage>): Pair<String, Str
 }
 
 internal fun ChatMessage.summaryText(): String {
+    if (displayKind == MessageDisplayKind.CompactStatus) return text.ifBlank { "Context compacted" }
     val textSummary = text.trim()
     if (textSummary.isNotBlank()) return textSummary
     reasoningTrace?.let { trace ->

@@ -41,6 +41,12 @@ enum class MessageAuthor {
     Agent,
 }
 
+enum class MessageDisplayKind {
+    Standard,
+    HiddenContext,
+    CompactStatus,
+}
+
 enum class AttachmentKind {
     Image,
     File;
@@ -148,6 +154,8 @@ data class ChatMessage(
     val branchGroup: ChatBranchGroup? = null,
     val responseGroupId: String? = null,
     val assistantActionsHidden: Boolean = false,
+    val providerPayloadJson: String = "",
+    val displayKind: MessageDisplayKind = MessageDisplayKind.Standard,
 )
 
 data class ChatSession(
@@ -197,6 +205,7 @@ data class AetherUiState(
     val pendingAssistantText: String = "",
     val pendingStatusText: String = "",
     val pendingStatusDetail: String = "",
+    val compactingSessionId: String? = null,
     val sessionExecutionStates: Map<String, SessionExecutionState> = emptyMap(),
     val unviewedCompletedSessionIds: Set<String> = emptySet(),
     val termuxSetupState: TermuxSetupState = TermuxSetupState(),

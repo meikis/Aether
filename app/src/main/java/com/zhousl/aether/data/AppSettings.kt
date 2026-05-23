@@ -139,6 +139,7 @@ data class AppSettings(
     val defaultChatModelKey: String = "",
     val defaultTitleModelKey: String = "",
     val defaultNamingModelKey: String = "",
+    val defaultCompactingModelKey: String = "",
     val unsupportedParallelToolCallProviderKeys: List<String> = emptyList(),
     val basicFunctionCallingCompatibilityMode: Boolean = false,
     val onboardingSeenVersion: Int = 0,
@@ -452,6 +453,7 @@ enum class AutomaticModelPurpose {
     Chat,
     Title,
     Naming,
+    Compacting,
 }
 
 fun List<LlmProviderConfig>.availableModelOptions(
@@ -539,11 +541,14 @@ private fun automaticModelPriority(
         }
 
         AutomaticModelPurpose.Title,
-        AutomaticModelPurpose.Naming -> when {
+        AutomaticModelPurpose.Naming,
+        AutomaticModelPurpose.Compacting -> when {
             isGemini3Flash -> 0
             isGemini31FlashLite -> 1
             normalized.contains("gpt54mini") -> 2
             normalized.contains("claude") && normalized.contains("haiku") && normalized.contains("46") -> 3
+            normalized.contains("gpt54") -> 4
+            normalized.contains("claude") && normalized.contains("sonnet") -> 5
             else -> null
         }
     }

@@ -161,6 +161,7 @@ private enum class SettingsPage {
     DefaultChatModel,
     DefaultTitleModel,
     DefaultNamingModel,
+    DefaultCompactingModel,
     AddProvider,
     EditProvider,
     Personalization,
@@ -208,7 +209,8 @@ private fun SettingsPage.depth(): Int = when (this) {
     SettingsPage.RootSetupProgress -> 2
     SettingsPage.DefaultChatModel,
     SettingsPage.DefaultTitleModel,
-    SettingsPage.DefaultNamingModel -> 3
+    SettingsPage.DefaultNamingModel,
+    SettingsPage.DefaultCompactingModel -> 3
 }
 
 private fun SettingsPage.toRootSetupProgressReturnPage(): RootSetupProgressReturnPage =
@@ -317,6 +319,7 @@ fun SettingsScreen(
     defaultChatModelKey: String,
     defaultTitleModelKey: String,
     defaultNamingModelKey: String,
+    defaultCompactingModelKey: String,
     agentModeDisplayState: AgentModeDisplayState,
     providerConfigs: List<LlmProviderConfig>,
     scheduledTasks: List<ScheduledTask>,
@@ -342,6 +345,7 @@ fun SettingsScreen(
         AgentModeAuthorizationMethod,
         AppLanguage,
         AppThemeMode,
+        String,
         String,
         String,
         String,
@@ -431,6 +435,7 @@ fun SettingsScreen(
     var defaultChatModelKeyValue by rememberSaveable { mutableStateOf(defaultChatModelKey) }
     var defaultTitleModelKeyValue by rememberSaveable { mutableStateOf(defaultTitleModelKey) }
     var defaultNamingModelKeyValue by rememberSaveable { mutableStateOf(defaultNamingModelKey) }
+    var defaultCompactingModelKeyValue by rememberSaveable { mutableStateOf(defaultCompactingModelKey) }
     val strings = remember(languageValue) { aetherStringsFor(languageValue) }
     val enabledModelOptions = remember(providerConfigs) { providerConfigs.availableModelOptions() }
 
@@ -474,6 +479,7 @@ fun SettingsScreen(
             defaultChatModelKeyValue,
             defaultTitleModelKeyValue,
             defaultNamingModelKeyValue,
+            defaultCompactingModelKeyValue,
         )
         onBack()
     }
@@ -501,6 +507,7 @@ fun SettingsScreen(
             defaultChatModelKeyValue,
             defaultTitleModelKeyValue,
             defaultNamingModelKeyValue,
+            defaultCompactingModelKeyValue,
         )
         onReplayOnboarding()
     }
@@ -528,6 +535,7 @@ fun SettingsScreen(
             defaultChatModelKeyValue,
             defaultTitleModelKeyValue,
             defaultNamingModelKeyValue,
+            defaultCompactingModelKeyValue,
         )
         onReplayFollowUpOnboarding()
     }
@@ -565,7 +573,10 @@ fun SettingsScreen(
     // Determine parent page for back navigation
     fun parentPage(): SettingsPage = when (page) {
         SettingsPage.DefaultModels -> SettingsPage.Providers
-        SettingsPage.DefaultChatModel, SettingsPage.DefaultTitleModel, SettingsPage.DefaultNamingModel -> SettingsPage.DefaultModels
+        SettingsPage.DefaultChatModel,
+        SettingsPage.DefaultTitleModel,
+        SettingsPage.DefaultNamingModel,
+        SettingsPage.DefaultCompactingModel -> SettingsPage.DefaultModels
         SettingsPage.AddProvider, SettingsPage.EditProvider -> SettingsPage.Providers
         SettingsPage.AddSkill -> SettingsPage.Skills
         SettingsPage.AddMcpServer, SettingsPage.EditMcpServer -> SettingsPage.McpServers
@@ -684,9 +695,11 @@ fun SettingsScreen(
                 defaultChatModelKey = defaultChatModelKeyValue,
                 defaultTitleModelKey = defaultTitleModelKeyValue,
                 defaultNamingModelKey = defaultNamingModelKeyValue,
+                defaultCompactingModelKey = defaultCompactingModelKeyValue,
                 onOpenDefaultChatModel = { currentPage = SettingsPage.DefaultChatModel.name },
                 onOpenDefaultTitleModel = { currentPage = SettingsPage.DefaultTitleModel.name },
                 onOpenDefaultNamingModel = { currentPage = SettingsPage.DefaultNamingModel.name },
+                onOpenDefaultCompactingModel = { currentPage = SettingsPage.DefaultCompactingModel.name },
                 onBack = { currentPage = SettingsPage.Providers.name },
             )
 
@@ -731,6 +744,21 @@ fun SettingsScreen(
                     ?: tr(strings, "Automatic", "自动选择"),
                 automaticSubtitle = tr(strings, "Prioritize the SOTA models", "优先选择前沿模型"),
                 onSelected = { defaultNamingModelKeyValue = it },
+                onBack = { currentPage = SettingsPage.DefaultModels.name },
+            )
+
+            SettingsPage.DefaultCompactingModel -> ModelSelectionListPage(
+                title = tr(strings, "Default Compacting Model", "默认压缩模型"),
+                subtitle = tr(strings, "Used when /compact summarizes the current conversation.", "用于 /compact 总结当前会话。"),
+                selectedKey = defaultCompactingModelKeyValue,
+                options = enabledModelOptions,
+                automaticLabel = enabledModelOptions.findModelOption(
+                    enabledModelOptions.resolveAutomaticModelKey(AutomaticModelPurpose.Compacting)
+                        .ifBlank { enabledModelOptions.resolveAutomaticModelKey(AutomaticModelPurpose.Chat) }
+                )?.fullLabel?.let { tr(strings, "Automatic · $it", "自动选择 · $it") }
+                    ?: tr(strings, "Automatic", "自动选择"),
+                automaticSubtitle = tr(strings, "Prioritize efficient summary models", "优先选择高效总结模型"),
+                onSelected = { defaultCompactingModelKeyValue = it },
                 onBack = { currentPage = SettingsPage.DefaultModels.name },
             )
 
@@ -1351,7 +1379,7 @@ private fun ProvidersListPage(
             SettingsNavRow(
                 icon = Icons.Rounded.AutoAwesome,
                 title = tr(strings, "Default Models", "默认模型"),
-                subtitle = tr(strings, "Choose dedicated defaults for chat, titles, and naming.", "为聊天、标题和命名分别设置默认模型。"),
+                subtitle = tr(strings, "Choose dedicated defaults for chat, titles, naming, and compaction.", "为聊天、标题、命名和压缩分别设置默认模型。"),
                 onClick = onOpenDefaultModels,
             )
         }
@@ -1364,9 +1392,11 @@ private fun DefaultModelsPage(
     defaultChatModelKey: String,
     defaultTitleModelKey: String,
     defaultNamingModelKey: String,
+    defaultCompactingModelKey: String,
     onOpenDefaultChatModel: () -> Unit,
     onOpenDefaultTitleModel: () -> Unit,
     onOpenDefaultNamingModel: () -> Unit,
+    onOpenDefaultCompactingModel: () -> Unit,
     onBack: () -> Unit,
 ) {
     val strings = rememberAetherStrings()
@@ -1379,6 +1409,10 @@ private fun DefaultModelsPage(
     )?.fullLabel
     val automaticNamingLabel = modelOptions.findModelOption(
         modelOptions.resolveAutomaticModelKey(AutomaticModelPurpose.Naming)
+            .ifBlank { modelOptions.resolveAutomaticModelKey(AutomaticModelPurpose.Chat) }
+    )?.fullLabel
+    val automaticCompactingLabel = modelOptions.findModelOption(
+        modelOptions.resolveAutomaticModelKey(AutomaticModelPurpose.Compacting)
             .ifBlank { modelOptions.resolveAutomaticModelKey(AutomaticModelPurpose.Chat) }
     )?.fullLabel
     SubPageScaffold(
@@ -1420,6 +1454,18 @@ private fun DefaultModelsPage(
                     modelOptions.findModelOption(defaultNamingModelKey)?.fullLabel.orEmpty()
                 },
                 onClick = onOpenDefaultNamingModel,
+            )
+            CardDivider()
+            SettingsNavRow(
+                icon = Icons.Rounded.AutoAwesome,
+                title = tr(strings, "Default Compacting Model", "默认压缩模型"),
+                subtitle = if (defaultCompactingModelKey.isBlank()) {
+                    automaticCompactingLabel?.let { tr(strings, "Automatic · $it", "自动选择 · $it") }
+                        ?: tr(strings, "Automatic", "自动选择")
+                } else {
+                    modelOptions.findModelOption(defaultCompactingModelKey)?.fullLabel.orEmpty()
+                },
+                onClick = onOpenDefaultCompactingModel,
             )
         }
     }

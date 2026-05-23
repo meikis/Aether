@@ -71,6 +71,7 @@ import androidx.compose.material.icons.rounded.Cloud
 import androidx.compose.material.icons.rounded.Extension
 import androidx.compose.material.icons.rounded.Image
 import androidx.compose.material.icons.rounded.Menu
+import androidx.compose.material.icons.rounded.RadioButtonUnchecked
 import androidx.compose.material.icons.rounded.Terminal
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -180,6 +181,12 @@ private sealed interface ConversationListItem {
             ?: messages.firstOrNull()?.id
             ?: "assistant-group"
     }
+
+    data class CompactStatus(
+        val message: ChatMessage,
+    ) : ConversationListItem {
+        override val key: String = message.id
+    }
 }
 
 private val ConversationTopFadeHeight = 42.dp
@@ -247,6 +254,7 @@ fun ConversationScreen(
     pendingAssistantText: String,
     pendingStatusText: String,
     pendingStatusDetail: String,
+    isCompacting: Boolean,
     pendingInputs: List<PendingSessionInput>,
     inputValue: String,
     draftAttachments: List<ChatAttachment>,
@@ -301,6 +309,7 @@ fun ConversationScreen(
 ) {
     val listState = remember(conversationStateKey) { LazyListState() }
     val conversationItems = remember(messages) { buildConversationListItems(messages) }
+    val compactSuggestionText = remember(messages) { compactCommandSuggestionText(messages) }
     var previewAttachment by remember { mutableStateOf<ChatAttachment?>(null) }
     var shouldAutoFollow by rememberSaveable(conversationStateKey) { mutableStateOf(true) }
     var topBarBodyHeightPx by remember { mutableIntStateOf(0) }
@@ -384,6 +393,7 @@ fun ConversationScreen(
         pendingToolInvocations,
         pendingStatusText,
         pendingStatusDetail,
+        isCompacting,
         isSending,
     ) {
         buildString {
@@ -432,6 +442,8 @@ fun ConversationScreen(
             append(pendingStatusText)
             append('|')
             append(pendingStatusDetail)
+            append('|')
+            append(isCompacting)
             append('|')
             append(isSending)
         }
@@ -529,6 +541,18 @@ fun ConversationScreen(
                                     onDelete = { onDeleteMessage(lastMessage.id) },
                                 )
                             }
+
+                            is ConversationListItem.CompactStatus -> {
+                                CompactStatusDivider(text = item.message.text.ifBlank { "Context compacted" })
+                            }
+                        }
+                    }
+                    if (isCompacting) {
+                        item(key = "compact-running-status") {
+                            CompactStatusDivider(
+                                text = "Compacting context",
+                                isRunning = true,
+                            )
                         }
                     }
                     if (pendingResponseBlocks.isNotEmpty() || pendingToolInvocations.isNotEmpty() || isSending) {
@@ -615,11 +639,12 @@ fun ConversationScreen(
                 agentModeAvailable = agentModeAvailable,
                 agentModeSelected = agentModeSelected,
                 isEditing = isEditing,
-                        termuxSetupState = termuxSetupState,
-                        isSending = isSending,
-                        showStarterPromptHint = showStarterPromptHint,
-                        showTermuxSetupNotice = showTermuxSetupNotice,
-                        onValueChange = onInputChanged,
+                termuxSetupState = termuxSetupState,
+                isSending = isSending,
+                showStarterPromptHint = showStarterPromptHint,
+                showTermuxSetupNotice = showTermuxSetupNotice,
+                compactSuggestionText = compactSuggestionText,
+                onValueChange = onInputChanged,
                 onRemoveAttachment = onRemoveDraftAttachment,
                 onSetSkillSelected = onSetSkillSelected,
                 onSetMcpServerSelected = onSetMcpServerSelected,
@@ -632,11 +657,11 @@ fun ConversationScreen(
                 onOpenTermuxSettings = onOpenTermuxSettings,
                 onOpenTermux = onOpenTermux,
                 onInstallTermux = onInstallTermux,
-                        onRefreshTermuxSetup = onRefreshTermuxSetup,
-                        onPauseGeneration = onPauseGeneration,
-                        onDismissTermuxSetupNotice = onDismissTermuxSetupNotice,
-                        onDismissStarterPromptHint = onDismissStarterPromptHint,
-                        onFocusChanged = { composerFocused = it },
+                onRefreshTermuxSetup = onRefreshTermuxSetup,
+                onPauseGeneration = onPauseGeneration,
+                onDismissTermuxSetupNotice = onDismissTermuxSetupNotice,
+                onDismissStarterPromptHint = onDismissStarterPromptHint,
+                onFocusChanged = { composerFocused = it },
                 onSend = onSend,
                 onQueueFollowUp = onQueueFollowUp,
                 onSteerFollowUp = onSteerFollowUp,
@@ -1217,6 +1242,20 @@ private fun buildConversationListItems(
     var index = 0
     while (index < messages.size) {
         val message = messages[index]
+        when (message.displayKind) {
+            MessageDisplayKind.HiddenContext -> {
+                index += 1
+                continue
+            }
+
+            MessageDisplayKind.CompactStatus -> {
+                add(ConversationListItem.CompactStatus(message))
+                index += 1
+                continue
+            }
+
+            MessageDisplayKind.Standard -> Unit
+        }
         val responseGroupId = message.responseGroupId
         if (
             message.author == MessageAuthor.Agent &&
@@ -1251,6 +1290,125 @@ private fun buildConversationListItems(
         }
         add(ConversationListItem.Message(message))
         index += 1
+    }
+}
+
+private fun compactCommandSuggestionText(messages: List<ChatMessage>): String {
+    val visibleMessages = messages.filter {
+        it.displayKind != MessageDisplayKind.HiddenContext &&
+            it.displayKind != MessageDisplayKind.CompactStatus
+    }
+    if (visibleMessages.size < 2) return "Compact this thread's context"
+    val estimatedChars = visibleMessages.sumOf { message ->
+        message.text.length +
+            message.attachments.sumOf { attachment ->
+                attachment.name.length + attachment.mimeType.length + attachment.workspacePath.length
+            } +
+            message.toolInvocations.sumOf { invocation ->
+                invocation.toolName.length + invocation.argumentsJson.length + invocation.outputJson.length
+            }
+    }
+    val percent = ((estimatedChars * 100L) / 120_000L).toInt().coerceIn(1, 100)
+    return "Compact this thread's context (${percent}% full)"
+}
+
+@Composable
+private fun CompactStatusDivider(
+    text: String,
+    isRunning: Boolean = false,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 2.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        Box(
+            modifier = Modifier
+                .weight(1f)
+                .height(1.dp)
+                .background(AetherOnSurfaceVariant.copy(alpha = 0.08f)),
+        )
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(7.dp),
+        ) {
+            Icon(
+                imageVector = if (isRunning) Icons.Rounded.RadioButtonUnchecked else Icons.Rounded.Check,
+                contentDescription = null,
+                tint = AetherOnSurfaceVariant.copy(alpha = 0.82f),
+                modifier = Modifier.size(15.dp),
+            )
+            if (isRunning) {
+                ShimmerStatusText(
+                    text = text,
+                    modifier = Modifier.widthIn(max = 190.dp),
+                    travelDurationMillis = 2200,
+                    pauseDurationMillis = 700,
+                )
+            } else {
+                Text(
+                    text = text,
+                    style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Medium),
+                    color = AetherOnSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        }
+        Box(
+            modifier = Modifier
+                .weight(1f)
+                .height(1.dp)
+                .background(AetherOnSurfaceVariant.copy(alpha = 0.08f)),
+        )
+    }
+}
+
+@Composable
+private fun CompactCommandSuggestion(
+    text: String,
+    onClick: () -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(22.dp))
+            .background(AetherSurfaceHigh.copy(alpha = 0.92f))
+            .clickable(onClick = onClick)
+            .padding(horizontal = 14.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        Box(
+            modifier = Modifier
+                .size(24.dp)
+                .clip(CircleShape)
+                .background(AetherSurface),
+            contentAlignment = Alignment.Center,
+        ) {
+            Icon(
+                imageVector = Icons.Rounded.RadioButtonUnchecked,
+                contentDescription = null,
+                tint = AetherOnSurfaceVariant,
+                modifier = Modifier.size(16.dp),
+            )
+        }
+        Text(
+            text = "Compact",
+            style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Medium),
+            color = AetherOnSurface,
+            maxLines = 1,
+        )
+        Text(
+            text = text,
+            style = MaterialTheme.typography.bodyMedium,
+            color = AetherOnSurfaceVariant,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f),
+        )
     }
 }
 
@@ -1346,6 +1504,7 @@ private fun ConversationComposerOverlay(
     isSending: Boolean,
     showStarterPromptHint: Boolean,
     showTermuxSetupNotice: Boolean,
+    compactSuggestionText: String,
     onValueChange: (String) -> Unit,
     onRemoveAttachment: (String) -> Unit,
     onSetSkillSelected: (String, Boolean) -> Unit,
@@ -1403,6 +1562,7 @@ private fun ConversationComposerOverlay(
                     isSending = isSending,
                     showStarterPromptHint = showStarterPromptHint,
                     showTermuxSetupNotice = showTermuxSetupNotice,
+                    compactSuggestionText = compactSuggestionText,
                     onValueChange = onValueChange,
                     onRemoveAttachment = onRemoveAttachment,
                     onSetSkillSelected = onSetSkillSelected,
@@ -1447,6 +1607,7 @@ private fun ConversationComposerBar(
     isSending: Boolean,
     showStarterPromptHint: Boolean,
     showTermuxSetupNotice: Boolean,
+    compactSuggestionText: String,
     onValueChange: (String) -> Unit,
     onRemoveAttachment: (String) -> Unit,
     onSetSkillSelected: (String, Boolean) -> Unit,
@@ -1505,6 +1666,10 @@ private fun ConversationComposerBar(
         else -> strings.askAether
     }
     val hasDraft = value.isNotBlank() || attachments.isNotEmpty()
+    val showCompactSuggestion = compactSuggestionText.isNotBlank() &&
+        attachments.isEmpty() &&
+        value.isNotBlank() &&
+        "/compact".startsWith(value.trim(), ignoreCase = true)
     val canSendDraft = attachments.all { it.workspaceState == AttachmentWorkspaceState.Ready }
     val showPauseButton = isSending && !hasDraft
     val showSubmitButton = !isSending || hasDraft
@@ -1615,6 +1780,24 @@ private fun ConversationComposerBar(
                 actionLabel = strings.cancel,
                 onAction = onCancelEdit,
                 actionEnabled = true,
+            )
+        }
+        AnimatedVisibility(
+            visible = showCompactSuggestion,
+            enter = fadeIn(animationSpec = tween(durationMillis = 160, easing = ChatGptMotionEasing)) +
+                slideInVertically(
+                    animationSpec = tween(durationMillis = 220, easing = ChatGptMotionEasing),
+                    initialOffsetY = { it / 3 },
+                ),
+            exit = fadeOut(animationSpec = tween(durationMillis = 120, easing = ChatGptMotionEasing)) +
+                slideOutVertically(
+                    animationSpec = tween(durationMillis = 180, easing = ChatGptMotionEasing),
+                    targetOffsetY = { it / 3 },
+                ),
+        ) {
+            CompactCommandSuggestion(
+                onClick = { onValueChange("/compact") },
+                text = compactSuggestionText,
             )
         }
         if (attachments.isNotEmpty()) {

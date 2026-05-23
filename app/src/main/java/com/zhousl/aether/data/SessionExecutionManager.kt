@@ -12,6 +12,7 @@ import com.zhousl.aether.ui.ChatAttachment
 import com.zhousl.aether.ui.ChatMessage
 import com.zhousl.aether.ui.ChatSession
 import com.zhousl.aether.ui.ChatToolInvocation
+import com.zhousl.aether.ui.MessageDisplayKind
 import com.zhousl.aether.ui.MessageAuthor
 import com.zhousl.aether.ui.ReasoningSummaryChunk
 import com.zhousl.aether.ui.ReasoningTrace
@@ -1222,7 +1223,18 @@ class SessionExecutionManager(
         chatStateStore.state.value.sessions.firstOrNull { it.id == sessionId }?.title.orEmpty()
 
     private fun buildRequestMessages(messages: List<ChatMessage>): List<LlmMessage> =
-        messages.map(::buildRequestMessage)
+        messages.afterLatestCompactedContext()
+            .filter { it.displayKind != MessageDisplayKind.CompactStatus }
+            .map(::buildRequestMessage)
+
+    private fun List<ChatMessage>.afterLatestCompactedContext(): List<ChatMessage> {
+        val compactContextIndex = indexOfLast { it.displayKind == MessageDisplayKind.HiddenContext }
+        return if (compactContextIndex >= 0) {
+            drop(compactContextIndex)
+        } else {
+            this
+        }
+    }
 
     private fun buildRequestMessage(message: ChatMessage): LlmMessage {
         val parts = mutableListOf<LlmContentPart>()
@@ -1238,6 +1250,7 @@ class SessionExecutionManager(
         return LlmMessage(
             role = if (message.author == MessageAuthor.User) "user" else "assistant",
             contentParts = parts,
+            providerPayload = parseJsonObject(message.providerPayloadJson),
         )
     }
 
