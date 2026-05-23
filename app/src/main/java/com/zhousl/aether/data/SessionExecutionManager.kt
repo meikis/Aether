@@ -80,6 +80,7 @@ data class SessionTurnRequest(
     val activeSkills: List<ActiveSkillContext>,
     val activeMcpServerIds: List<String>,
     val agentModeEnabled: Boolean,
+    val providerConfigs: List<LlmProviderConfig> = emptyList(),
 )
 
 data class SessionTurnEvent(
@@ -351,6 +352,7 @@ class SessionExecutionManager(
                 activeSkills = activeSkills,
                 activeMcpServerIds = activeMcpServerIds,
                 agentModeEnabled = agentModeEnabled,
+                providerConfigs = providerConfigs,
             )
         )
         return true
@@ -527,6 +529,7 @@ class SessionExecutionManager(
                 activeSkills = resolvedActiveSkills,
                 mcpToolBindings = mcpClientManager.toolBindings(),
                 agentModeEnabled = request.agentModeEnabled,
+                providerConfigs = request.providerConfigs,
                 onToolEvent = { event ->
                     if (handle.pauseRequested) return@runTurn
                     val nowUptime = SystemClock.uptimeMillis()
@@ -1242,7 +1245,7 @@ class SessionExecutionManager(
             parts += LlmTextPart(message.text)
         }
         message.attachments.forEach { attachment ->
-            parts += buildWorkspaceAttachmentPart(attachment)
+            parts += buildWorkspaceAttachmentParts(attachment)
         }
         if (parts.isEmpty()) {
             parts += LlmTextPart("[Empty message]")
@@ -1270,22 +1273,22 @@ class SessionExecutionManager(
         return buildRequestMessage(message.copy(text = steerText))
     }
 
-    private fun buildWorkspaceAttachmentPart(
+    private fun buildWorkspaceAttachmentParts(
         attachment: ChatAttachment,
-    ): LlmTextPart {
+    ): List<LlmContentPart> {
         if (attachment.workspacePath.isBlank()) {
-            return LlmTextPart(
+            return listOf(LlmTextPart(
                 "Attached file '${attachment.name}' is missing a workspace path. Ask the user to re-upload it if you need to inspect the file."
-            )
+            ))
         }
 
         val accessHint = if (attachment.kind == AttachmentKind.Image) {
-            "This image was copied into the workspace but was not passed to model vision automatically. Use analyze_image on this path if you need to inspect it."
+            "This image was copied into the workspace and is also inserted into this model request when local bytes are available. Use analyze_image on this path for a focused second pass if needed."
         } else {
             "Inspect this file through read, grep, find, ls, or bash inside the workspace instead of assuming its contents."
         }
 
-        return LlmTextPart(
+        val metadataPart = LlmTextPart(
             buildString {
                 append("Workspace attachment:\n")
                 append("Name: ${attachment.name}\n")
@@ -1296,6 +1299,17 @@ class SessionExecutionManager(
                 append(accessHint)
             }
         )
+        val imagePart = attachment.takeIf {
+            it.kind == AttachmentKind.Image &&
+                it.mimeType.startsWith("image/") &&
+                it.inlineBase64.isNotBlank()
+        }?.let {
+            LlmImagePart(
+                mimeType = it.mimeType,
+                base64Data = it.inlineBase64,
+            )
+        }
+        return listOfNotNull(metadataPart, imagePart)
     }
 
     private fun buildProviderUserMessage(

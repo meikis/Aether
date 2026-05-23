@@ -257,6 +257,7 @@ private fun parseAttachments(attachments: JSONArray?): List<ChatAttachment> {
                     } else {
                         ""
                     },
+                    inlineBase64 = attachment.optString("inlineBase64"),
                 )
             )
         }

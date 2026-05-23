@@ -77,6 +77,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.Base64
 
 private const val FollowUpTourAutoOpenDelayMillis = 2_500L
 private const val AppUpdateCheckIntervalMillis = 3L * 24L * 60L * 60L * 1000L
@@ -85,6 +86,7 @@ private const val SessionTitleSystemPrompt =
     "Generate a concise chat title for this conversation. Return only the title, in the user's language when possible, with no quotes, no emoji, and at most 6 words."
 private const val CompactCommand = "/compact"
 private const val CompactingMaxInputChars = 120_000
+private const val MaxInlineImageAttachmentBytes = 5 * 1024 * 1024
 private const val SessionCompactingSystemPrompt =
     "You are Aether's conversation compactor. Summarize the provided conversation so a future assistant can continue seamlessly. Preserve user goals, constraints, decisions, important facts, open tasks, files/paths mentioned, tool results, errors, and next steps. Do not invent details. Return only the compacted context."
 
@@ -2340,6 +2342,15 @@ class AetherViewModel(
                         workspaceError = "",
                         workspaceBytesCopied = importedFile.bytesCopied,
                         workspaceBytesPerSecond = 0L,
+                        inlineBase64 = if (
+                            resolvedMimeType.startsWith("image/") &&
+                            importedFile.inlineBytes.isNotEmpty() &&
+                            importedFile.inlineBytes.size <= MaxInlineImageAttachmentBytes
+                        ) {
+                            Base64.getEncoder().encodeToString(importedFile.inlineBytes)
+                        } else {
+                            existingAttachment.inlineBase64
+                        },
                     )
                 },
                 onFailure = { throwable ->

@@ -26,6 +26,7 @@ private const val MaxWorkspaceDownloadBytes = 32 * 1024 * 1024
 private const val WorkspaceImportChunkBytes = 48 * 1024
 private const val WorkspaceTransferChunkBytes = 6 * 1024
 private const val WorkspaceUploadChunkChars = 64 * 1024
+private const val MaxAnalyzeInlineBytes = 5 * 1024 * 1024
 private const val WorkspaceImportProgressIntervalMillis = 500L
 private const val WorkspaceHttpUploadBufferBytes = 256 * 1024
 private const val WorkspaceHttpUploadTimeoutMillis = 60 * 60 * 1000L
@@ -66,15 +67,18 @@ class WorkspaceFileBridge(
             displayName = displayName,
         )
         val destinationPath = "${workspaceUploadsDirectory(sessionId, mode)}/$safeFileName"
+        var inlineBytes = ByteArray(0)
         val bytesCopied = copyUriToWorkspace(
             sourceUri = sourceUri,
             absolutePath = destinationPath,
             onProgress = onProgress,
+            onInlineBytes = { inlineBytes = it },
         )
 
         ImportedWorkspaceFile(
             absolutePath = destinationPath,
             bytesCopied = bytesCopied,
+            inlineBytes = inlineBytes,
         )
     }
 
@@ -309,16 +313,19 @@ class WorkspaceFileBridge(
         sourceUri: Uri,
         absolutePath: String,
         onProgress: (WorkspaceImportProgress) -> Unit,
+        onInlineBytes: (ByteArray) -> Unit,
     ): Long = withContext(Dispatchers.IO) {
         copyUriToWorkspaceOverHttp(
             sourceUri = sourceUri,
             absolutePath = absolutePath,
             onProgress = onProgress,
+            onInlineBytes = onInlineBytes,
         ).getOrElse {
             copyUriToWorkspaceOverBase64(
                 sourceUri = sourceUri,
                 absolutePath = absolutePath,
                 onProgress = onProgress,
+                onInlineBytes = onInlineBytes,
             )
         }
     }
@@ -327,6 +334,7 @@ class WorkspaceFileBridge(
         sourceUri: Uri,
         absolutePath: String,
         onProgress: (WorkspaceImportProgress) -> Unit,
+        onInlineBytes: (ByteArray) -> Unit,
     ): Result<Long> = runCatching {
         val uploadServer = WorkspaceHttpUploadServer(
             context = context,
@@ -344,6 +352,9 @@ class WorkspaceFileBridge(
                 awaitTimeoutMillis = WorkspaceHttpUploadTimeoutMillis,
             )
             val serverBytes = server.awaitBytesServed()
+            if (serverBytes <= MaxAnalyzeInlineBytes) {
+                onInlineBytes(server.inlineBytes())
+            }
             val values = parseStructuredStdout(rawResult.optString("stdout"))
             values["bytes_written"]?.toLongOrNull() ?: serverBytes
         }
@@ -353,6 +364,7 @@ class WorkspaceFileBridge(
         sourceUri: Uri,
         absolutePath: String,
         onProgress: (WorkspaceImportProgress) -> Unit,
+        onInlineBytes: (ByteArray) -> Unit,
     ): Long {
         val pathBase64 = encodeBase64(absolutePath)
         executeUploadCommand(
@@ -365,6 +377,7 @@ class WorkspaceFileBridge(
         val startedAtMillis = System.currentTimeMillis()
         var lastProgressAtMillis = 0L
         var bytesCopied = 0L
+        val inlineBuffer = ByteArrayOutputStream()
 
         fun maybeEmitProgress(force: Boolean = false) {
             val now = System.currentTimeMillis()
@@ -397,8 +410,17 @@ class WorkspaceFileBridge(
                     )
                 }
                 bytesCopied += read.toLong()
+                if (inlineBuffer.size() <= MaxAnalyzeInlineBytes) {
+                    val remaining = MaxAnalyzeInlineBytes - inlineBuffer.size()
+                    if (remaining > 0) {
+                        inlineBuffer.write(buffer, 0, minOf(read, remaining))
+                    }
+                }
                 maybeEmitProgress()
             }
+        }
+        if (bytesCopied <= MaxAnalyzeInlineBytes) {
+            onInlineBytes(inlineBuffer.toByteArray())
         }
 
         val rawResult = executeUploadCommand(
@@ -823,6 +845,7 @@ private data class RootReadCommandResult(
 data class ImportedWorkspaceFile(
     val absolutePath: String,
     val bytesCopied: Long,
+    val inlineBytes: ByteArray = ByteArray(0),
 )
 
 data class WorkspaceImportProgress(
@@ -838,6 +861,7 @@ private class WorkspaceHttpUploadServer(
     private val token = UUID.randomUUID().toString()
     private val serverSocket = ServerSocket(0, 1, InetAddress.getByName("127.0.0.1"))
     private val result = AtomicReference<Result<Long>?>(null)
+    private val inlineBuffer = ByteArrayOutputStream()
     private val worker = thread(
         name = "aether-workspace-upload",
         isDaemon = true,
@@ -855,6 +879,8 @@ private class WorkspaceHttpUploadServer(
         return result.get()?.getOrThrow()
             ?: error("Workspace upload server stopped without a result.")
     }
+
+    fun inlineBytes(): ByteArray = inlineBuffer.toByteArray()
 
     override fun close() {
         runCatching { serverSocket.close() }
@@ -909,6 +935,12 @@ private class WorkspaceHttpUploadServer(
                     if (read <= 0) break
                     output.write(buffer, 0, read)
                     bytesCopied += read.toLong()
+                    if (inlineBuffer.size() <= MaxAnalyzeInlineBytes) {
+                        val remaining = MaxAnalyzeInlineBytes - inlineBuffer.size()
+                        if (remaining > 0) {
+                            inlineBuffer.write(buffer, 0, minOf(read, remaining))
+                        }
+                    }
                     maybeEmitProgress()
                 }
             }

@@ -82,6 +82,7 @@ data class ChatAttachment(
     val workspaceError: String = "",
     val workspaceBytesCopied: Long = 0L,
     val workspaceBytesPerSecond: Long = 0L,
+    val inlineBase64: String = "",
 )
 
 data class ChatToolInvocation(
