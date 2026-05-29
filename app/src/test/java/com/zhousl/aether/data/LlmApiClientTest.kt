@@ -1,12 +1,46 @@
 package com.zhousl.aether.data
 
 import kotlinx.coroutines.runBlocking
+import okhttp3.mockwebserver.MockResponse
+import okhttp3.mockwebserver.MockWebServer
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class LlmApiClientTest {
+    @Test
+    fun fetchModelsIncludesAetherUserAgentAndCustomHeaders() = runBlocking {
+        val server = MockWebServer()
+        server.enqueue(
+            MockResponse()
+                .addHeader("Content-Type", "application/json")
+                .setBody("""{"data":[{"id":"gpt-test"}]}""")
+        )
+        server.start()
+
+        try {
+            val result = LlmApiClient.fetchModels(
+                LlmProviderConfig(
+                    providerId = "openai",
+                    name = "OpenAI",
+                    providerType = LlmProvider.OpenAiCompatible,
+                    apiKey = "test-key",
+                    baseUrl = server.url("/v1").toString(),
+                    modelId = "gpt-test",
+                    customHeaders = listOf(LlmCustomHeader("X-Aether-Test", "models")),
+                )
+            )
+
+            assertEquals(listOf("gpt-test"), result.models)
+            val request = server.takeRequest()
+            assertEquals(AetherLlmUserAgent, request.getHeader("User-Agent"))
+            assertEquals("models", request.getHeader("X-Aether-Test"))
+        } finally {
+            server.shutdown()
+        }
+    }
+
     @Test
     fun vertexOfficialEndpointIncludesPreviewModels() = runBlocking {
         val result = LlmApiClient.fetchModels(

@@ -4,12 +4,15 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
+import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.graphics.Point
 import android.hardware.display.DisplayManager
-import android.view.Display
 import android.os.IBinder
+import android.os.ParcelFileDescriptor
 import android.util.Base64
+import android.view.Display
+import android.view.Surface
 import androidx.core.content.getSystemService
 import com.rosan.app_process.AppProcess
 import com.zhousl.aether.agentmode.AetherAgentModeShizukuService
@@ -18,13 +21,20 @@ import com.zhousl.aether.termux.TermuxBashTool
 import java.io.File
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import org.json.JSONArray
 import org.json.JSONObject
 import rikka.shizuku.Shizuku
 
@@ -32,8 +42,15 @@ private const val FallbackAgentDisplayWidth = 720
 private const val FallbackAgentDisplayHeight = 1280
 private const val FallbackAgentDisplayDensityDpi = 320
 private const val AgentDisplayName = "aether-agent-mode"
+private const val AgentModeCaptureExtension = "jpg"
+private const val AgentModeCaptureMimeType = "image/jpeg"
+private const val AgentModeCaptureMaxEdge = 1280
+private const val AgentModeCaptureJpegQuality = 85
 private const val ShizukuPermissionRequestCode = 4201
 private const val RootAuthorizationProbeTimeoutMillis = 2_000L
+private const val ShizukuUserServiceBindTimeoutMillis = 20_000L
+private const val ShizukuUserServiceTag = "aether-agent-mode"
+private const val ShizukuUserServiceVersion = 1
 
 private val ShizukuManagerPackages = listOf(
     "moe.shizuku.privileged.api",
@@ -48,6 +65,10 @@ data class AgentModeDisplayState(
     val displays: List<AgentModeDisplayInfo> = emptyList(),
     val latestPreviewPath: String = "",
     val latestWorkspacePath: String = "",
+    val cursorX: Int? = null,
+    val cursorY: Int? = null,
+    val cursorAnimationDurationMillis: Int = 220,
+    val isLivePreviewActive: Boolean = false,
     val lastUpdatedMillis: Long = 0L,
     val status: String = "",
 )
@@ -58,6 +79,14 @@ data class AgentModeDisplayInfo(
     val width: Int,
     val height: Int,
     val isAetherDisplay: Boolean,
+)
+
+data class AgentModeInstalledAppInfo(
+    val packageName: String,
+    val appName: String,
+    val activityName: String,
+    val isSystemApp: Boolean,
+    val isEnabled: Boolean,
 )
 
 enum class AgentModeAuthorizationIssue {
@@ -85,9 +114,13 @@ class AgentModeController(
     private val context: Context,
     private val bashTool: TermuxBashTool,
     private val workspaceFileBridge: WorkspaceFileBridge,
+    private val diagnosticLogger: AetherDiagnosticLogger = AetherDiagnosticLogger.NoOp,
 ) {
     private val displayManager = context.getSystemService<DisplayManager>()!!
     private val cacheDirectory = File(context.cacheDir, "agent-mode").apply { mkdirs() }
+    private val controllerScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val captureMutex = Mutex()
+    private val shizukuServiceMutex = Mutex()
     private val _displayState = MutableStateFlow(AgentModeDisplayState())
     private val _authorizationState = MutableStateFlow(AgentModeAuthorizationState())
     private val shizukuPermissionResultListener =
@@ -103,11 +136,20 @@ class AgentModeController(
                     ),
                 )
                 _authorizationState.value = if (grantResult == PackageManager.PERMISSION_GRANTED) {
+                    diagnosticLogger.event(
+                        category = "agent_mode",
+                        event = "shizuku_permission_granted",
+                    )
                     AgentModeAuthorizationState(
                         issue = AgentModeAuthorizationIssue.Ready,
                         detail = "Shizuku permission is granted.",
                     )
                 } else {
+                    diagnosticLogger.event(
+                        category = "agent_mode",
+                        event = "shizuku_permission_denied",
+                        level = "warn",
+                    )
                     AgentModeAuthorizationState(
                         issue = AgentModeAuthorizationIssue.ShizukuPermissionDenied,
                         detail = "Shizuku permission was denied. Grant Aether permission in Shizuku before using Agent Mode.",
@@ -122,15 +164,19 @@ class AgentModeController(
                 detail = "Shizuku stopped. Start Shizuku, then refresh Agent Mode status.",
             )
         }
-        shizukuService = null
+        clearShizukuService("Shizuku stopped. Agent Mode virtual display was reset.")
     }
 
     private var shizukuDisplayId: Int? = null
+    private var displayOwnerMethod: AgentModeAuthorizationMethod? = null
+    private var displayOwnerBinder: IBinder? = null
     private var shizukuService: IAetherAgentModeService? = null
     private var shizukuServiceArgs: Shizuku.UserServiceArgs? = null
     private var shizukuServiceConnection: ServiceConnection? = null
     private var rootService: IAetherAgentModeService? = null
     private var rootProcess: AppProcess.Terminal? = null
+    @Volatile
+    private var previewSurface: Surface? = null
 
     val displayState: StateFlow<AgentModeDisplayState> = _displayState.asStateFlow()
     val authorizationState: StateFlow<AgentModeAuthorizationState> = _authorizationState.asStateFlow()
@@ -172,6 +218,15 @@ class AgentModeController(
                 )
             }
         val action = arguments.optString("action").trim().lowercase()
+        diagnosticLogger.event(
+            category = "agent_mode",
+            event = "action_start",
+            details = mapOf(
+                "action" to action.ifBlank { "unknown" },
+                "authorization_method" to settings.agentModeAuthorizationMethod.storageValue,
+                "display_active" to _displayState.value.isActive,
+            ),
+        )
 
         runCatching {
             when (action) {
@@ -180,6 +235,7 @@ class AgentModeController(
                 captureAfterDelay(settings, workspaceDirectory, delayMillis = 350)
             }
             "status" -> statusResult(settings)
+            "list_apps", "apps", "installed_apps" -> listInstalledAppsResult(settings, arguments)
             "launch" -> {
                 ensureDisplay(settings)
                 val target = arguments.optString("target").trim()
@@ -198,6 +254,7 @@ class AgentModeController(
                     invalidArguments("Both 'x' and 'y' are required, using 0..1000 screen coordinates.")
                 } else {
                     requireAgentModeService(settings).tap(displayId, x, y)
+                    updateCursorPosition(x, y, animationDurationMillis = 180)
                     captureAfterDelay(settings, workspaceDirectory, delayMillis = 350)
                 }
             }
@@ -212,6 +269,11 @@ class AgentModeController(
                 if (x1 == null || y1 == null || x2 == null || y2 == null) {
                     invalidArguments("x1, y1, x2, and y2 are required, using 0..1000 screen coordinates.")
                 } else {
+                    updateCursorPosition(x1, y1, animationDurationMillis = 80)
+                    controllerScope.launch {
+                        delay(40)
+                        updateCursorPosition(x2, y2, animationDurationMillis = durationMs)
+                    }
                     requireAgentModeService(settings).swipe(displayId, x1, y1, x2, y2, durationMs)
                     captureAfterDelay(settings, workspaceDirectory, delayMillis = durationMs.toLong() + 250)
                 }
@@ -255,6 +317,20 @@ class AgentModeController(
                     message = "Unsupported action '$action'.",
                 )
             }
+            }.also {
+                val result = runCatching { JSONObject(it) }.getOrNull()
+                diagnosticLogger.event(
+                    category = "agent_mode",
+                    event = "action_end",
+                    level = if (result?.optBoolean("ok", true) == false) "warn" else "info",
+                    details = mapOf(
+                        "action" to action.ifBlank { "unknown" },
+                        "ok" to (result?.optBoolean("ok", true) ?: true),
+                        "display_id" to _displayState.value.displayId,
+                        "display_active" to _displayState.value.isActive,
+                        "message" to result?.optString("errmsg").orEmpty(),
+                    ),
+                )
             }
         }.getOrElse { throwable ->
             captureAgentModeFailed(
@@ -271,7 +347,26 @@ class AgentModeController(
     }
 
     suspend fun refreshAuthorization(settings: AppSettings) {
-        _authorizationState.value = inspectAuthorization(settings)
+        if (
+            shizukuDisplayId != null &&
+            displayOwnerMethod != null &&
+            displayOwnerMethod != settings.agentModeAuthorizationMethod
+        ) {
+            releaseDisplay("Virtual display reset because Agent Mode authorization method changed.")
+        }
+        _authorizationState.value = inspectAuthorization(settings).also { state ->
+            diagnosticLogger.event(
+                category = "agent_mode",
+                event = "authorization_refreshed",
+                level = if (state.isReady || state.issue == AgentModeAuthorizationIssue.Disabled) "info" else "warn",
+                details = mapOf(
+                    "issue" to state.issue.name,
+                    "detail" to state.detail,
+                    "method" to settings.agentModeAuthorizationMethod.storageValue,
+                    "enabled" to settings.agentModeAuthorizationEnabled,
+                ),
+            )
+        }
     }
 
     fun requestShizukuPermission(): AgentModeAuthorizationState {
@@ -321,15 +416,35 @@ class AgentModeController(
     }
 
     private suspend fun ensureDisplay(settings: AppSettings): Int {
-        shizukuDisplayId?.let { return it }
+        val service = requireAgentModeService(settings)
+        val serviceBinder = service.asBinder()
+        shizukuDisplayId?.let { displayId ->
+            if (isCurrentDisplayOwner(settings, serviceBinder)) {
+                return displayId
+            }
+            releaseDisplay("Virtual display reset because Agent Mode authorization service changed.")
+        }
         val displaySpec = currentDeviceDisplaySpec()
-        val displayId = requireAgentModeService(settings).createOwnedDisplay(
+        val displayId = service.createOwnedDisplay(
             AgentDisplayName,
             displaySpec.width,
             displaySpec.height,
             displaySpec.densityDpi,
         )
         shizukuDisplayId = displayId
+        displayOwnerMethod = settings.agentModeAuthorizationMethod
+        displayOwnerBinder = serviceBinder
+        diagnosticLogger.event(
+            category = "agent_mode",
+            event = "display_created",
+            details = mapOf(
+                "display_id" to displayId,
+                "width" to displaySpec.width,
+                "height" to displaySpec.height,
+                "density_dpi" to displaySpec.densityDpi,
+                "method" to settings.agentModeAuthorizationMethod.storageValue,
+            ),
+        )
         _displayState.value = AgentModeDisplayState(
             isActive = true,
             displayId = displayId,
@@ -339,6 +454,7 @@ class AgentModeController(
             status = "${settings.agentModeAuthorizationMethod.displayName} virtual display ready",
             lastUpdatedMillis = System.currentTimeMillis(),
         )
+        attachCurrentPreviewSurface(settings, displayId)
         return displayId
     }
 
@@ -346,7 +462,39 @@ class AgentModeController(
         releaseDisplay()
     }
 
+    suspend fun attachPreviewSurface(settings: AppSettings, surface: Surface) = withContext(Dispatchers.IO) {
+        previewSurface = surface
+        val displayId = currentManagedDisplayId(settings) ?: return@withContext
+        attachCurrentPreviewSurface(settings, displayId)
+    }
+
+    suspend fun detachPreviewSurface(settings: AppSettings, surface: Surface) = withContext(Dispatchers.IO) {
+        if (previewSurface !== surface) return@withContext
+        previewSurface = null
+        val displayId = currentManagedDisplayId(settings) ?: run {
+            _displayState.value = _displayState.value.copy(
+                isLivePreviewActive = false,
+                lastUpdatedMillis = System.currentTimeMillis(),
+            )
+            return@withContext
+        }
+        runCatching {
+            requireAgentModeService(settings).detachPreviewSurface(displayId)
+        }
+        val state = _displayState.value
+        _displayState.value = state.copy(
+            isLivePreviewActive = false,
+            status = if (state.isActive) {
+                "${settings.agentModeAuthorizationMethod.displayName} virtual display ready"
+            } else {
+                state.status
+            },
+            lastUpdatedMillis = System.currentTimeMillis(),
+        )
+    }
+
     suspend fun refreshDisplays(settings: AppSettings) {
+        currentManagedDisplayId(settings)
         val state = _displayState.value
         _displayState.value = state.copy(
             displays = currentDisplays(settings, state.displayId),
@@ -354,43 +502,190 @@ class AgentModeController(
         )
     }
 
+    private suspend fun attachCurrentPreviewSurface(settings: AppSettings, displayId: Int) {
+        val surface = previewSurface?.takeIf { it.isValid } ?: return
+        runCatching {
+            requireAgentModeService(settings).attachPreviewSurface(displayId, surface)
+        }.onSuccess {
+            val state = _displayState.value
+            if (state.displayId == displayId && state.isActive) {
+                _displayState.value = state.copy(
+                    isLivePreviewActive = true,
+                    status = "Streaming virtual display",
+                    lastUpdatedMillis = System.currentTimeMillis(),
+                )
+            }
+        }.onFailure { throwable ->
+            val state = _displayState.value
+            if (state.displayId == displayId && state.isActive) {
+                _displayState.value = state.copy(
+                    isLivePreviewActive = false,
+                    status = throwable.message ?: "Live preview surface is not available.",
+                    lastUpdatedMillis = System.currentTimeMillis(),
+                )
+            }
+        }
+    }
+
     private suspend fun launchTarget(
         settings: AppSettings,
         target: String,
     ) {
         val displayId = ensureDisplay(settings)
-        val launchPackage = resolveLaunchPackage(target)
+        val launchPackage = resolveLaunchPackage(settings, target)
             ?: error("No launchable app matched '$target'. Try a package name such as com.android.chrome, or a shorter app label.")
         requireAgentModeService(settings).launchPackage(launchPackage, displayId)
     }
 
-    private fun resolveLaunchPackage(target: String): String? {
+    private suspend fun resolveLaunchPackage(
+        settings: AppSettings,
+        target: String,
+    ): String? {
         val normalizedTarget = target.trim().lowercase()
         if (normalizedTarget.isBlank()) return null
-        val packageManager = context.packageManager
-        packageManager.getLaunchIntentForPackage(target)?.let { return target }
+        context.packageManager.getLaunchIntentForPackage(target)?.let { return target }
 
-        val launcherIntent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
-        val launchables = packageManager.queryIntentActivities(launcherIntent, 0)
-            .map { info ->
-                val label = info.loadLabel(packageManager).toString()
-                Triple(info.activityInfo.packageName, label, info.activityInfo.name)
-            }
+        val launchables = currentInstalledApps(settings)
         val tokens = normalizedTarget.split(Regex("\\s+"))
             .filter { it.length > 2 && it !in setOf("app", "browser", "managed") }
-        return launchables.firstOrNull { (packageName, label, _) ->
-            packageName.equals(normalizedTarget, ignoreCase = true) ||
-                label.equals(target, ignoreCase = true)
-        }?.first ?: launchables.firstOrNull { (packageName, label, activityName) ->
-            packageName.lowercase().contains(normalizedTarget) ||
-                label.lowercase().contains(normalizedTarget) ||
-                activityName.lowercase().contains(normalizedTarget) ||
+        return launchables.firstOrNull { app ->
+            app.packageName.equals(normalizedTarget, ignoreCase = true) ||
+                app.appName.equals(target, ignoreCase = true)
+        }?.packageName ?: launchables.firstOrNull { app ->
+            app.packageName.lowercase().contains(normalizedTarget) ||
+                app.appName.lowercase().contains(normalizedTarget) ||
+                app.activityName.lowercase().contains(normalizedTarget) ||
                 tokens.any { token ->
-                    packageName.lowercase().contains(token) ||
-                        label.lowercase().contains(token) ||
-                        activityName.lowercase().contains(token)
+                    app.packageName.lowercase().contains(token) ||
+                        app.appName.lowercase().contains(token) ||
+                        app.activityName.lowercase().contains(token)
                 }
-        }?.first
+        }?.packageName ?: target.takeIf {
+            it.matches(Regex("""[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z0-9_]+)+"""))
+        }
+    }
+
+    private suspend fun listInstalledAppsResult(
+        settings: AppSettings,
+        arguments: JSONObject,
+    ): String {
+        val query = arguments.optString("query").trim()
+        val normalizedQuery = query.lowercase()
+        val includeSystem = arguments.optBoolean(
+            "include_system",
+            arguments.optBoolean("includeSystem", true),
+        )
+        val maxResults = arguments.optInt(
+            "max_results",
+            arguments.optInt("maxResults", 500),
+        ).coerceIn(1, 1_000)
+        val apps = currentInstalledApps(settings)
+            .asSequence()
+            .filter { includeSystem || !it.isSystemApp }
+            .filter { app ->
+                normalizedQuery.isBlank() ||
+                    app.packageName.lowercase().contains(normalizedQuery) ||
+                    app.appName.lowercase().contains(normalizedQuery) ||
+                    app.activityName.lowercase().contains(normalizedQuery)
+            }
+            .toList()
+        val visibleApps = apps.take(maxResults)
+        return JSONObject().apply {
+            put("ok", true)
+            put("count", apps.size)
+            put("truncated", apps.size > visibleApps.size)
+            put(
+                "apps",
+                JSONArray().apply {
+                    visibleApps.forEach { app ->
+                        put(
+                            JSONObject().apply {
+                                put("app_name", app.appName)
+                                put("package_name", app.packageName)
+                                put("activity_name", app.activityName)
+                                put("enabled", app.isEnabled)
+                                put("system", app.isSystemApp)
+                                put("launchable", true)
+                            }
+                        )
+                    }
+                },
+            )
+            put(
+                "stdout",
+                buildString {
+                    append("Found ")
+                    append(apps.size)
+                    append(if (includeSystem) " launchable apps." else " non-system launchable apps.")
+                    if (apps.size > visibleApps.size) {
+                        append(" Showing ")
+                        append(visibleApps.size)
+                        append(".")
+                    }
+                    visibleApps.forEach { app ->
+                        append('\n')
+                        append(app.appName)
+                        append(" -> ")
+                        append(app.packageName)
+                    }
+                },
+            )
+        }.toString()
+    }
+
+    private suspend fun currentInstalledApps(settings: AppSettings): List<AgentModeInstalledAppInfo> {
+        val privilegedApps = runCatching {
+            parseInstalledApps(requireAgentModeService(settings).listInstalledAppsJson())
+        }.getOrNull()
+        return (privilegedApps?.takeIf { it.isNotEmpty() } ?: currentInstalledAppsLocal())
+            .distinctBy { it.packageName }
+            .sortedWith(compareBy({ it.appName.lowercase() }, { it.packageName }))
+    }
+
+    @Suppress("DEPRECATION")
+    private fun currentInstalledAppsLocal(): List<AgentModeInstalledAppInfo> {
+        val packageManager = context.packageManager
+        val launcherIntent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+        return packageManager.queryIntentActivities(
+            launcherIntent,
+            PackageManager.MATCH_DISABLED_COMPONENTS,
+        ).mapNotNull { info ->
+            val activityInfo = info.activityInfo ?: return@mapNotNull null
+            val applicationInfo = activityInfo.applicationInfo ?: return@mapNotNull null
+            AgentModeInstalledAppInfo(
+                packageName = activityInfo.packageName.orEmpty(),
+                appName = info.loadLabel(packageManager).toString(),
+                activityName = activityInfo.name.orEmpty(),
+                isSystemApp = applicationInfo.flags and ApplicationInfo.FLAG_SYSTEM != 0,
+                isEnabled = activityInfo.enabled && applicationInfo.enabled,
+            )
+        }
+    }
+
+    private fun parseInstalledApps(rawValue: String): List<AgentModeInstalledAppInfo> {
+        val array = JSONArray(rawValue)
+        return buildList {
+            for (index in 0 until array.length()) {
+                val item = array.optJSONObject(index) ?: continue
+                val packageName = item.optString("package_name").ifBlank {
+                    item.optString("packageName")
+                }
+                if (packageName.isBlank()) continue
+                add(
+                    AgentModeInstalledAppInfo(
+                        packageName = packageName,
+                        appName = item.optString("app_name").ifBlank {
+                            item.optString("appName").ifBlank { packageName }
+                        },
+                        activityName = item.optString("activity_name").ifBlank {
+                            item.optString("activityName")
+                        },
+                        isSystemApp = item.optBoolean("system"),
+                        isEnabled = item.optBoolean("enabled", true),
+                    )
+                )
+            }
+        }
     }
 
     private suspend fun captureAfterDelay(
@@ -399,23 +694,26 @@ class AgentModeController(
         delayMillis: Long,
     ): String {
         if (delayMillis > 0) delay(delayMillis)
-        val bytes = capturePngBytes(settings)
         val captureId = "capture-${System.currentTimeMillis()}"
-        val previewPath = File(cacheDirectory, "$captureId.png").absolutePath
-        File(previewPath).writeBytes(bytes)
-        File(cacheDirectory, "latest.png").writeBytes(bytes)
-        val workspacePath = "$workspaceDirectory/agent-mode/$captureId.png"
+        val previewFile = File(cacheDirectory, "$captureId.$AgentModeCaptureExtension")
+        captureImageFile(settings, previewFile)
+        if (!previewFile.isFile || previewFile.length() <= 0L) {
+            error("Agent Mode screenshot capture produced an empty file.")
+        }
+        val bytes = previewFile.readBytes()
+        val latestPreviewFile = File(cacheDirectory, "latest.$AgentModeCaptureExtension")
+        previewFile.copyTo(latestPreviewFile, overwrite = true)
+        val previewPath = previewFile.absolutePath
+        val workspacePath = "$workspaceDirectory/agent-mode/$captureId.$AgentModeCaptureExtension"
         workspaceFileBridge.writeWorkspaceBytes(
             absolutePath = workspacePath,
             bytes = bytes,
         ).getOrThrow()
-        val displayId = shizukuDisplayId
+        val displayId = currentManagedDisplayId(settings)
         val state = _displayState.value
-        _displayState.value = AgentModeDisplayState(
+        _displayState.value = state.copy(
             isActive = displayId != null,
             displayId = displayId,
-            width = state.width,
-            height = state.height,
             displays = currentDisplays(settings, displayId),
             latestPreviewPath = previewPath,
             latestWorkspacePath = workspacePath,
@@ -429,18 +727,59 @@ class AgentModeController(
             put("height", state.height)
             put("screenshot_path", workspacePath)
             put("preview_path", previewPath)
-            put("screenshot_mime_type", "image/png")
+            state.cursorX?.let { put("cursor_x", it) }
+            state.cursorY?.let { put("cursor_y", it) }
+            put("screenshot_mime_type", AgentModeCaptureMimeType)
             put("screenshot_base64", Base64.encodeToString(bytes, Base64.NO_WRAP))
             put("stdout", "Captured Agent Mode screenshot: $workspacePath")
         }.toString()
     }
 
-    private suspend fun capturePngBytes(settings: AppSettings): ByteArray {
-        val displayId = shizukuDisplayId ?: error("Agent Mode display is not running.")
-        return requireAgentModeService(settings).capturePng(displayId)
+    private fun updateCursorPosition(
+        x: Int,
+        y: Int,
+        animationDurationMillis: Int = 220,
+    ) {
+        val state = _displayState.value
+        _displayState.value = state.copy(
+            cursorX = x.coerceIn(0, state.width),
+            cursorY = y.coerceIn(0, state.height),
+            cursorAnimationDurationMillis = animationDurationMillis.coerceIn(80, 1_200),
+            lastUpdatedMillis = System.currentTimeMillis(),
+        )
+    }
+
+    private suspend fun captureImageFile(
+        settings: AppSettings,
+        outputFile: File,
+    ) {
+        val displayId = ensureDisplay(settings)
+        captureMutex.withLock {
+            outputFile.parentFile?.mkdirs()
+            runCatching { outputFile.delete() }
+            try {
+                ParcelFileDescriptor.open(
+                    outputFile,
+                    ParcelFileDescriptor.MODE_CREATE or
+                        ParcelFileDescriptor.MODE_WRITE_ONLY or
+                        ParcelFileDescriptor.MODE_TRUNCATE,
+                ).use { descriptor ->
+                    requireAgentModeService(settings).captureImageToFd(
+                        displayId,
+                        descriptor,
+                        AgentModeCaptureMaxEdge,
+                        AgentModeCaptureJpegQuality,
+                    )
+                }
+            } catch (throwable: Throwable) {
+                runCatching { outputFile.delete() }
+                throw throwable
+            }
+        }
     }
 
     private suspend fun statusResult(settings: AppSettings): String {
+        currentManagedDisplayId(settings)
         val state = _displayState.value
         val displays = currentDisplays(settings, state.displayId)
         _displayState.value = state.copy(
@@ -453,6 +792,7 @@ class AgentModeController(
             put("display_id", state.displayId)
             put("width", state.width)
             put("height", state.height)
+            put("live_preview", state.isLivePreviewActive)
             put(
                 "displays",
                 org.json.JSONArray().apply {
@@ -474,18 +814,78 @@ class AgentModeController(
         }.toString()
     }
 
-    private fun releaseDisplay() {
+    private fun releaseDisplay(status: String = "Virtual display stopped") {
         shizukuDisplayId?.let { displayId ->
-            runCatching { shizukuService?.releaseDisplay(displayId) }
-            runCatching { rootService?.releaseDisplay(displayId) }
+            diagnosticLogger.event(
+                category = "agent_mode",
+                event = "display_released",
+                details = mapOf(
+                    "display_id" to displayId,
+                    "method" to displayOwnerMethod?.storageValue.orEmpty(),
+                    "status" to status,
+                ),
+            )
+            when (displayOwnerMethod) {
+                AgentModeAuthorizationMethod.Shizuku -> runCatching { shizukuService?.releaseDisplay(displayId) }
+                AgentModeAuthorizationMethod.Root -> runCatching { rootService?.releaseDisplay(displayId) }
+                null -> {
+                    runCatching { shizukuService?.releaseDisplay(displayId) }
+                    runCatching { rootService?.releaseDisplay(displayId) }
+                }
+            }
         }
         shizukuDisplayId = null
+        displayOwnerMethod = null
+        displayOwnerBinder = null
         _displayState.value = AgentModeDisplayState(
             isActive = false,
             displays = currentDisplaysLocal(null),
-            status = "Virtual display stopped",
+            status = status,
             lastUpdatedMillis = System.currentTimeMillis(),
         )
+    }
+
+    private suspend fun currentManagedDisplayId(settings: AppSettings): Int? {
+        val displayId = shizukuDisplayId ?: return null
+        val service = runCatching { requireAgentModeService(settings) }
+            .getOrElse { throwable ->
+                if (displayOwnerMethod == settings.agentModeAuthorizationMethod) {
+                    releaseDisplay(
+                        throwable.message ?: "Virtual display reset because Agent Mode service is unavailable."
+                    )
+                }
+                return null
+            }
+        if (isCurrentDisplayOwner(settings, service.asBinder())) {
+            return displayId
+        }
+        releaseDisplay("Virtual display reset because Agent Mode authorization service changed.")
+        return null
+    }
+
+    private fun isCurrentDisplayOwner(
+        settings: AppSettings,
+        binder: IBinder,
+    ): Boolean =
+        displayOwnerMethod == settings.agentModeAuthorizationMethod &&
+            displayOwnerBinder === binder &&
+            binder.isBinderAlive
+
+    private fun clearShizukuService(displayStatus: String) {
+        shizukuService = null
+        shizukuServiceArgs = null
+        shizukuServiceConnection = null
+        if (displayOwnerMethod == AgentModeAuthorizationMethod.Shizuku) {
+            releaseDisplay(displayStatus)
+        }
+    }
+
+    private fun clearRootService(displayStatus: String) {
+        rootService = null
+        rootProcess = null
+        if (displayOwnerMethod == AgentModeAuthorizationMethod.Root) {
+            releaseDisplay(displayStatus)
+        }
     }
 
     private fun captureAgentModeFailed(
@@ -494,6 +894,19 @@ class AgentModeController(
         reason: String,
         message: String,
     ) {
+        diagnosticLogger.event(
+            category = "agent_mode",
+            event = "action_failed",
+            level = "warn",
+            details = mapOf(
+                "action" to action,
+                "reason" to reason,
+                "message" to message,
+                "authorization_enabled" to settings.agentModeAuthorizationEnabled,
+                "authorization_method" to settings.agentModeAuthorizationMethod.storageValue,
+                "display_active" to _displayState.value.isActive,
+            ),
+        )
         AetherAnalytics.capture(
             event = "agent mode failed",
             properties = mapOf(
@@ -566,7 +979,12 @@ class AgentModeController(
 
     private suspend fun requireRootService(): IAetherAgentModeService = withContext(Dispatchers.IO) {
         val existing = rootService
-        if (existing != null) return@withContext existing
+        if (existing != null) {
+            if (existing.asBinder().isBinderAlive) {
+                return@withContext existing
+            }
+            clearRootService("Root Agent Mode service disconnected. Virtual display was reset.")
+        }
         val suPath = findSuPath()
         if (suPath.isBlank()) {
             _authorizationState.value = AgentModeAuthorizationState(
@@ -599,9 +1017,14 @@ class AgentModeController(
         service
     }
 
-    private suspend fun requireShizukuService(): IAetherAgentModeService {
+    private suspend fun requireShizukuService(): IAetherAgentModeService = shizukuServiceMutex.withLock {
         val existing = shizukuService
-        if (existing != null) return existing
+        if (existing != null) {
+            if (existing.asBinder().isBinderAlive) {
+                return@withLock existing
+            }
+            clearShizukuService("Shizuku Agent Mode service disconnected. Virtual display was reset.")
+        }
         if (!Shizuku.pingBinder()) {
             error("Shizuku is not running.")
         }
@@ -613,24 +1036,90 @@ class AgentModeController(
             ComponentName(context, AetherAgentModeShizukuService::class.java),
         )
             .processNameSuffix("agentmode")
+            .tag(ShizukuUserServiceTag)
+            .version(ShizukuUserServiceVersion)
             .daemon(false)
         val connection = object : ServiceConnection {
             override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
                 val bound = IAetherAgentModeService.Stub.asInterface(service)
+                if (shizukuServiceConnection !== this) return
                 shizukuService = bound
-                if (!deferred.isCompleted) {
+                if (bound == null) {
+                    if (!deferred.isCompleted) {
+                        deferred.completeExceptionally(
+                            IllegalStateException("Shizuku Agent Mode service returned an invalid binder.")
+                        )
+                    }
+                } else if (!deferred.isCompleted) {
                     deferred.complete(bound)
                 }
             }
 
             override fun onServiceDisconnected(name: ComponentName?) {
-                shizukuService = null
+                if (shizukuServiceConnection === this) {
+                    clearShizukuService("Shizuku Agent Mode service disconnected. Virtual display was reset.")
+                }
             }
         }
         shizukuServiceArgs = args
         shizukuServiceConnection = connection
-        Shizuku.bindUserService(args, connection)
-        return withTimeout(8_000) { deferred.await() }
+        diagnosticLogger.event(
+            category = "agent_mode",
+            event = "shizuku_service_bind_start",
+            details = mapOf(
+                "timeout_ms" to ShizukuUserServiceBindTimeoutMillis,
+                "tag" to ShizukuUserServiceTag,
+                "version" to ShizukuUserServiceVersion,
+            ),
+        )
+        val bindStartMillis = System.currentTimeMillis()
+        runCatching {
+            Shizuku.bindUserService(args, connection)
+        }.onSuccess {
+            diagnosticLogger.event(
+                category = "agent_mode",
+                event = "shizuku_service_bind_dispatched",
+                details = mapOf(
+                    "duration_ms" to (System.currentTimeMillis() - bindStartMillis),
+                ),
+            )
+        }.onFailure { throwable ->
+            if (shizukuServiceConnection === connection) {
+                shizukuService = null
+                shizukuServiceArgs = null
+                shizukuServiceConnection = null
+            }
+            throw throwable
+        }
+        return@withLock try {
+            withTimeout(ShizukuUserServiceBindTimeoutMillis) { deferred.await() }.also {
+                diagnosticLogger.event(
+                    category = "agent_mode",
+                    event = "shizuku_service_bound",
+                )
+            }
+        } catch (throwable: TimeoutCancellationException) {
+            if (shizukuServiceConnection === connection) {
+                shizukuService = null
+                shizukuServiceArgs = null
+                shizukuServiceConnection = null
+            }
+            runCatching { Shizuku.unbindUserService(args, connection, true) }
+            diagnosticLogger.event(
+                category = "agent_mode",
+                event = "shizuku_service_bind_timeout",
+                level = "warn",
+                details = mapOf(
+                    "timeout_ms" to ShizukuUserServiceBindTimeoutMillis,
+                    "shizuku_version" to runCatching { Shizuku.getVersion() }.getOrDefault(-1),
+                    "shizuku_server_patch_version" to runCatching { Shizuku.getServerPatchVersion() }.getOrDefault(-1),
+                ),
+            )
+            error(
+                "Timed out starting Shizuku Agent Mode service after " +
+                    "$ShizukuUserServiceBindTimeoutMillis ms. Restart Shizuku or update Shizuku, then refresh Agent Mode status."
+            )
+        }
     }
 
     private suspend fun inspectAuthorization(settings: AppSettings): AgentModeAuthorizationState =
@@ -646,11 +1135,15 @@ class AgentModeController(
         }
 
     private suspend fun inspectRootAuthorization(): AgentModeAuthorizationState = withContext(Dispatchers.IO) {
-        if (rootService != null) {
+        val existing = rootService
+        if (existing != null && existing.asBinder().isBinderAlive) {
             return@withContext AgentModeAuthorizationState(
                 issue = AgentModeAuthorizationIssue.Ready,
                 detail = "Root Agent Mode service is already connected.",
             )
+        }
+        if (existing != null) {
+            clearRootService("Root Agent Mode service disconnected. Virtual display was reset.")
         }
 
         val suPath = findSuPath()

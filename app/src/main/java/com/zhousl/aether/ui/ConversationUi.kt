@@ -1,11 +1,16 @@
 package com.zhousl.aether.ui
 
 import android.graphics.BitmapFactory
+import android.graphics.SurfaceTexture
+import android.os.SystemClock
+import android.view.Surface
+import android.view.TextureView
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.core.CubicBezierEasing
 import androidx.compose.animation.core.MutableTransitionState
 import androidx.compose.animation.core.animateDpAsState
+import androidx.compose.animation.core.animateIntOffsetAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -20,6 +25,7 @@ import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -66,6 +72,7 @@ import androidx.compose.material.icons.rounded.Cloud
 import androidx.compose.material.icons.rounded.Extension
 import androidx.compose.material.icons.rounded.Image
 import androidx.compose.material.icons.rounded.Menu
+import androidx.compose.material.icons.rounded.RadioButtonUnchecked
 import androidx.compose.material.icons.rounded.Terminal
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -73,18 +80,21 @@ import androidx.compose.material3.ModalDrawerSheet
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
-import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.withFrameNanos
+import androidx.compose.runtime.key
+import androidx.compose.runtime.produceState
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.BlurredEdgeTreatment
@@ -112,6 +122,7 @@ import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.PlatformTextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
@@ -119,12 +130,15 @@ import androidx.compose.ui.text.style.LineHeightStyle
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.Velocity
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Popup
 import androidx.compose.ui.window.PopupProperties
+import com.zhousl.aether.R
 import com.zhousl.aether.data.InstalledSkill
 import com.zhousl.aether.data.AppLanguage
 import com.zhousl.aether.data.AgentModeDisplayState
@@ -139,16 +153,18 @@ import com.zhousl.aether.termux.TermuxSetupState
 import com.zhousl.aether.ui.theme.AetherBackground
 import com.zhousl.aether.ui.theme.AetherBackgroundGradientTop
 import com.zhousl.aether.ui.theme.AetherOnSurface
-import com.zhousl.aether.ui.theme.AetherOnPrimary
 import com.zhousl.aether.ui.theme.AetherOnSurfaceVariant
 import com.zhousl.aether.ui.theme.AetherPrimary
 import com.zhousl.aether.ui.theme.AetherScrim
 import com.zhousl.aether.ui.theme.AetherSurface
 import com.zhousl.aether.ui.theme.AetherSurfaceHigh
 import com.zhousl.aether.ui.theme.AetherSurfaceHigher
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.delay
+import kotlin.math.roundToInt
 import org.json.JSONObject
 
 private sealed interface ConversationListItem {
@@ -167,11 +183,20 @@ private sealed interface ConversationListItem {
             ?: messages.firstOrNull()?.id
             ?: "assistant-group"
     }
+
+    data class CompactStatus(
+        val message: ChatMessage,
+    ) : ConversationListItem {
+        override val key: String = message.id
+    }
 }
 
 private val ConversationTopFadeHeight = 42.dp
 private val ComposerCardShape = RoundedCornerShape(26.dp)
 private val ComposerFocusedCardShape = RoundedCornerShape(28.dp)
+private val ComposerPlusMenuMaxHeight = 372.dp
+private const val ComposerPopupActionDelayMillis = 240L
+private const val MinimumWallClockMillis = 946_684_800_000L
 private val ChatGptControlShadow = Color(0x14000000)
 private val ChatGptComposerShadow = Color(0x18000000)
 private val ChatGptPurple = Color(0xFF9B5CFF)
@@ -188,12 +213,38 @@ internal fun pendingGenerationIndicator(
     pendingAssistantText: String,
     pendingStatusText: String,
     hasVisiblePendingReasoning: Boolean = false,
+    hasVisiblePendingWork: Boolean = false,
+    lastVisibleMessageAuthor: MessageAuthor? = null,
 ): PendingGenerationIndicator = when {
     !isSending -> PendingGenerationIndicator.None
     pendingStatusText.isNotBlank() -> PendingGenerationIndicator.Status
     hasVisiblePendingReasoning -> PendingGenerationIndicator.None
+    hasVisiblePendingWork -> PendingGenerationIndicator.None
+    lastVisibleMessageAuthor == MessageAuthor.Agent -> PendingGenerationIndicator.None
     pendingAssistantText.isBlank() -> PendingGenerationIndicator.Thinking
     else -> PendingGenerationIndicator.None
+}
+
+internal fun shouldRenderPendingGenerationBlock(
+    isSending: Boolean,
+    pendingResponseBlocks: List<AssistantResponseBlock>,
+    pendingToolInvocations: List<ChatToolInvocation>,
+    pendingStatusText: String,
+    lastVisibleAgentText: String?,
+): Boolean {
+    val hasPendingContent = pendingResponseBlocks.isNotEmpty() ||
+        pendingToolInvocations.isNotEmpty() ||
+        isSending
+    if (!hasPendingContent) return false
+
+    val pendingText = pendingResponseBlocks.visibleText().trim()
+    val lastAgentText = lastVisibleAgentText?.trim().orEmpty()
+    val isCommittedTextEcho = pendingText.isNotBlank() &&
+        lastAgentText.isNotBlank() &&
+        pendingText == lastAgentText &&
+        pendingToolInvocations.isEmpty() &&
+        pendingStatusText.isBlank()
+    return !isCommittedTextEcho
 }
 
 internal fun hasVisibleReasoningStatus(trace: ReasoningTrace): Boolean =
@@ -232,6 +283,8 @@ fun ConversationScreen(
     pendingAssistantText: String,
     pendingStatusText: String,
     pendingStatusDetail: String,
+    activeTurnStartedAtMillis: Long?,
+    isCompacting: Boolean,
     pendingInputs: List<PendingSessionInput>,
     inputValue: String,
     draftAttachments: List<ChatAttachment>,
@@ -247,7 +300,6 @@ fun ConversationScreen(
     allowRootImageRead: Boolean = false,
     isEditing: Boolean,
     termuxSetupState: TermuxSetupState,
-    showResumeSetupBanner: Boolean,
     showStarterPromptHint: Boolean,
     showTermuxSetupNotice: Boolean,
     onInputChanged: (String) -> Unit,
@@ -278,13 +330,32 @@ fun ConversationScreen(
     onOpenTermux: () -> Unit,
     onInstallTermux: () -> Unit,
     onRefreshTermuxSetup: () -> Unit,
+    onAttachAgentModePreviewSurface: (Surface) -> Unit,
+    onDetachAgentModePreviewSurface: (Surface) -> Unit,
     onPauseGeneration: () -> Unit,
-    onResumeOnboarding: () -> Unit,
+    onDismissTermuxSetupNotice: () -> Unit,
     onDismissStarterPromptHint: () -> Unit,
     isSending: Boolean,
 ) {
-    val listState = remember(conversationStateKey) { LazyListState() }
+    val listState = rememberSaveable(
+        conversationStateKey,
+        saver = LazyListState.Saver,
+    ) {
+        LazyListState()
+    }
     val conversationItems = remember(messages) { buildConversationListItems(messages) }
+    val compactSuggestionText = remember(messages) { compactCommandSuggestionText(messages) }
+    val lastVisibleMessageAuthor = remember(messages) {
+        messages.lastOrNull { message ->
+            message.displayKind == MessageDisplayKind.Standard
+        }?.author
+    }
+    val lastVisibleAgentText = remember(messages) {
+        messages.lastOrNull { message ->
+            message.displayKind == MessageDisplayKind.Standard &&
+                message.author == MessageAuthor.Agent
+        }?.text
+    }
     var previewAttachment by remember { mutableStateOf<ChatAttachment?>(null) }
     var shouldAutoFollow by rememberSaveable(conversationStateKey) { mutableStateOf(true) }
     var topBarBodyHeightPx by remember { mutableIntStateOf(0) }
@@ -368,6 +439,7 @@ fun ConversationScreen(
         pendingToolInvocations,
         pendingStatusText,
         pendingStatusDetail,
+        isCompacting,
         isSending,
     ) {
         buildString {
@@ -417,6 +489,8 @@ fun ConversationScreen(
             append('|')
             append(pendingStatusDetail)
             append('|')
+            append(isCompacting)
+            append('|')
             append(isSending)
         }
     }
@@ -456,8 +530,6 @@ fun ConversationScreen(
                         bottom = composerBodyHeight + animatedImeBottom + 16.dp,
                     ),
                     inputFocused = composerFocused,
-                    showResumeSetupBanner = showResumeSetupBanner,
-                    onResumeOnboarding = onResumeOnboarding,
                     onStarterPromptSelected = onInputChanged,
                 )
             } else {
@@ -515,14 +587,37 @@ fun ConversationScreen(
                                     onDelete = { onDeleteMessage(lastMessage.id) },
                                 )
                             }
+
+                            is ConversationListItem.CompactStatus -> {
+                                CompactStatusDivider(text = item.message.text.ifBlank { "Context compacted" })
+                            }
                         }
                     }
-                    if (pendingResponseBlocks.isNotEmpty() || pendingToolInvocations.isNotEmpty() || isSending) {
+                    if (isCompacting) {
+                        item(key = "compact-running-status") {
+                            CompactStatusDivider(
+                                text = "Compacting context",
+                                isRunning = true,
+                            )
+                        }
+                    }
+                    if (
+                        shouldRenderPendingGenerationBlock(
+                            isSending = isSending,
+                            pendingResponseBlocks = pendingResponseBlocks,
+                            pendingToolInvocations = pendingToolInvocations,
+                            pendingStatusText = pendingStatusText,
+                            lastVisibleAgentText = lastVisibleAgentText,
+                        )
+                    ) {
                         item(key = "pending-generation-block") {
                             val indicator = pendingGenerationIndicator(
                                 isSending = isSending,
                                 pendingAssistantText = pendingAssistantText,
                                 pendingStatusText = pendingStatusText,
+                                hasVisiblePendingWork = pendingResponseBlocks.hasVisiblePendingWork() ||
+                                    pendingToolInvocations.isNotEmpty(),
+                                lastVisibleMessageAuthor = lastVisibleMessageAuthor,
                                 hasVisiblePendingReasoning = pendingResponseBlocks.any {
                                     it is AssistantResponseBlock.Reasoning &&
                                         hasVisibleReasoningStatus(it.trace)
@@ -542,8 +637,11 @@ fun ConversationScreen(
                                     onOpenLink = onOpenLink,
                                     pendingToolInvocationStateKey = pendingToolInvocationStateKey,
                                     pendingToolInvocations = pendingToolInvocations,
+                                    activeTurnStartedAtMillis = activeTurnStartedAtMillis,
                                     agentModeSelected = agentModeSelected,
                                     agentModeDisplayState = agentModeDisplayState,
+                                    onAttachAgentModePreviewSurface = onAttachAgentModePreviewSurface,
+                                    onDetachAgentModePreviewSurface = onDetachAgentModePreviewSurface,
                                 )
                                 when (indicator) {
                                     PendingGenerationIndicator.Thinking -> {
@@ -588,6 +686,7 @@ fun ConversationScreen(
 
             ConversationComposerOverlay(
                 modifier = Modifier.align(Alignment.BottomCenter),
+                conversationStateKey = conversationStateKey,
                 onBodyHeightChanged = { composerBodyHeightPx = it },
                 value = inputValue,
                 attachments = draftAttachments,
@@ -598,11 +697,12 @@ fun ConversationScreen(
                 agentModeAvailable = agentModeAvailable,
                 agentModeSelected = agentModeSelected,
                 isEditing = isEditing,
-                        termuxSetupState = termuxSetupState,
-                        isSending = isSending,
-                        showStarterPromptHint = showStarterPromptHint,
-                        showTermuxSetupNotice = showTermuxSetupNotice,
-                        onValueChange = onInputChanged,
+                termuxSetupState = termuxSetupState,
+                isSending = isSending,
+                showStarterPromptHint = showStarterPromptHint,
+                showTermuxSetupNotice = showTermuxSetupNotice,
+                compactSuggestionText = compactSuggestionText,
+                onValueChange = onInputChanged,
                 onRemoveAttachment = onRemoveDraftAttachment,
                 onSetSkillSelected = onSetSkillSelected,
                 onSetMcpServerSelected = onSetMcpServerSelected,
@@ -615,10 +715,11 @@ fun ConversationScreen(
                 onOpenTermuxSettings = onOpenTermuxSettings,
                 onOpenTermux = onOpenTermux,
                 onInstallTermux = onInstallTermux,
-                        onRefreshTermuxSetup = onRefreshTermuxSetup,
-                        onPauseGeneration = onPauseGeneration,
-                        onDismissStarterPromptHint = onDismissStarterPromptHint,
-                        onFocusChanged = { composerFocused = it },
+                onRefreshTermuxSetup = onRefreshTermuxSetup,
+                onPauseGeneration = onPauseGeneration,
+                onDismissTermuxSetupNotice = onDismissTermuxSetupNotice,
+                onDismissStarterPromptHint = onDismissStarterPromptHint,
+                onFocusChanged = { composerFocused = it },
                 onSend = onSend,
                 onQueueFollowUp = onQueueFollowUp,
                 onSteerFollowUp = onSteerFollowUp,
@@ -867,8 +968,6 @@ private fun ConversationModelSelector(
 private fun ConversationEmptyState(
     modifier: Modifier = Modifier,
     inputFocused: Boolean,
-    showResumeSetupBanner: Boolean,
-    onResumeOnboarding: () -> Unit,
     onStarterPromptSelected: (String) -> Unit,
 ) {
     val strings = rememberAetherStrings()
@@ -885,10 +984,6 @@ private fun ConversationEmptyState(
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center,
     ) {
-        if (showResumeSetupBanner) {
-            ResumeSetupCard(onResumeOnboarding = onResumeOnboarding)
-            Spacer(modifier = Modifier.height(22.dp))
-        }
         Text(
             text = strings.whatCanIHelpWith,
             style = MaterialTheme.typography.titleLarge.copy(
@@ -969,43 +1064,6 @@ private fun EmptyStateChip(
 }
 
 @Composable
-private fun ResumeSetupCard(
-    onResumeOnboarding: () -> Unit,
-) {
-    val strings = rememberAetherStrings()
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .shadow(12.dp, RoundedCornerShape(24.dp), ambientColor = AetherScrim, spotColor = AetherScrim)
-            .clip(RoundedCornerShape(24.dp))
-            .background(AetherSurface.copy(alpha = 0.96f))
-            .padding(18.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp),
-    ) {
-        Text(
-            text = if (strings.appLanguage == AppLanguage.SimplifiedChinese) "完成设置" else "Finish setup",
-            style = MaterialTheme.typography.titleMedium,
-            color = AetherOnSurface,
-        )
-        Text(
-            text = if (strings.appLanguage == AppLanguage.SimplifiedChinese) "连接模型后返回聊天。" else "Connect a model, then come back to chat.",
-            style = MaterialTheme.typography.bodySmall,
-            color = AetherOnSurfaceVariant,
-        )
-        Button(
-            onClick = onResumeOnboarding,
-            shape = RoundedCornerShape(16.dp),
-            colors = ButtonDefaults.buttonColors(
-                containerColor = AetherPrimary,
-                contentColor = AetherOnPrimary,
-            ),
-        ) {
-            Text(if (strings.appLanguage == AppLanguage.SimplifiedChinese) "继续设置" else "Resume setup")
-        }
-    }
-}
-
-@Composable
 private fun ConversationThinkingIndicator() {
     val strings = rememberAetherStrings()
     ShimmerStatusText(
@@ -1022,23 +1080,58 @@ private fun PendingAssistantTimeline(
     onOpenLink: (String) -> Unit,
     pendingToolInvocationStateKey: String,
     pendingToolInvocations: List<ChatToolInvocation>,
+    activeTurnStartedAtMillis: Long?,
     agentModeSelected: Boolean,
     agentModeDisplayState: AgentModeDisplayState,
+    onAttachAgentModePreviewSurface: (Surface) -> Unit,
+    onDetachAgentModePreviewSurface: (Surface) -> Unit,
 ) {
+    val visiblePendingInvocations = pendingToolInvocations.filterNot { it.isAgentModeDisplayInvocation() }
+    val blockAgentModeInvocations = blocks.flatMap { it.agentModeToolInvocations() }
+    val pendingAgentModeInvocations = pendingToolInvocations.filter { it.isAgentModeDisplayInvocation() }
+    val agentModePreviewVisible =
+        agentModeSelected &&
+            agentModeDisplayState.isActive &&
+            (blockAgentModeInvocations.isNotEmpty() ||
+                pendingAgentModeInvocations.isNotEmpty() ||
+                agentModeDisplayState.latestPreviewPath.isNotBlank())
+    val firstAgentModeBlockIndex = blocks.firstAgentModeBlockIndex().let { index ->
+        if (index >= 0) index else if (agentModePreviewVisible) blocks.size else -1
+    }
+    val agentModeOverlayText = if (agentModePreviewVisible) {
+        blocks.lastTextBlockAfterAgentMode().orEmpty()
+    } else {
+        ""
+    }
     if (blocks.isEmpty()) {
-        val agentModePreviewVisible =
-            pendingToolInvocations.isNotEmpty() &&
-                (agentModeSelected ||
-                    agentModeDisplayState.isActive ||
-                    agentModeDisplayState.latestPreviewPath.isNotBlank())
-        if (agentModePreviewVisible) {
-            AgentModePreviewPanel(
-                displayState = agentModeDisplayState,
-                toolInvocation = pendingToolInvocations.lastOrNull(),
+        if (!agentModePreviewVisible && visiblePendingInvocations.isNotEmpty()) {
+            val pendingToolsDurationMillis by produceState(
+                initialValue = workDurationMillisForToolInvocations(visiblePendingInvocations),
+                visiblePendingInvocations,
+            ) {
+                val recordedStartedAtMillis = visiblePendingInvocations
+                    .mapNotNull { it.startedAtMillis.takeIf { timestamp -> timestamp > 0L } }
+                    .plus(listOfNotNull(activeTurnStartedAtMillis?.takeIf { it > 0L }))
+                    .filter { it >= MinimumWallClockMillis }
+                    .minOrNull()
+                val startedRealtimeMillis = SystemClock.elapsedRealtime()
+                while (true) {
+                    value = if (recordedStartedAtMillis != null) {
+                        workDurationMillisForToolInvocations(
+                            visiblePendingInvocations,
+                            endAtMillis = System.currentTimeMillis(),
+                        )
+                    } else {
+                        fallbackDurationMillis(startedRealtimeMillis)
+                    }
+                    kotlinx.coroutines.delay(1_000L)
+                }
+            }
+            AgentWorkingStatusHeader(
+                title = formatWorkedSummaryTitle(pendingToolsDurationMillis),
             )
-        } else if (pendingToolInvocations.isNotEmpty()) {
             ToolInvocationList(
-                toolInvocations = pendingToolInvocations,
+                toolInvocations = visiblePendingInvocations,
                 stateKey = pendingToolInvocationStateKey,
                 autoExpand = true,
             )
@@ -1046,48 +1139,194 @@ private fun PendingAssistantTimeline(
         return
     }
 
-    blocks.forEachIndexed { index, block ->
+    val workingDurationMillis by produceState(initialValue = workDurationMillisForBlocks(blocks), blocks.firstOrNull()?.id) {
+        val recordedStartedAtMillis = listOfNotNull(
+            blocks.workStartedAtMillis(),
+            activeTurnStartedAtMillis?.takeIf { it >= MinimumWallClockMillis },
+        ).minOrNull()
+        val startedRealtimeMillis = SystemClock.elapsedRealtime()
+        while (true) {
+            value = if (recordedStartedAtMillis != null) {
+                workDurationMillisForBlocks(blocks, endAtMillis = System.currentTimeMillis())
+            } else {
+                fallbackDurationMillis(startedRealtimeMillis)
+            }
+            kotlinx.coroutines.delay(1_000L)
+        }
+    }
+    val shouldShowWorkingDisclosure = blocks.any { block ->
         when (block) {
-            is AssistantResponseBlock.Text -> PendingAssistantResponseBlock(
-                text = block.text,
+            is AssistantResponseBlock.Text -> block.text.isNotBlank()
+            is AssistantResponseBlock.ToolGroup -> block.toolInvocations.isNotEmpty()
+            is AssistantResponseBlock.Reasoning -> hasVisibleReasoningStatus(block.trace)
+        }
+    }
+
+    if (shouldShowWorkingDisclosure) {
+        AgentWorkingStatusHeader(
+            title = formatWorkedSummaryTitle(workingDurationMillis),
+        )
+        blocks.forEachIndexed { index, block ->
+            if (agentModePreviewVisible && index == firstAgentModeBlockIndex) {
+                AgentModePreviewPanel(
+                    displayState = agentModeDisplayState,
+                    toolInvocation = (blockAgentModeInvocations + pendingAgentModeInvocations).lastOrNull()
+                        ?: pendingToolInvocations.lastOrNull(),
+                    overlayText = agentModeOverlayText,
+                    workspaceDirectory = workspaceDirectory,
+                    allowRootImageRead = allowRootImageRead,
+                    onOpenLink = onOpenLink,
+                    onAttachSurface = onAttachAgentModePreviewSurface,
+                    onDetachSurface = onDetachAgentModePreviewSurface,
+                )
+            }
+            PendingAssistantTimelineBlock(
+                block = block,
+                index = index,
+                isLastBlock = index == blocks.lastIndex,
+                agentModePreviewVisible = false,
                 workspaceDirectory = workspaceDirectory,
                 allowRootImageRead = allowRootImageRead,
                 onOpenLink = onOpenLink,
+                pendingToolInvocationStateKey = pendingToolInvocationStateKey,
+                agentModeSelected = agentModeSelected,
+                agentModeDisplayState = agentModeDisplayState,
+                onAttachAgentModePreviewSurface = onAttachAgentModePreviewSurface,
+                onDetachAgentModePreviewSurface = onDetachAgentModePreviewSurface,
             )
+        }
+    }
+}
 
-            is AssistantResponseBlock.ToolGroup -> {
-                val isLastBlock = index == blocks.lastIndex
-                val shouldShowAgentModePreview =
-                    isLastBlock &&
-                        (agentModeSelected ||
-                            agentModeDisplayState.isActive ||
-                            agentModeDisplayState.latestPreviewPath.isNotBlank()) &&
-                        block.toolInvocations.any { it.toolName.equals("agent_display", ignoreCase = true) }
-                if (shouldShowAgentModePreview) {
-                    AgentModePreviewPanel(
-                        displayState = agentModeDisplayState,
-                        toolInvocation = block.toolInvocations.lastOrNull(),
-                    )
-                } else {
-                    ToolInvocationList(
-                        toolInvocations = block.toolInvocations,
-                        stateKey = "$pendingToolInvocationStateKey-${block.id}",
-                        autoExpand = isLastBlock,
-                    )
-                }
+@Composable
+private fun PendingAssistantTimelineBlock(
+    block: AssistantResponseBlock,
+    index: Int,
+    isLastBlock: Boolean,
+    agentModePreviewVisible: Boolean,
+    workspaceDirectory: String,
+    allowRootImageRead: Boolean,
+    onOpenLink: (String) -> Unit,
+    pendingToolInvocationStateKey: String,
+    agentModeSelected: Boolean,
+    agentModeDisplayState: AgentModeDisplayState,
+    onAttachAgentModePreviewSurface: (Surface) -> Unit,
+    onDetachAgentModePreviewSurface: (Surface) -> Unit,
+) {
+    when (block) {
+        is AssistantResponseBlock.Text -> {
+            if (!agentModePreviewVisible) {
+                PendingAssistantResponseBlock(
+                    text = block.text,
+                    workspaceDirectory = workspaceDirectory,
+                    allowRootImageRead = allowRootImageRead,
+                    onOpenLink = onOpenLink,
+                )
             }
+        }
 
-            is AssistantResponseBlock.Reasoning -> {
-                if (hasVisibleReasoningStatus(block.trace)) {
-                    ReasoningTraceStatus(
-                        trace = block.trace,
-                        onOpenLink = onOpenLink,
-                    )
-                }
+        is AssistantResponseBlock.ToolGroup -> {
+            val visibleInvocations = if (agentModePreviewVisible) {
+                block.toolInvocations.filterNot { it.isAgentModeDisplayInvocation() }
+            } else {
+                block.toolInvocations
+            }
+            val shouldShowAgentModePreview =
+                !agentModePreviewVisible &&
+                    isLastBlock &&
+                    agentModeSelected &&
+                    agentModeDisplayState.isActive &&
+                    block.toolInvocations.any { it.toolName.equals("agent_display", ignoreCase = true) }
+            if (shouldShowAgentModePreview) {
+                AgentModePreviewPanel(
+                    displayState = agentModeDisplayState,
+                    toolInvocation = block.toolInvocations.lastOrNull(),
+                    overlayText = "",
+                    workspaceDirectory = workspaceDirectory,
+                    allowRootImageRead = allowRootImageRead,
+                    onOpenLink = onOpenLink,
+                    onAttachSurface = onAttachAgentModePreviewSurface,
+                    onDetachSurface = onDetachAgentModePreviewSurface,
+                )
+            } else if (visibleInvocations.isNotEmpty()) {
+                ToolInvocationList(
+                    toolInvocations = visibleInvocations,
+                    stateKey = "$pendingToolInvocationStateKey-${block.id}",
+                    autoExpand = isLastBlock,
+                )
+            }
+        }
+
+        is AssistantResponseBlock.Reasoning -> {
+            if (hasVisibleReasoningStatus(block.trace)) {
+                ReasoningTraceStatus(
+                    trace = block.trace,
+                    onOpenLink = onOpenLink,
+                )
             }
         }
     }
 }
+
+private fun AssistantResponseBlock.agentModeToolInvocations(): List<ChatToolInvocation> = when (this) {
+    is AssistantResponseBlock.ToolGroup -> toolInvocations.filter { it.isAgentModeDisplayInvocation() }
+    is AssistantResponseBlock.Reasoning -> trace.toolInvocations.filter { it.isAgentModeDisplayInvocation() }
+    is AssistantResponseBlock.Text -> emptyList()
+}
+
+private fun ChatToolInvocation.isAgentModeDisplayInvocation(): Boolean =
+    toolName.equals("agent_display", ignoreCase = true)
+
+private fun List<AssistantResponseBlock>.firstAgentModeBlockIndex(): Int =
+    indexOfFirst { it.agentModeToolInvocations().isNotEmpty() }
+
+private fun List<AssistantResponseBlock>.lastTextBlockAfterAgentMode(): String? {
+    val firstAgentModeBlockIndex = firstAgentModeBlockIndex()
+    if (firstAgentModeBlockIndex < 0) {
+        return null
+    }
+    return drop(firstAgentModeBlockIndex + 1)
+        .filterIsInstance<AssistantResponseBlock.Text>()
+        .lastOrNull { it.text.isNotBlank() }
+        ?.text
+}
+
+private fun List<AssistantResponseBlock>.visibleText(): String =
+    filterIsInstance<AssistantResponseBlock.Text>()
+        .joinToString("\n\n") { it.text }
+
+private fun List<AssistantResponseBlock>.hasVisiblePendingWork(): Boolean =
+    any { block ->
+        when (block) {
+            is AssistantResponseBlock.Text -> block.text.isNotBlank()
+            is AssistantResponseBlock.ToolGroup -> block.toolInvocations.isNotEmpty()
+            is AssistantResponseBlock.Reasoning -> hasVisibleReasoningStatus(block.trace)
+        }
+    }
+
+private fun List<AssistantResponseBlock>.workStartedAtMillis(): Long? =
+    flatMap { block ->
+        when (block) {
+            is AssistantResponseBlock.Text -> emptyList()
+            is AssistantResponseBlock.ToolGroup -> block.toolInvocations.mapNotNull {
+                it.startedAtMillis.takeIf { timestamp -> timestamp > 0L }
+            }
+            is AssistantResponseBlock.Reasoning -> buildList {
+                block.trace.startedAtMillis.takeIf { it > 0L }?.let(::add)
+                block.trace.chunks.forEach { chunk ->
+                    chunk.createdAtMillis.takeIf { it > 0L }?.let(::add)
+                }
+                block.trace.toolInvocations.forEach { invocation ->
+                    invocation.startedAtMillis.takeIf { it > 0L }?.let(::add)
+                }
+            }
+        }
+    }
+        .filter { it >= MinimumWallClockMillis }
+        .minOrNull()
+
+private fun fallbackDurationMillis(startedRealtimeMillis: Long): Long =
+    (SystemClock.elapsedRealtime() - startedRealtimeMillis).coerceAtLeast(1_000L)
 
 private fun buildConversationListItems(
     messages: List<ChatMessage>,
@@ -1095,6 +1334,20 @@ private fun buildConversationListItems(
     var index = 0
     while (index < messages.size) {
         val message = messages[index]
+        when (message.displayKind) {
+            MessageDisplayKind.HiddenContext -> {
+                index += 1
+                continue
+            }
+
+            MessageDisplayKind.CompactStatus -> {
+                add(ConversationListItem.CompactStatus(message))
+                index += 1
+                continue
+            }
+
+            MessageDisplayKind.Standard -> Unit
+        }
         val responseGroupId = message.responseGroupId
         if (
             message.author == MessageAuthor.Agent &&
@@ -1129,6 +1382,125 @@ private fun buildConversationListItems(
         }
         add(ConversationListItem.Message(message))
         index += 1
+    }
+}
+
+private fun compactCommandSuggestionText(messages: List<ChatMessage>): String {
+    val visibleMessages = messages.filter {
+        it.displayKind != MessageDisplayKind.HiddenContext &&
+            it.displayKind != MessageDisplayKind.CompactStatus
+    }
+    if (visibleMessages.size < 2) return "Compact this thread's context"
+    val estimatedChars = visibleMessages.sumOf { message ->
+        message.text.length +
+            message.attachments.sumOf { attachment ->
+                attachment.name.length + attachment.mimeType.length + attachment.workspacePath.length
+            } +
+            message.toolInvocations.sumOf { invocation ->
+                invocation.toolName.length + invocation.argumentsJson.length + invocation.outputJson.length
+            }
+    }
+    val percent = ((estimatedChars * 100L) / 120_000L).toInt().coerceIn(1, 100)
+    return "Compact this thread's context (${percent}% full)"
+}
+
+@Composable
+private fun CompactStatusDivider(
+    text: String,
+    isRunning: Boolean = false,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 2.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        Box(
+            modifier = Modifier
+                .weight(1f)
+                .height(1.dp)
+                .background(AetherOnSurfaceVariant.copy(alpha = 0.08f)),
+        )
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(7.dp),
+        ) {
+            Icon(
+                imageVector = if (isRunning) Icons.Rounded.RadioButtonUnchecked else Icons.Rounded.Check,
+                contentDescription = null,
+                tint = AetherOnSurfaceVariant.copy(alpha = 0.82f),
+                modifier = Modifier.size(15.dp),
+            )
+            if (isRunning) {
+                ShimmerStatusText(
+                    text = text,
+                    modifier = Modifier.widthIn(max = 190.dp),
+                    travelDurationMillis = 2200,
+                    pauseDurationMillis = 700,
+                )
+            } else {
+                Text(
+                    text = text,
+                    style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Medium),
+                    color = AetherOnSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        }
+        Box(
+            modifier = Modifier
+                .weight(1f)
+                .height(1.dp)
+                .background(AetherOnSurfaceVariant.copy(alpha = 0.08f)),
+        )
+    }
+}
+
+@Composable
+private fun CompactCommandSuggestion(
+    text: String,
+    onClick: () -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(22.dp))
+            .background(AetherSurfaceHigh.copy(alpha = 0.92f))
+            .clickable(onClick = onClick)
+            .padding(horizontal = 14.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        Box(
+            modifier = Modifier
+                .size(24.dp)
+                .clip(CircleShape)
+                .background(AetherSurface),
+            contentAlignment = Alignment.Center,
+        ) {
+            Icon(
+                imageVector = Icons.Rounded.RadioButtonUnchecked,
+                contentDescription = null,
+                tint = AetherOnSurfaceVariant,
+                modifier = Modifier.size(16.dp),
+            )
+        }
+        Text(
+            text = "Compact",
+            style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Medium),
+            color = AetherOnSurface,
+            maxLines = 1,
+        )
+        Text(
+            text = text,
+            style = MaterialTheme.typography.bodyMedium,
+            color = AetherOnSurfaceVariant,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f),
+        )
     }
 }
 
@@ -1209,6 +1581,7 @@ private fun PendingSessionInputBubble(
 @Composable
 private fun ConversationComposerOverlay(
     modifier: Modifier = Modifier,
+    conversationStateKey: String,
     onBodyHeightChanged: (Int) -> Unit,
     value: String,
     attachments: List<ChatAttachment>,
@@ -1223,6 +1596,7 @@ private fun ConversationComposerOverlay(
     isSending: Boolean,
     showStarterPromptHint: Boolean,
     showTermuxSetupNotice: Boolean,
+    compactSuggestionText: String,
     onValueChange: (String) -> Unit,
     onRemoveAttachment: (String) -> Unit,
     onSetSkillSelected: (String, Boolean) -> Unit,
@@ -1238,6 +1612,7 @@ private fun ConversationComposerOverlay(
     onInstallTermux: () -> Unit,
     onRefreshTermuxSetup: () -> Unit,
     onPauseGeneration: () -> Unit,
+    onDismissTermuxSetupNotice: () -> Unit,
     onDismissStarterPromptHint: () -> Unit,
     onFocusChanged: (Boolean) -> Unit,
     onSend: () -> Unit,
@@ -1263,41 +1638,46 @@ private fun ConversationComposerOverlay(
                 .fillMaxWidth()
                 .onSizeChanged { onBodyHeightChanged(it.height) },
         ) {
-            ConversationComposerBar(
-                value = value,
-                attachments = attachments,
-                availableSkills = availableSkills,
-                availableMcpServers = availableMcpServers,
-            selectedSkillIds = selectedSkillIds,
-            selectedMcpServerIds = selectedMcpServerIds,
-            agentModeAvailable = agentModeAvailable,
-            agentModeSelected = agentModeSelected,
-            isEditing = isEditing,
-                termuxSetupState = termuxSetupState,
-                isSending = isSending,
-                showStarterPromptHint = showStarterPromptHint,
-                showTermuxSetupNotice = showTermuxSetupNotice,
-                onValueChange = onValueChange,
-                onRemoveAttachment = onRemoveAttachment,
-            onSetSkillSelected = onSetSkillSelected,
-            onSetMcpServerSelected = onSetMcpServerSelected,
-            onSetAgentModeSelected = onSetAgentModeSelected,
-                onCancelEdit = onCancelEdit,
-                onPickImages = onPickImages,
-                onPickFiles = onPickFiles,
-                onRequestTermuxPermission = onRequestTermuxPermission,
-                onOpenAppPermissions = onOpenAppPermissions,
-                onOpenTermuxSettings = onOpenTermuxSettings,
-                onOpenTermux = onOpenTermux,
-                onInstallTermux = onInstallTermux,
-                onRefreshTermuxSetup = onRefreshTermuxSetup,
-                onPauseGeneration = onPauseGeneration,
-                onDismissStarterPromptHint = onDismissStarterPromptHint,
-                onFocusChanged = onFocusChanged,
-                onSend = onSend,
-                onQueueFollowUp = onQueueFollowUp,
-                onSteerFollowUp = onSteerFollowUp,
-            )
+            key(conversationStateKey) {
+                ConversationComposerBar(
+                    conversationStateKey = conversationStateKey,
+                    value = value,
+                    attachments = attachments,
+                    availableSkills = availableSkills,
+                    availableMcpServers = availableMcpServers,
+                    selectedSkillIds = selectedSkillIds,
+                    selectedMcpServerIds = selectedMcpServerIds,
+                    agentModeAvailable = agentModeAvailable,
+                    agentModeSelected = agentModeSelected,
+                    isEditing = isEditing,
+                    termuxSetupState = termuxSetupState,
+                    isSending = isSending,
+                    showStarterPromptHint = showStarterPromptHint,
+                    showTermuxSetupNotice = showTermuxSetupNotice,
+                    compactSuggestionText = compactSuggestionText,
+                    onValueChange = onValueChange,
+                    onRemoveAttachment = onRemoveAttachment,
+                    onSetSkillSelected = onSetSkillSelected,
+                    onSetMcpServerSelected = onSetMcpServerSelected,
+                    onSetAgentModeSelected = onSetAgentModeSelected,
+                    onCancelEdit = onCancelEdit,
+                    onPickImages = onPickImages,
+                    onPickFiles = onPickFiles,
+                    onRequestTermuxPermission = onRequestTermuxPermission,
+                    onOpenAppPermissions = onOpenAppPermissions,
+                    onOpenTermuxSettings = onOpenTermuxSettings,
+                    onOpenTermux = onOpenTermux,
+                    onInstallTermux = onInstallTermux,
+                    onRefreshTermuxSetup = onRefreshTermuxSetup,
+                    onPauseGeneration = onPauseGeneration,
+                    onDismissTermuxSetupNotice = onDismissTermuxSetupNotice,
+                    onDismissStarterPromptHint = onDismissStarterPromptHint,
+                    onFocusChanged = onFocusChanged,
+                    onSend = onSend,
+                    onQueueFollowUp = onQueueFollowUp,
+                    onSteerFollowUp = onSteerFollowUp,
+                )
+            }
         }
     }
 }
@@ -1305,6 +1685,7 @@ private fun ConversationComposerOverlay(
 @Composable
 private fun ConversationComposerBar(
     modifier: Modifier = Modifier,
+    conversationStateKey: String,
     value: String,
     attachments: List<ChatAttachment>,
     availableSkills: List<InstalledSkill>,
@@ -1318,6 +1699,7 @@ private fun ConversationComposerBar(
     isSending: Boolean,
     showStarterPromptHint: Boolean,
     showTermuxSetupNotice: Boolean,
+    compactSuggestionText: String,
     onValueChange: (String) -> Unit,
     onRemoveAttachment: (String) -> Unit,
     onSetSkillSelected: (String, Boolean) -> Unit,
@@ -1333,6 +1715,7 @@ private fun ConversationComposerBar(
     onInstallTermux: () -> Unit,
     onRefreshTermuxSetup: () -> Unit,
     onPauseGeneration: () -> Unit,
+    onDismissTermuxSetupNotice: () -> Unit,
     onDismissStarterPromptHint: () -> Unit,
     onFocusChanged: (Boolean) -> Unit,
     onSend: () -> Unit,
@@ -1340,11 +1723,12 @@ private fun ConversationComposerBar(
     onSteerFollowUp: () -> Unit,
 ) {
     val strings = rememberAetherStrings()
-    var attachmentMenuExpanded by remember { mutableStateOf(false) }
-    val attachmentMenuVisibility = remember { MutableTransitionState(false) }
+    var attachmentMenuExpanded by remember(conversationStateKey) { mutableStateOf(false) }
+    val attachmentMenuVisibility = remember(conversationStateKey) { MutableTransitionState(false) }
     attachmentMenuVisibility.targetState = attachmentMenuExpanded
-    var followUpMenuExpanded by remember { mutableStateOf(false) }
-    val followUpMenuVisibility = remember { MutableTransitionState(false) }
+    val attachmentMenuActionScope = rememberCoroutineScope()
+    var followUpMenuExpanded by remember(conversationStateKey) { mutableStateOf(false) }
+    val followUpMenuVisibility = remember(conversationStateKey) { MutableTransitionState(false) }
     followUpMenuVisibility.targetState = followUpMenuExpanded
     var textFieldFocused by remember { mutableStateOf(false) }
     var measuredTextLineCount by remember { mutableIntStateOf(1) }
@@ -1374,6 +1758,10 @@ private fun ConversationComposerBar(
         else -> strings.askAether
     }
     val hasDraft = value.isNotBlank() || attachments.isNotEmpty()
+    val showCompactSuggestion = compactSuggestionText.isNotBlank() &&
+        attachments.isEmpty() &&
+        value.isNotBlank() &&
+        "/compact".startsWith(value.trim(), ignoreCase = true)
     val canSendDraft = attachments.all { it.workspaceState == AttachmentWorkspaceState.Ready }
     val showPauseButton = isSending && !hasDraft
     val showSubmitButton = !isSending || hasDraft
@@ -1412,6 +1800,10 @@ private fun ConversationComposerBar(
     }
     LaunchedEffect(plusSeparated) {
         onFocusChanged(plusSeparated)
+    }
+    fun runAfterAttachmentMenuDismiss(action: () -> Unit) {
+        attachmentMenuExpanded = false
+        action()
     }
     val composerHorizontalPadding by animateDpAsState(
         targetValue = when {
@@ -1461,6 +1853,7 @@ private fun ConversationComposerBar(
                 onOpenTermux = onOpenTermux,
                 onInstallTermux = onInstallTermux,
                 onRefresh = onRefreshTermuxSetup,
+                onDismiss = onDismissTermuxSetupNotice,
             )
         }
         if (showStarterPromptHint) {
@@ -1479,6 +1872,24 @@ private fun ConversationComposerBar(
                 actionLabel = strings.cancel,
                 onAction = onCancelEdit,
                 actionEnabled = true,
+            )
+        }
+        AnimatedVisibility(
+            visible = showCompactSuggestion,
+            enter = fadeIn(animationSpec = tween(durationMillis = 160, easing = ChatGptMotionEasing)) +
+                slideInVertically(
+                    animationSpec = tween(durationMillis = 220, easing = ChatGptMotionEasing),
+                    initialOffsetY = { it / 3 },
+                ),
+            exit = fadeOut(animationSpec = tween(durationMillis = 120, easing = ChatGptMotionEasing)) +
+                slideOutVertically(
+                    animationSpec = tween(durationMillis = 180, easing = ChatGptMotionEasing),
+                    targetOffsetY = { it / 3 },
+                ),
+        ) {
+            CompactCommandSuggestion(
+                onClick = { onValueChange("/compact") },
+                text = compactSuggestionText,
             )
         }
         if (attachments.isNotEmpty()) {
@@ -1693,22 +2104,26 @@ private fun ConversationComposerBar(
                 }
             }
 
-                Box(
-            modifier = Modifier
-                .align(plusButtonAlignment)
-                .size(48.dp)
-                    .shadow(plusShadowElevation, CircleShape, ambientColor = ChatGptControlShadow, spotColor = ChatGptControlShadow)
-                    .clip(CircleShape)
-                    .background(if (plusSeparated) AetherSurface else Color.Transparent)
-                    .clickable(onClick = { attachmentMenuExpanded = !attachmentMenuExpanded }),
-                contentAlignment = Alignment.Center,
+            Box(
+                modifier = Modifier.align(plusButtonAlignment)
             ) {
-                Icon(
-                    imageVector = Icons.Rounded.Add,
-                    contentDescription = if (strings.appLanguage == AppLanguage.SimplifiedChinese) "添加附件或工具" else "Add attachment or tool",
-                    tint = AetherOnSurface,
-                    modifier = Modifier.size(27.dp),
-                )
+                Box(
+                    modifier = Modifier
+                        .size(48.dp)
+                        .shadow(plusShadowElevation, CircleShape, ambientColor = ChatGptControlShadow, spotColor = ChatGptControlShadow)
+                        .clip(CircleShape)
+                        .background(if (plusSeparated) AetherSurface else Color.Transparent)
+                        .clickable(onClick = { attachmentMenuExpanded = !attachmentMenuExpanded }),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Icon(
+                        imageVector = Icons.Rounded.Add,
+                        contentDescription = if (strings.appLanguage == AppLanguage.SimplifiedChinese) "添加附件或工具" else "Add attachment or tool",
+                        tint = AetherOnSurface,
+                        modifier = Modifier.size(27.dp),
+                    )
+                }
+
                 if (attachmentMenuVisibility.currentState || attachmentMenuVisibility.targetState) {
                     Popup(
                         alignment = Alignment.BottomStart,
@@ -1737,79 +2152,86 @@ private fun ConversationComposerBar(
                                 ) +
                                 slideOutVertically(targetOffsetY = { it / 12 }),
                         ) {
-                            Column(
+                            Box(
                                 modifier = Modifier
                                     .widthIn(min = 284.dp, max = 304.dp)
                                     .shadow(20.dp, RoundedCornerShape(30.dp), ambientColor = AetherScrim, spotColor = AetherScrim)
                                     .clip(RoundedCornerShape(30.dp))
-                                    .background(AetherSurface)
-                                    .padding(horizontal = 12.dp, vertical = 12.dp),
-                                verticalArrangement = Arrangement.spacedBy(2.dp),
+                                    .background(AetherSurface),
                             ) {
-                                ComposerPlusMenuRow(
-                                    title = if (strings.appLanguage == AppLanguage.SimplifiedChinese) "照片" else "Photos",
-                                    icon = Icons.Rounded.Image,
-                                    iconTint = Color(0xFF4E8D5A),
-                                    iconContainerColor = AetherSurfaceHigh,
-                                    onClick = {
-                                        attachmentMenuExpanded = false
-                                        onPickImages()
-                                    },
-                                )
-                                ComposerPlusMenuRow(
-                                    title = if (strings.appLanguage == AppLanguage.SimplifiedChinese) "文件" else "Files",
-                                    icon = Icons.Rounded.AttachFile,
-                                    iconTint = AetherOnSurface,
-                                    iconContainerColor = AetherSurfaceHigh,
-                                    onClick = {
-                                        attachmentMenuExpanded = false
-                                        onPickFiles()
-                                    },
-                                )
-                                if (agentModeAvailable || availableSkills.isNotEmpty() || availableMcpServers.isNotEmpty()) {
-                                    Spacer(modifier = Modifier.height(6.dp))
-                                }
-                                if (agentModeAvailable) {
+                                Column(
+                                    modifier = Modifier
+                                        .heightIn(max = ComposerPlusMenuMaxHeight)
+                                        .verticalScroll(rememberScrollState())
+                                        .padding(horizontal = 12.dp, vertical = 12.dp),
+                                    verticalArrangement = Arrangement.spacedBy(2.dp),
+                                ) {
                                     ComposerPlusMenuRow(
-                                        title = strings.agentMode,
-                                        icon = LucideIcons.MousePointer2,
-                                        selected = agentModeSelected,
-                                        iconTint = Color(0xFF6D5CFF),
+                                        title = if (strings.appLanguage == AppLanguage.SimplifiedChinese) "照片" else "Photos",
+                                        icon = Icons.Rounded.Image,
+                                        iconTint = Color(0xFF4E8D5A),
                                         iconContainerColor = AetherSurfaceHigh,
                                         onClick = {
-                                            attachmentMenuExpanded = false
-                                            onSetAgentModeSelected(!agentModeSelected)
+                                            runAfterAttachmentMenuDismiss(onPickImages)
                                         },
                                     )
-                                }
-                                availableSkills.forEach { skill ->
-                                    val selected = selectedSkillSet.contains(skill.id)
                                     ComposerPlusMenuRow(
-                                        title = skill.quickActionLabel(),
-                                        icon = Icons.Rounded.Extension,
-                                        selected = selected,
-                                        iconTint = Color(0xFF9C6B2F),
+                                        title = if (strings.appLanguage == AppLanguage.SimplifiedChinese) "文件" else "Files",
+                                        icon = Icons.Rounded.AttachFile,
+                                        iconTint = AetherOnSurface,
                                         iconContainerColor = AetherSurfaceHigh,
                                         onClick = {
-                                            attachmentMenuExpanded = false
-                                            onSetSkillSelected(skill.id, !selected)
+                                            runAfterAttachmentMenuDismiss(onPickFiles)
                                         },
                                     )
-                                }
-                                availableMcpServers.forEach { server ->
-                                    val selected = selectedMcpServerSet.contains(server.id)
-                                    val isStdIo = server.transport is McpTransportConfig.StdIo
-                                    ComposerPlusMenuRow(
-                                        title = server.quickActionLabel(),
-                                        icon = if (isStdIo) Icons.Rounded.Terminal else Icons.Rounded.Cloud,
-                                        selected = selected,
-                                        iconTint = if (isStdIo) Color(0xFF2F6DA3) else Color(0xFF2A9C9A),
-                                        iconContainerColor = AetherSurfaceHigh,
-                                        onClick = {
-                                            attachmentMenuExpanded = false
-                                            onSetMcpServerSelected(server.id, !selected)
-                                        },
-                                    )
+                                    if (agentModeAvailable || availableSkills.isNotEmpty() || availableMcpServers.isNotEmpty()) {
+                                        Spacer(modifier = Modifier.height(6.dp))
+                                    }
+                                    if (agentModeAvailable) {
+                                        ComposerPlusMenuRow(
+                                            title = strings.agentMode,
+                                            icon = LucideIcons.MousePointer2,
+                                            selected = agentModeSelected,
+                                            iconTint = Color(0xFF6D5CFF),
+                                            iconContainerColor = AetherSurfaceHigh,
+                                            onClick = {
+                                                runAfterAttachmentMenuDismiss {
+                                                    onSetAgentModeSelected(!agentModeSelected)
+                                                }
+                                            },
+                                        )
+                                    }
+                                    availableSkills.forEach { skill ->
+                                        val selected = selectedSkillSet.contains(skill.id)
+                                        ComposerPlusMenuRow(
+                                            title = skill.quickActionLabel(),
+                                            icon = Icons.Rounded.Extension,
+                                            selected = selected,
+                                            iconTint = Color(0xFF9C6B2F),
+                                            iconContainerColor = AetherSurfaceHigh,
+                                            onClick = {
+                                                runAfterAttachmentMenuDismiss {
+                                                    onSetSkillSelected(skill.id, !selected)
+                                                }
+                                            },
+                                        )
+                                    }
+                                    availableMcpServers.forEach { server ->
+                                        val selected = selectedMcpServerSet.contains(server.id)
+                                        val isStdIo = server.transport is McpTransportConfig.StdIo
+                                        ComposerPlusMenuRow(
+                                            title = server.quickActionLabel(),
+                                            icon = if (isStdIo) Icons.Rounded.Terminal else Icons.Rounded.Cloud,
+                                            selected = selected,
+                                            iconTint = if (isStdIo) Color(0xFF2F6DA3) else Color(0xFF2A9C9A),
+                                            iconContainerColor = AetherSurfaceHigh,
+                                            onClick = {
+                                                runAfterAttachmentMenuDismiss {
+                                                    onSetMcpServerSelected(server.id, !selected)
+                                                }
+                                            },
+                                        )
+                                    }
                                 }
                             }
                         }
@@ -1930,6 +2352,12 @@ private fun ComposerActionTray(
 private fun AgentModePreviewPanel(
     displayState: AgentModeDisplayState,
     toolInvocation: ChatToolInvocation?,
+    overlayText: String = "",
+    workspaceDirectory: String = "",
+    allowRootImageRead: Boolean = false,
+    onOpenLink: (String) -> Unit = {},
+    onAttachSurface: (Surface) -> Unit,
+    onDetachSurface: (Surface) -> Unit,
 ) {
     val strings = rememberAetherStrings()
     val bitmap = remember(displayState.latestPreviewPath, displayState.lastUpdatedMillis) {
@@ -1951,7 +2379,7 @@ private fun AgentModePreviewPanel(
         } else {
             AgentModePreviewHeader(displayState = displayState)
         }
-        if (bitmap != null) {
+        if (displayState.isActive || bitmap != null) {
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -1960,15 +2388,96 @@ private fun AgentModePreviewPanel(
                     .background(agentModePreviewBackdropBrush()),
                 contentAlignment = Alignment.Center,
             ) {
-                Image(
+                var previewSize by remember { mutableStateOf(IntSize.Zero) }
+                val density = LocalDensity.current
+                val imagePaddingPx = with(density) { 10.dp.toPx() }
+                val cursorOffset = remember(
+                    previewSize,
+                    displayState.width,
+                    displayState.height,
+                    displayState.cursorX,
+                    displayState.cursorY,
+                ) {
+                    resolveAgentModeCursorOffset(
+                        previewSize = previewSize,
+                        imagePaddingPx = imagePaddingPx,
+                        displayWidth = displayState.width,
+                        displayHeight = displayState.height,
+                        cursorX = displayState.cursorX,
+                        cursorY = displayState.cursorY,
+                    )
+                }
+                val animationDurationMillis = displayState.cursorAnimationDurationMillis.coerceIn(80, 1_200)
+                val animatedCursorOffset by animateIntOffsetAsState(
+                    targetValue = cursorOffset,
+                    animationSpec = tween(durationMillis = animationDurationMillis, easing = ChatGptMotionEasing),
+                    label = "agent_mode_cursor_offset",
+                )
+                if (displayState.isActive) {
+                    AgentModeLivePreviewSurface(
+                        displayState = displayState,
+                        onAttachSurface = onAttachSurface,
+                        onDetachSurface = onDetachSurface,
+                        modifier = Modifier
+                            .fillMaxHeight()
+                            .padding(10.dp)
+                            .aspectRatio(
+                                displayState.width.coerceAtLeast(1).toFloat() /
+                                    displayState.height.coerceAtLeast(1).toFloat(),
+                                matchHeightConstraintsFirst = true,
+                            )
+                            .clip(RoundedCornerShape(14.dp)),
+                    )
+                } else if (bitmap != null) {
+                    Image(
                     bitmap = bitmap.asImageBitmap(),
                     contentDescription = if (strings.appLanguage == AppLanguage.SimplifiedChinese) "Agent 模式虚拟显示" else "Agent Mode virtual display",
                     modifier = Modifier
                         .fillMaxSize()
                         .padding(10.dp)
                         .clip(RoundedCornerShape(14.dp)),
-                    contentScale = ContentScale.Fit,
-                )
+                        contentScale = ContentScale.Fit,
+                    )
+                }
+                Box(
+                    modifier = Modifier
+                        .matchParentSize()
+                        .onSizeChanged { previewSize = it },
+                ) {
+                    AgentModeCursor(
+                        modifier = Modifier
+                            .offset {
+                                val tipInsetPx = with(density) { 5.dp.roundToPx() }
+                                IntOffset(animatedCursorOffset.x - tipInsetPx, animatedCursorOffset.y - tipInsetPx)
+                            }
+                            .size(30.dp),
+                    )
+                    if (overlayText.isNotBlank()) {
+                        val bubbleOffset = remember(
+                            cursorOffset,
+                            previewSize,
+                            density,
+                        ) {
+                            resolveAgentModeBubbleOffset(
+                                cursorOffset = cursorOffset,
+                                previewSize = previewSize,
+                                density = density,
+                            )
+                        }
+                        val animatedBubbleOffset by animateIntOffsetAsState(
+                            targetValue = bubbleOffset,
+                            animationSpec = tween(durationMillis = animationDurationMillis, easing = ChatGptMotionEasing),
+                            label = "agent_mode_bubble_offset",
+                        )
+                        AgentModeCursorTextBubble(
+                            text = overlayText,
+                            workspaceDirectory = workspaceDirectory,
+                            allowRootImageRead = allowRootImageRead,
+                            onOpenLink = onOpenLink,
+                            modifier = Modifier.offset { animatedBubbleOffset },
+                        )
+                    }
+                }
             }
         } else {
             Text(
@@ -1978,6 +2487,181 @@ private fun AgentModePreviewPanel(
             )
         }
     }
+}
+
+@Composable
+private fun AgentModeLivePreviewSurface(
+    displayState: AgentModeDisplayState,
+    onAttachSurface: (Surface) -> Unit,
+    onDetachSurface: (Surface) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val latestOnAttachSurface by rememberUpdatedState(onAttachSurface)
+    val latestOnDetachSurface by rememberUpdatedState(onDetachSurface)
+    var attachedSurface by remember { mutableStateOf<Surface?>(null) }
+
+    fun fixedWidth() = displayState.width.coerceAtLeast(1)
+    fun fixedHeight() = displayState.height.coerceAtLeast(1)
+    fun attach(surfaceTexture: SurfaceTexture?) {
+        if (surfaceTexture == null || attachedSurface?.isValid == true) return
+        surfaceTexture.setDefaultBufferSize(fixedWidth(), fixedHeight())
+        val surface = Surface(surfaceTexture)
+        attachedSurface = surface
+        latestOnAttachSurface(surface)
+    }
+
+    fun detach() {
+        val surface = attachedSurface ?: return
+        attachedSurface = null
+        latestOnDetachSurface(surface)
+        surface.release()
+    }
+
+    DisposableEffect(Unit) {
+        onDispose {
+            detach()
+        }
+    }
+
+    AndroidView(
+        modifier = modifier.background(Color.Black),
+        factory = { context ->
+            TextureView(context).apply {
+                isOpaque = true
+                surfaceTextureListener = object : TextureView.SurfaceTextureListener {
+                    override fun onSurfaceTextureAvailable(
+                        surfaceTexture: SurfaceTexture,
+                        width: Int,
+                        height: Int,
+                    ) {
+                        attach(surfaceTexture)
+                    }
+
+                    override fun onSurfaceTextureSizeChanged(
+                        surfaceTexture: SurfaceTexture,
+                        width: Int,
+                        height: Int,
+                    ) {
+                        surfaceTexture.setDefaultBufferSize(fixedWidth(), fixedHeight())
+                    }
+
+                    override fun onSurfaceTextureDestroyed(surfaceTexture: SurfaceTexture): Boolean {
+                        detach()
+                        return true
+                    }
+
+                    override fun onSurfaceTextureUpdated(surfaceTexture: SurfaceTexture) = Unit
+                }
+            }
+        },
+        update = { view ->
+            view.surfaceTexture?.setDefaultBufferSize(fixedWidth(), fixedHeight())
+            if (displayState.isActive) {
+                attach(view.surfaceTexture)
+            }
+        },
+    )
+}
+
+@Composable
+private fun AgentModeCursor(
+    modifier: Modifier = Modifier,
+) {
+    Image(
+        painter = painterResource(R.drawable.mouse_pointer_2_white_fill),
+        contentDescription = null,
+        modifier = modifier,
+    )
+}
+
+@Composable
+private fun AgentModeCursorTextBubble(
+    text: String,
+    workspaceDirectory: String,
+    allowRootImageRead: Boolean,
+    onOpenLink: (String) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val scrollState = rememberScrollState()
+    LaunchedEffect(text, scrollState.maxValue) {
+        if (scrollState.maxValue > 0) {
+            scrollState.scrollTo(scrollState.maxValue)
+        }
+    }
+    Box(
+        modifier = modifier
+            .widthIn(max = 320.dp)
+            .shadow(18.dp, RoundedCornerShape(12.dp), ambientColor = AetherScrim, spotColor = AetherScrim)
+            .clip(RoundedCornerShape(12.dp))
+            .background(AetherSurface)
+            .padding(horizontal = 14.dp, vertical = 12.dp),
+    ) {
+        Box(
+            modifier = Modifier
+                .heightIn(max = 104.dp)
+                .verticalScroll(scrollState),
+        ) {
+            StreamingMarkdownContent(
+                markdown = text,
+                workspaceDirectory = workspaceDirectory,
+                allowRootImageRead = allowRootImageRead,
+                onLinkClick = onOpenLink,
+            )
+        }
+    }
+}
+
+private fun resolveAgentModeCursorOffset(
+    previewSize: IntSize,
+    imagePaddingPx: Float,
+    displayWidth: Int,
+    displayHeight: Int,
+    cursorX: Int?,
+    cursorY: Int?,
+): IntOffset {
+    if (previewSize.width <= 0 || previewSize.height <= 0) return IntOffset.Zero
+    val contentWidth = (previewSize.width - imagePaddingPx * 2f).coerceAtLeast(1f)
+    val contentHeight = (previewSize.height - imagePaddingPx * 2f).coerceAtLeast(1f)
+    val sourceWidth = displayWidth.coerceAtLeast(1)
+    val sourceHeight = displayHeight.coerceAtLeast(1)
+    val scale = minOf(contentWidth / sourceWidth, contentHeight / sourceHeight)
+    val renderedWidth = sourceWidth * scale
+    val renderedHeight = sourceHeight * scale
+    val renderedLeft = imagePaddingPx + (contentWidth - renderedWidth) / 2f
+    val renderedTop = imagePaddingPx + (contentHeight - renderedHeight) / 2f
+    val cursorFractionX = cursorX?.let { it.toFloat() / sourceWidth } ?: 0.58f
+    val cursorFractionY = cursorY?.let { it.toFloat() / sourceHeight } ?: 0.56f
+    return IntOffset(
+        x = (renderedLeft + renderedWidth * cursorFractionX.coerceIn(0f, 1f)).roundToInt(),
+        y = (renderedTop + renderedHeight * cursorFractionY.coerceIn(0f, 1f)).roundToInt(),
+    )
+}
+
+private fun resolveAgentModeBubbleOffset(
+    cursorOffset: IntOffset,
+    previewSize: IntSize,
+    density: androidx.compose.ui.unit.Density,
+): IntOffset {
+    val bubbleMaxWidthPx = with(density) { 320.dp.roundToPx() }
+    val bubbleMaxHeightPx = with(density) { 128.dp.roundToPx() }
+    val horizontalGapPx = with(density) { 34.dp.roundToPx() }
+    val verticalGapPx = with(density) { 34.dp.roundToPx() }
+    val edgePaddingPx = with(density) { 8.dp.roundToPx() }
+    val targetY = if (cursorOffset.y < previewSize.height / 2) {
+        cursorOffset.y + verticalGapPx
+    } else {
+        cursorOffset.y - verticalGapPx - bubbleMaxHeightPx
+    }
+    return IntOffset(
+        x = (cursorOffset.x + horizontalGapPx).coerceIn(
+            edgePaddingPx,
+            (previewSize.width - bubbleMaxWidthPx - edgePaddingPx).coerceAtLeast(edgePaddingPx),
+        ),
+        y = targetY.coerceIn(
+            edgePaddingPx,
+            (previewSize.height - edgePaddingPx).coerceAtLeast(edgePaddingPx),
+        ),
+    )
 }
 
 @Composable
@@ -2001,6 +2685,28 @@ private fun AgentModePreviewHeader(
             style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.Medium),
             color = AetherOnSurface,
         )
+        if (displayState.isLivePreviewActive) {
+            Row(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(999.dp))
+                    .background(Color(0xFFE5F8EE))
+                    .padding(horizontal = 8.dp, vertical = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(5.dp),
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(6.dp)
+                        .clip(CircleShape)
+                        .background(Color(0xFF20A564)),
+                )
+                Text(
+                    text = if (strings.appLanguage == AppLanguage.SimplifiedChinese) "实时" else "Live",
+                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Medium),
+                    color = Color(0xFF137A49),
+                )
+            }
+        }
         Spacer(modifier = Modifier.weight(1f))
         Text(
             text = displayState.displayId?.let {

@@ -4,7 +4,10 @@ import android.os.SystemClock
 import com.zhousl.aether.termux.TermuxBashTool
 import com.zhousl.aether.termux.TermuxFilesystemTool
 import java.io.File
+import java.time.ZonedDateTime
+import java.time.format.DateTimeFormatter
 import java.util.Base64
+import java.util.Locale
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.async
@@ -20,6 +23,12 @@ private const val MaxSkillResourceBytes = 1024 * 1024
 private const val DefaultSkillResourceMaxChars = 20_000
 private const val SkillMetadataContextBudgetChars = 8_000
 private const val MaxSleepDurationMillis = 10 * 60 * 1000L
+private val DynamicPromptPlaceholderRegex = Regex("""\{\{\s*([A-Za-z0-9_-]+)\s*\}\}""")
+
+data class AetherAgentTurnResult(
+    val assistantText: String,
+    val tokenUsage: LlmTokenUsage? = null,
+)
 
 class AetherAgent(
     private val client: OpenAiCompatibleClient,
@@ -29,6 +38,8 @@ class AetherAgent(
     private val skillManager: AgentSkillManager,
     private val mcpClientManager: McpClientManager,
     private val webToolsClient: WebToolsClient,
+    private val selfManagementTool: AetherSelfManagementTool,
+    private val diagnosticLogger: AetherDiagnosticLogger = AetherDiagnosticLogger.NoOp,
     private val onParallelToolCallsUnsupported: suspend (String) -> Unit = {},
 ) {
     private val filesystemTool = TermuxFilesystemTool(bashTool)
@@ -41,6 +52,7 @@ class AetherAgent(
         activeSkills: List<ActiveSkillContext> = emptyList(),
         mcpToolBindings: List<McpToolBinding> = emptyList(),
         agentModeEnabled: Boolean = false,
+        providerConfigs: List<LlmProviderConfig> = emptyList(),
         onToolEvent: suspend (AgentToolEvent) -> Unit = {},
         onAssistantTextDelta: suspend (String) -> Unit = {},
         onAssistantReasoningDelta: suspend (String) -> Unit = {},
@@ -49,7 +61,21 @@ class AetherAgent(
         onStreamingStatus: suspend (StreamingStatus?) -> Unit = {},
         onSkillActivated: suspend (ActiveSkillContext) -> Unit = {},
         pollInjectedUserMessages: suspend () -> List<LlmMessage> = { emptyList() },
-    ): Result<String> {
+    ): Result<AetherAgentTurnResult> {
+        diagnosticLogger.event(
+            category = "agent",
+            event = "turn_start",
+            details = mapOf(
+                "provider" to settings.provider.storageValue,
+                "model" to settings.modelId,
+                "base_url" to DiagnosticRedactor.sanitizedBaseUrl(settings.baseUrl),
+                "message_count" to messages.size,
+                "available_skill_count" to availableSkills.size,
+                "active_skill_count" to activeSkills.size,
+                "mcp_tool_count" to mcpToolBindings.size,
+                "agent_mode_enabled" to agentModeEnabled,
+            ),
+        )
         return try {
         val conversation = client.buildConversation(
             settings = settings,
@@ -73,6 +99,7 @@ class AetherAgent(
             buildAnalyzeImageToolDefinition(),
             buildFetchWebUrlToolDefinition(),
             buildTavilySearchToolDefinition(),
+            *selfManagementTool.toolDefinitions().toTypedArray(),
             if (agentModeEnabled) buildAgentModeToolDefinition() else null,
         ).filterNotNull()
         val hasMcpCatalog = mcpToolBindings.isNotEmpty() ||
@@ -85,6 +112,7 @@ class AetherAgent(
                 LlmProvider.OpenAiCompatible,
             ) && mcpToolBindings.isNotEmpty()
         var lastAssistantText = ""
+        var tokenUsage: LlmTokenUsage? = null
         var lastAgentModeScreenshotMessageIndex: Int? = null
         val latestUserText = messages.lastOrNull { it.role == "user" }
             ?.contentParts
@@ -106,7 +134,7 @@ class AetherAgent(
                 )
             }
             val systemPrompt = buildAgentInstructions(
-                systemPrompt = settings.systemPrompt,
+                systemPrompt = expandDynamicPromptPlaceholders(settings.systemPrompt),
                 workspaceDirectory = workspaceDirectory,
                 availableSkills = resolvedAvailableSkills,
                 activeSkills = resolvedActiveSkills,
@@ -168,6 +196,9 @@ class AetherAgent(
             }
 
             conversation += response.assistantMessage
+            response.tokenUsage?.let { usage ->
+                tokenUsage = tokenUsage?.plus(usage) ?: usage
+            }
 
             if (response.assistantText.isNotBlank()) {
                 lastAssistantText = response.assistantText
@@ -197,6 +228,7 @@ class AetherAgent(
                 activeSkills = resolvedActiveSkills,
                 round = round,
                 parallelToolCallsEnabled = parallelToolCallsEnabled,
+                providerConfigs = providerConfigs,
                 onToolEvent = onToolEvent,
                 onSkillActivated = onSkillActivated,
             )
@@ -231,13 +263,27 @@ class AetherAgent(
             round += 1
         }
         Result.success(
-            lastAssistantText.ifBlank {
-                "The model finished without returning any assistant text."
-            }
-        )
+            AetherAgentTurnResult(
+                assistantText = lastAssistantText.ifBlank {
+                    "The model finished without returning any assistant text."
+                },
+                tokenUsage = tokenUsage?.withMissingTotalResolved(),
+            )
+        ).also {
+            diagnosticLogger.event(
+                category = "agent",
+                event = "turn_end",
+                details = mapOf("ok" to true),
+            )
+        }
         } catch (cancellationException: CancellationException) {
             throw cancellationException
         } catch (throwable: Throwable) {
+            diagnosticLogger.exception(
+                category = "agent",
+                event = "turn_failed",
+                throwable = throwable,
+            )
             Result.failure(throwable)
         }
     }
@@ -250,6 +296,7 @@ class AetherAgent(
         activeSkills: MutableList<ActiveSkillContext>,
         round: Int,
         parallelToolCallsEnabled: Boolean,
+        providerConfigs: List<LlmProviderConfig>,
         onToolEvent: suspend (AgentToolEvent) -> Unit,
         onSkillActivated: suspend (ActiveSkillContext) -> Unit,
     ): List<ExecutedToolCallResult> {
@@ -268,6 +315,7 @@ class AetherAgent(
                     workspaceDirectory = workspaceDirectory,
                     availableSkills = availableSkills,
                     activeSkills = activeSkills,
+                    providerConfigs = providerConfigs,
                     onSkillActivated = onSkillActivated,
                 )
                 onToolCompleted(result, onToolEvent)
@@ -299,6 +347,7 @@ class AetherAgent(
                             workspaceDirectory = workspaceDirectory,
                             availableSkills = availableSkills,
                             activeSkills = activeSkills,
+                            providerConfigs = providerConfigs,
                             onSkillActivated = onSkillActivated,
                         )
                         onToolCompleted(result, onToolEvent)
@@ -317,6 +366,15 @@ class AetherAgent(
         indexedToolCall: IndexedToolCall,
         onToolEvent: suspend (AgentToolEvent) -> Unit,
     ) {
+        diagnosticLogger.event(
+            category = "tool",
+            event = "tool_start",
+            requestId = indexedToolCall.id,
+            details = mapOf(
+                "tool_name" to indexedToolCall.toolCall.name,
+                "argument_chars" to indexedToolCall.toolCall.arguments.length,
+            ),
+        )
         onToolEvent(
             AgentToolEvent(
                 id = indexedToolCall.id,
@@ -330,6 +388,22 @@ class AetherAgent(
         result: ExecutedToolCallResult,
         onToolEvent: suspend (AgentToolEvent) -> Unit,
     ) {
+        val output = runCatching { JSONObject(result.rawOutput) }.getOrNull()
+        val ok = output?.optBoolean("ok", true) ?: true
+        diagnosticLogger.event(
+            category = "tool",
+            event = "tool_end",
+            level = if (ok) "info" else "warn",
+            requestId = result.id,
+            details = mapOf(
+                "tool_name" to result.name,
+                "ok" to ok,
+                "output_chars" to result.visibleOutput.length,
+                "message" to output?.optString("errmsg").orEmpty().ifBlank {
+                    output?.optString("error").orEmpty()
+                },
+            ),
+        )
         onToolEvent(
             AgentToolEvent(
                 id = result.id,
@@ -346,6 +420,7 @@ class AetherAgent(
         workspaceDirectory: String,
         availableSkills: List<InstalledSkill>,
         activeSkills: MutableList<ActiveSkillContext>,
+        providerConfigs: List<LlmProviderConfig>,
         onSkillActivated: suspend (ActiveSkillContext) -> Unit,
     ): ExecutedToolCallResult {
         val toolCall = indexedToolCall.toolCall
@@ -356,11 +431,19 @@ class AetherAgent(
                 workspaceDirectory = workspaceDirectory,
                 availableSkills = availableSkills,
                 activeSkills = activeSkills,
+                providerConfigs = providerConfigs,
                 onSkillActivated = onSkillActivated,
             )
         } catch (cancellationException: CancellationException) {
             throw cancellationException
         } catch (throwable: Throwable) {
+            diagnosticLogger.exception(
+                category = "tool",
+                event = "tool_failed",
+                requestId = indexedToolCall.id,
+                throwable = throwable,
+                details = mapOf("tool_name" to toolCall.name),
+            )
             JSONObject().apply {
                 put("ok", false)
                 put("errmsg", throwable.message ?: "Tool execution failed.")
@@ -379,6 +462,13 @@ class AetherAgent(
     private fun isParallelSafeToolCall(toolName: String): Boolean = when (toolName) {
         "run_tool_batch",
         "activate_skill",
+        "aether_config_set",
+        "aether_skill_manage",
+        "aether_mcp_manage",
+        "aether_termux_manage",
+        "aether_agent_mode_manage",
+        "aether_scheduled_task_manage",
+        "aether_developer_manage",
         "agent_display" -> false
 
         else -> true
@@ -390,6 +480,7 @@ class AetherAgent(
         workspaceDirectory: String,
         availableSkills: List<InstalledSkill>,
         activeSkills: MutableList<ActiveSkillContext>,
+        providerConfigs: List<LlmProviderConfig>,
         onSkillActivated: suspend (ActiveSkillContext) -> Unit,
     ): String {
         return when (toolCall.name) {
@@ -432,12 +523,24 @@ class AetherAgent(
                 settings = settings,
                 argumentsJson = toolCall.arguments,
             )
+            "aether_config_get",
+            "aether_config_set",
+            "aether_skill_manage",
+            "aether_mcp_manage",
+            "aether_termux_manage",
+            "aether_agent_mode_manage",
+            "aether_scheduled_task_manage",
+            "aether_developer_manage" -> selfManagementTool.execute(
+                toolName = toolCall.name,
+                argumentsJson = toolCall.arguments,
+            )
             "run_tool_batch" -> executeRunToolBatch(
                 argumentsJson = toolCall.arguments,
                 settings = settings,
                 workspaceDirectory = workspaceDirectory,
                 availableSkills = availableSkills,
                 activeSkills = activeSkills,
+                providerConfigs = providerConfigs,
                 onSkillActivated = onSkillActivated,
             )
             "mcp_list_tools" -> executeMcpListTools(toolCall.arguments)
@@ -448,6 +551,7 @@ class AetherAgent(
             "mcp_get_prompt" -> executeMcpGetPrompt(toolCall.arguments)
             "analyze_image" -> executeAnalyzeImage(
                 settings = settings,
+                providerConfigs = providerConfigs,
                 argumentsJson = injectDefaultWorkingDirectory(toolCall.arguments, workspaceDirectory),
             )
             "agent_display" -> agentModeController.execute(
@@ -520,6 +624,7 @@ class AetherAgent(
         workspaceDirectory: String,
         availableSkills: List<InstalledSkill>,
         activeSkills: MutableList<ActiveSkillContext>,
+        providerConfigs: List<LlmProviderConfig>,
         onSkillActivated: suspend (ActiveSkillContext) -> Unit,
     ): String {
         val arguments = runCatching { JSONObject(argumentsJson) }.getOrNull()
@@ -570,6 +675,7 @@ class AetherAgent(
                             workspaceDirectory = workspaceDirectory,
                             availableSkills = availableSkills,
                             activeSkills = activeSkills,
+                            providerConfigs = providerConfigs,
                             onSkillActivated = onSkillActivated,
                         )
                     }
@@ -585,6 +691,7 @@ class AetherAgent(
                     workspaceDirectory = workspaceDirectory,
                     availableSkills = availableSkills,
                     activeSkills = activeSkills,
+                    providerConfigs = providerConfigs,
                     onSkillActivated = onSkillActivated,
                 )
             }
@@ -634,6 +741,7 @@ class AetherAgent(
         workspaceDirectory: String,
         availableSkills: List<InstalledSkill>,
         activeSkills: MutableList<ActiveSkillContext>,
+        providerConfigs: List<LlmProviderConfig>,
         onSkillActivated: suspend (ActiveSkillContext) -> Unit,
     ): JSONObject {
         val rawOutput = try {
@@ -647,6 +755,7 @@ class AetherAgent(
                 workspaceDirectory = workspaceDirectory,
                 availableSkills = availableSkills,
                 activeSkills = activeSkills,
+                providerConfigs = providerConfigs,
                 onSkillActivated = onSkillActivated,
             )
         } catch (cancellationException: CancellationException) {
@@ -671,6 +780,13 @@ class AetherAgent(
     private fun canRunInsideExplicitParallelBatch(toolName: String): Boolean = when (toolName) {
         "run_tool_batch",
         "activate_skill",
+        "aether_config_set",
+        "aether_skill_manage",
+        "aether_mcp_manage",
+        "aether_termux_manage",
+        "aether_agent_mode_manage",
+        "aether_scheduled_task_manage",
+        "aether_developer_manage",
         "agent_display" -> false
 
         else -> true
@@ -729,6 +845,16 @@ class AetherAgent(
 
             val failure = result.exceptionOrNull() ?: error("Streaming request failed without an exception.")
             if (currentParallelToolCallsEnabled && isParallelToolCallsUnsupportedFailure(failure)) {
+                diagnosticLogger.event(
+                    category = "llm",
+                    event = "parallel_tool_calls_unsupported",
+                    level = "warn",
+                    details = mapOf(
+                        "provider" to settings.provider.storageValue,
+                        "model" to settings.modelId,
+                        "message" to failure.message.orEmpty(),
+                    ),
+                )
                 if (receivedTextThisAttempt) {
                     onTextReset()
                 }
@@ -748,6 +874,20 @@ class AetherAgent(
             }
             val attemptNumber = reconnectFailures + 1
             val reconnectDelayMillis = resolveReconnectDelayMillis(failure, reconnectFailures)
+            diagnosticLogger.exception(
+                category = "llm",
+                event = "request_reconnect_scheduled",
+                level = "warn",
+                throwable = failure,
+                details = mapOf(
+                    "provider" to settings.provider.storageValue,
+                    "model" to settings.modelId,
+                    "attempt" to attemptNumber,
+                    "max_attempts" to LlmReconnectDelayScheduleMillis.size,
+                    "delay_millis" to reconnectDelayMillis,
+                    "received_text_this_attempt" to receivedTextThisAttempt,
+                ),
+            )
             reconnectStatusVisible = true
             onStreamingStatus(
                 StreamingStatus(
@@ -1116,6 +1256,7 @@ class AetherAgent(
 
     private suspend fun executeAnalyzeImage(
         settings: AppSettings,
+        providerConfigs: List<LlmProviderConfig>,
         argumentsJson: String,
     ): String {
         val arguments = runCatching { JSONObject(argumentsJson) }.getOrNull()
@@ -1130,6 +1271,15 @@ class AetherAgent(
         val prompt = arguments.optString("prompt").trim().ifBlank {
             "Describe the image and answer any relevant details needed for the task."
         }
+        val preferredModelKey = arguments.optString("model_key").trim()
+            .ifBlank { arguments.optString("modelKey").trim() }
+            .ifBlank { arguments.optString("model").trim() }
+        val analysisSettings = resolveModelSettings(
+            baseSettings = settings,
+            providerConfigs = providerConfigs,
+            preferredModelKey = preferredModelKey,
+            fallbackModelKey = resolveDefaultChatModelKey(settings, providerConfigs),
+        )
 
         if (path.isBlank()) {
             return JSONObject().apply {
@@ -1163,10 +1313,10 @@ class AetherAgent(
         }
 
         val response = client.createChatCompletion(
-            settings = settings,
+            settings = analysisSettings,
             systemPrompt = "You are an image analysis helper for an Android coding agent. Answer only with observations and conclusions grounded in the image and the prompt.",
             conversation = client.buildConversation(
-                settings = settings,
+                settings = analysisSettings,
                 messages = listOf(
                     LlmMessage(
                         role = "user",
@@ -1190,6 +1340,7 @@ class AetherAgent(
             put("ok", true)
             put("path", payload.absolutePath)
             put("prompt", prompt)
+            put("model", analysisSettings.modelId)
             put("analysis", response.assistantText)
             put("stdout", response.assistantText)
         }.toString()
@@ -1276,6 +1427,7 @@ class AetherAgent(
 
         val response = webToolsClient.searchTavily(
             apiKey = settings.tavilyApiKey,
+            baseUrl = settings.tavilyBaseUrl,
             request = TavilySearchRequest(
                 query = query,
                 topic = arguments.stringValue("topic").ifBlank { "general" },
@@ -1338,9 +1490,19 @@ class AetherAgent(
         workspaceDirectory: String,
     ): String {
         val arguments = runCatching { JSONObject(argumentsJson) }.getOrNull() ?: return argumentsJson
-        if (!arguments.has("workingDirectory") && !arguments.has("working_directory")) {
-            arguments.put("working_directory", workspaceDirectory)
+
+        val snake = arguments.cleanOptionalString("working_directory")
+        val camel = arguments.cleanOptionalString("workingDirectory")
+
+        arguments.remove("working_directory")
+        arguments.remove("workingDirectory")
+
+        when {
+            snake.isNotBlank() -> arguments.put("working_directory", snake)
+            camel.isNotBlank() -> arguments.put("working_directory", camel)
+            else -> arguments.put("working_directory", workspaceDirectory)
         }
+
         return arguments.toString()
     }
 
@@ -1417,6 +1579,23 @@ class AetherAgent(
         }
     }
 
+    private fun expandDynamicPromptPlaceholders(
+        prompt: String,
+        now: ZonedDateTime = ZonedDateTime.now(),
+    ): String {
+        if (!prompt.contains("{{")) return prompt
+        val values = mapOf(
+            "current_datetime" to now.format(DateTimeFormatter.ISO_OFFSET_DATE_TIME),
+            "current_date" to now.toLocalDate().toString(),
+            "current_time" to now.toLocalTime().withNano(0).toString(),
+            "timezone" to now.zone.id,
+            "unix_timestamp" to now.toEpochSecond().toString(),
+        )
+        return DynamicPromptPlaceholderRegex.replace(prompt) { match ->
+            values[match.groupValues[1].lowercase(Locale.US)] ?: match.value
+        }
+    }
+
     private fun buildAgentInstructions(
         systemPrompt: String,
         workspaceDirectory: String,
@@ -1436,8 +1615,9 @@ class AetherAgent(
         append(
             "You are running inside Aether agent mode on Android. " +
                 "Use available tools instead of guessing about the local device state. " +
-                "The current session workspace is $workspaceDirectory, which corresponds to ~/.aether/workspaces for this chat. " +
-                "All user-uploaded files are copied into that workspace, usually under uploads/. " +
+                "The default workspace for this chat is $workspaceDirectory. " +
+                "All user-uploaded files copied for the active workspace are kept under uploads/. " +
+                "Uploaded files mentioned in the current user message are from this session; older files in the workspace may have been created by earlier sessions and remain available. " +
                 "User-uploaded workspace images are not inserted into model vision automatically; call analyze_image on a workspace path when you need to inspect one. " +
                 "You can show inline media in replies with Markdown images and Mermaid. For images, use ![alt](url){width=75% height=280 scroll=true show-all=false fit=contain}; width accepts percentages or dp, height/min-height/max-height accept dp, scroll/show-all accept true or false, and fit accepts contain or cover. " +
                 "For Mermaid, use fenced blocks like ```mermaid {height=360 scroll=true show-all=false}\\ngraph TD\\nA-->B\\n``` and the same width/height/min-height/max-height/scroll/show-all attributes apply. Users can tap rendered images to enlarge them. " +
@@ -1447,6 +1627,11 @@ class AetherAgent(
                 "Use either time_range or start_date/end_date, never both. " +
                 "Only set country when you know Tavily supports that lowercase country value, such as china or united states; otherwise leave it null. " +
                 "Use snake_case tavily_search keys only; do not invent duplicate camelCase aliases. " +
+                "When the user asks for help diagnosing or repairing Aether itself, use the aether_* self-management tools to inspect and update allowed app settings directly. " +
+                "These tools may manage general language/theme settings, Web Tools, Reliability, Agent Skills, MCP servers, Termux setup, Agent Mode authorization, and developer diagnostics. " +
+                "Never try to modify LLM provider, model, base URL, provider API key, or default model configuration; Aether intentionally does not expose those through self-management tools. " +
+                "Prefer aether_skill_manage for installing, enabling, disabling, or removing skills, and aether_mcp_manage for adding, editing, enabling, disabling, or removing MCP servers. " +
+                "Use aether_termux_manage and aether_agent_mode_manage for setup/status repair before asking the user to perform manual steps. " +
                 "Prefer read, edit, write, grep, find, and ls for filesystem work. " +
                 "If a tool call omits working_directory, Aether will run it in the current session workspace by default. " +
                 "The read tool reads file contents with optional line offset and limit. " +
@@ -1477,7 +1662,8 @@ class AetherAgent(
             append(
                 "Agent Mode is enabled for this chat. Use agent_display to operate an isolated Android virtual display, not the user's main screen. " +
                     "Coordinates for tap and swipe are normalized from 0 to 1000, matching the Ruto/AutoGLM convention. " +
-                    "Call agent_display with action=start before operating apps, action=launch to open an app by package name or exact label, and action=screenshot after visible changes. " +
+                    "Call agent_display with action=list_apps when you need the installed app name to package name mapping, then call action=start before operating apps, action=launch to open an app by package name or exact label, and action=screenshot after visible changes. " +
+                    "During multi-step Agent Mode work, interleave concise assistant text between display actions so the user can see what you are doing and why, such as the next app, screen, or decision you are checking. " +
                     "After each agent_display action that captures the display, the latest screenshot is automatically inserted into the next model request as an image, following the Ruto-GLM workflow. Use that image directly instead of calling analyze_image for Agent Mode screenshots. " +
                     "Do not use Agent Mode tools when the user only wants a normal chat answer."
             )
@@ -1997,6 +2183,9 @@ class AetherAgent(
         properties = JSONObject().apply {
             put("path", stringProperty("The image file path to inspect. Relative paths resolve from the current workspace."))
             put("prompt", stringProperty("Optional question or instruction for what to inspect in the image."))
+            put("model", stringProperty("Optional model id or model option key to use. Omit this to use the current main conversation model."))
+            put("model_key", stringProperty("Optional exact model option key to use. Alias of model."))
+            put("modelKey", stringProperty("Alias of model_key."))
             put(
                 "workingDirectory",
                 stringProperty("Optional working directory used to resolve relative paths."),
@@ -2081,7 +2270,12 @@ class AetherAgent(
         name = "agent_display",
         description = "Operate Aether Agent Mode on an isolated Android virtual display. Use this only when Agent Mode is selected in the chat composer.",
         properties = JSONObject().apply {
-            put("action", stringProperty("One of: start, status, launch, tap, swipe, key, text, screenshot, stop."))
+            put("action", stringProperty("One of: list_apps, start, status, launch, tap, swipe, key, text, screenshot, stop."))
+            put("query", stringProperty("For list_apps: optional app label, package, or activity filter."))
+            put("include_system", booleanProperty("For list_apps: whether to include system apps. Defaults to true."))
+            put("includeSystem", booleanProperty("Alias of include_system."))
+            put("max_results", integerProperty("For list_apps: maximum number of apps to return. Defaults to 500."))
+            put("maxResults", integerProperty("Alias of max_results."))
             put("target", stringProperty("For launch: package name or exact app label."))
             put("x", integerProperty("For tap: normalized X coordinate from 0 to 1000."))
             put("y", integerProperty("For tap: normalized Y coordinate from 0 to 1000."))

@@ -23,6 +23,7 @@ import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.animateIntOffsetAsState
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.keyframes
 import androidx.compose.animation.core.rememberInfiniteTransition
@@ -45,6 +46,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -100,9 +102,11 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
@@ -112,11 +116,13 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.compose.ui.window.Popup
 import androidx.compose.ui.window.PopupProperties
+import com.zhousl.aether.R
 import com.zhousl.aether.ui.theme.AetherMessageBubble
 import com.zhousl.aether.ui.theme.AetherError
 import com.zhousl.aether.ui.theme.AetherOnPrimaryContainer
@@ -157,6 +163,7 @@ private const val StreamingInitialChunkFadeDurationMillis = 600
 private const val StreamingCjkChunkLength = 1
 private const val StreamingFallbackChunkLength = 18
 private const val FaviconFetchTimeoutMillis = 3_000
+private const val MinimumEpochMillis = 946_684_800_000L
 private const val TavilyFallbackDomain = "tavily.com"
 private const val DefaultFaviconUserAgent =
     "Mozilla/5.0 (Linux; Android 15) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Mobile Safari/537.36"
@@ -249,6 +256,7 @@ fun TermuxSetupNotice(
     onInstallTermux: () -> Unit,
     onRefresh: () -> Unit,
     showRefreshAction: Boolean = true,
+    onDismiss: (() -> Unit)? = null,
 ) {
     if (setupState.isReady) return
     val strings = rememberAetherStrings()
@@ -267,6 +275,9 @@ fun TermuxSetupNotice(
         copyTermuxSetupCommand()
         onOpenTermux()
     }
+    val showInactiveTermuxPrompt = setupState.previouslyConfigured &&
+        (setupState.issue == TermuxSetupIssue.DispatchFailed ||
+            setupState.issue == TermuxSetupIssue.ExternalAppsDisabled)
 
     val title: String
     val subtitle: String
@@ -283,14 +294,40 @@ fun TermuxSetupNotice(
         }
 
         TermuxSetupIssue.ExternalAppsDisabled -> {
-            title = if (strings.appLanguage == AppLanguage.SimplifiedChinese) "在 Termux 中启用外部应用" else "Enable external apps in Termux"
-            subtitle = if (strings.appLanguage == AppLanguage.SimplifiedChinese) "打开 Termux，粘贴 Aether 配置命令，然后返回刷新状态。" else "Open Termux, paste the Aether setup command, then return and refresh."
+            if (showInactiveTermuxPrompt) {
+                title = if (strings.appLanguage == AppLanguage.SimplifiedChinese) {
+                    "Termux \u4f3c\u4e4e\u4e0d\u5728\u540e\u53f0\u8fd0\u884c"
+                } else {
+                    "Termux seems to be not running in the background"
+                }
+                subtitle = if (strings.appLanguage == AppLanguage.SimplifiedChinese) {
+                    "\u6253\u5f00 Termux \u5e76\u4fdd\u6301\u5b83\u5728\u540e\u53f0\u8fd0\u884c\uff0c\u7136\u540e\u56de\u5230 Aether \u5237\u65b0\u72b6\u6001\u3002"
+                } else {
+                    "Open Termux and keep it running in the background, then return to Aether and refresh."
+                }
+            } else {
+                title = if (strings.appLanguage == AppLanguage.SimplifiedChinese) "在 Termux 中启用外部应用" else "Enable external apps in Termux"
+                subtitle = if (strings.appLanguage == AppLanguage.SimplifiedChinese) "打开 Termux，粘贴 Aether 配置命令，然后返回刷新状态。" else "Open Termux, paste the Aether setup command, then return and refresh."
+            }
         }
 
         TermuxSetupIssue.DispatchFailed -> {
-            title = if (strings.appLanguage == AppLanguage.SimplifiedChinese) "完成 Termux 设置" else "Finish Termux setup"
-            subtitle = setupState.detail.ifBlank {
-                if (strings.appLanguage == AppLanguage.SimplifiedChinese) "打开一次 Termux，并确认其集成设置。" else "Open Termux once and verify its integration settings."
+            if (showInactiveTermuxPrompt) {
+                title = if (strings.appLanguage == AppLanguage.SimplifiedChinese) {
+                    "Termux \u4f3c\u4e4e\u4e0d\u5728\u540e\u53f0\u8fd0\u884c"
+                } else {
+                    "Termux seems to be not running in the background"
+                }
+                subtitle = if (strings.appLanguage == AppLanguage.SimplifiedChinese) {
+                    "\u6253\u5f00 Termux \u5e76\u4fdd\u6301\u5b83\u5728\u540e\u53f0\u8fd0\u884c\uff0c\u7136\u540e\u56de\u5230 Aether \u5237\u65b0\u72b6\u6001\u3002"
+                } else {
+                    "Open Termux and keep it running in the background, then return to Aether and refresh."
+                }
+            } else {
+                title = if (strings.appLanguage == AppLanguage.SimplifiedChinese) "完成 Termux 设置" else "Finish Termux setup"
+                subtitle = setupState.detail.ifBlank {
+                    if (strings.appLanguage == AppLanguage.SimplifiedChinese) "打开一次 Termux，并确认其集成设置。" else "Open Termux once and verify its integration settings."
+                }
             }
         }
 
@@ -306,11 +343,36 @@ fun TermuxSetupNotice(
             .padding(horizontal = 16.dp, vertical = 14.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-            Text(title, style = MaterialTheme.typography.labelLarge, color = AetherOnSurface)
-            Text(subtitle, style = MaterialTheme.typography.bodySmall, color = AetherOnSurfaceVariant)
-            if (setupState.detail.isNotBlank() && setupState.detail != subtitle) {
-                Text(setupState.detail, style = MaterialTheme.typography.bodySmall, color = AetherOnSurfaceVariant)
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.Top,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                Text(title, style = MaterialTheme.typography.labelLarge, color = AetherOnSurface)
+                Text(subtitle, style = MaterialTheme.typography.bodySmall, color = AetherOnSurfaceVariant)
+                if (setupState.detail.isNotBlank() && setupState.detail != subtitle) {
+                    Text(setupState.detail, style = MaterialTheme.typography.bodySmall, color = AetherOnSurfaceVariant)
+                }
+            }
+            if (onDismiss != null) {
+                Box(
+                    modifier = Modifier
+                        .size(28.dp)
+                        .clip(CircleShape)
+                        .clickable(onClick = onDismiss),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Icon(
+                        imageVector = Icons.Rounded.Close,
+                        contentDescription = if (strings.appLanguage == AppLanguage.SimplifiedChinese) "关闭" else "Close",
+                        tint = AetherOnSurfaceVariant,
+                        modifier = Modifier.size(18.dp),
+                    )
+                }
             }
         }
 
@@ -354,12 +416,21 @@ fun TermuxSetupNotice(
                 }
 
                 TermuxSetupIssue.ExternalAppsDisabled -> {
-                    ActionIconLabel(
-                        icon = Icons.AutoMirrored.Rounded.OpenInNew,
-                        label = if (strings.appLanguage == AppLanguage.SimplifiedChinese) "复制并打开 Termux" else "Copy and Open Termux",
-                        enabled = true,
-                        onClick = ::copyTermuxSetupCommandAndOpenTermux,
-                    )
+                    if (showInactiveTermuxPrompt) {
+                        ActionIconLabel(
+                            icon = Icons.AutoMirrored.Rounded.OpenInNew,
+                            label = if (strings.appLanguage == AppLanguage.SimplifiedChinese) "\u6253\u5f00" else "Open",
+                            enabled = true,
+                            onClick = onOpenTermux,
+                        )
+                    } else {
+                        ActionIconLabel(
+                            icon = Icons.AutoMirrored.Rounded.OpenInNew,
+                            label = if (strings.appLanguage == AppLanguage.SimplifiedChinese) "复制并打开 Termux" else "Copy and Open Termux",
+                            enabled = true,
+                            onClick = ::copyTermuxSetupCommandAndOpenTermux,
+                        )
+                    }
                     if (showRefreshAction) {
                         ActionIconLabel(
                             icon = Icons.Rounded.Refresh,
@@ -371,24 +442,33 @@ fun TermuxSetupNotice(
                 }
 
                 TermuxSetupIssue.DispatchFailed -> {
-                    ActionIconLabel(
-                        icon = Icons.Rounded.ContentCopy,
-                        label = if (strings.appLanguage == AppLanguage.SimplifiedChinese) "复制配置命令" else "Copy setup command",
-                        enabled = true,
-                        onClick = ::copyTermuxSetupCommand,
-                    )
-                    ActionIconLabel(
-                        icon = Icons.AutoMirrored.Rounded.OpenInNew,
-                        label = strings.openTermux,
-                        enabled = true,
-                        onClick = onOpenTermux,
-                    )
-                    ActionIconLabel(
-                        icon = Icons.Rounded.Settings,
-                        label = if (strings.appLanguage == AppLanguage.SimplifiedChinese) "Termux 设置" else "Termux settings",
-                        enabled = true,
-                        onClick = onOpenTermuxSettings,
-                    )
+                    if (showInactiveTermuxPrompt) {
+                        ActionIconLabel(
+                            icon = Icons.AutoMirrored.Rounded.OpenInNew,
+                            label = if (strings.appLanguage == AppLanguage.SimplifiedChinese) "\u6253\u5f00" else "Open",
+                            enabled = true,
+                            onClick = onOpenTermux,
+                        )
+                    } else {
+                        ActionIconLabel(
+                            icon = Icons.Rounded.ContentCopy,
+                            label = if (strings.appLanguage == AppLanguage.SimplifiedChinese) "复制配置命令" else "Copy setup command",
+                            enabled = true,
+                            onClick = ::copyTermuxSetupCommand,
+                        )
+                        ActionIconLabel(
+                            icon = Icons.AutoMirrored.Rounded.OpenInNew,
+                            label = strings.openTermux,
+                            enabled = true,
+                            onClick = onOpenTermux,
+                        )
+                        ActionIconLabel(
+                            icon = Icons.Rounded.Settings,
+                            label = if (strings.appLanguage == AppLanguage.SimplifiedChinese) "Termux 设置" else "Termux settings",
+                            enabled = true,
+                            onClick = onOpenTermuxSettings,
+                        )
+                    }
                     if (showRefreshAction) {
                         ActionIconLabel(
                             icon = Icons.Rounded.Refresh,
@@ -764,6 +844,11 @@ private fun AssistantMessageBlock(
     onDelete: () -> Unit,
 ) {
     val strings = rememberAetherStrings()
+    val shouldFoldWorkBeforeFinalText = message.text.isNotBlank() &&
+        (message.reasoningTrace != null ||
+            message.thoughtDurationMillis != null ||
+            message.toolInvocations.isNotEmpty() ||
+            message.attachments.isNotEmpty())
     Column(
         modifier = Modifier.fillMaxWidth(),
         verticalArrangement = Arrangement.spacedBy(10.dp),
@@ -771,6 +856,27 @@ private fun AssistantMessageBlock(
         val agentModeFrames = remember(message.toolInvocations) {
             buildAgentModeReplayFrames(message.toolInvocations)
         }
+        val workContent: @Composable () -> Unit = {
+            AssistantMessageWorkContent(
+                message = message,
+                agentModeFrames = agentModeFrames,
+                workspaceDirectory = workspaceDirectory,
+                allowRootImageRead = allowRootImageRead,
+                onOpenAttachment = onOpenAttachment,
+                onOpenLink = onOpenLink,
+            )
+        }
+        if (shouldFoldWorkBeforeFinalText) {
+            AgentWorkSummaryDisclosure(
+                title = formatWorkedSummaryTitle(
+                    message.thoughtDurationMillis
+                        ?: workDurationMillisForMessages(listOf(message), endAtMillis = message.createdAtMillis),
+                ),
+                stateKey = "message-work-${message.id}",
+                content = workContent,
+            )
+        }
+        if (!shouldFoldWorkBeforeFinalText) {
         if (message.reasoningTrace != null) {
             ReasoningTraceStatus(
                 trace = message.reasoningTrace,
@@ -793,6 +899,9 @@ private fun AssistantMessageBlock(
             AgentModeReplayPanel(
                 frames = agentModeFrames,
                 stateKey = "agent-mode-replay-${message.id}",
+                workspaceDirectory = workspaceDirectory,
+                allowRootImageRead = allowRootImageRead,
+                onOpenLink = onOpenLink,
             )
         } else if (message.reasoningTrace == null) {
             ToolInvocationList(
@@ -804,6 +913,7 @@ private fun AssistantMessageBlock(
             attachments = message.attachments,
             onOpenAttachment = onOpenAttachment,
         )
+        }
         if (message.text.isNotBlank()) {
             MarkdownContent(
                 markdown = message.text,
@@ -837,6 +947,54 @@ private fun AssistantMessageBlock(
 }
 
 @Composable
+private fun AssistantMessageWorkContent(
+    message: ChatMessage,
+    agentModeFrames: List<AgentModeReplayFrame>,
+    workspaceDirectory: String?,
+    allowRootImageRead: Boolean,
+    onOpenAttachment: (ChatAttachment) -> Unit,
+    onOpenLink: (String) -> Unit,
+) {
+    val strings = rememberAetherStrings()
+    if (message.reasoningTrace != null) {
+        ReasoningTraceStatus(
+            trace = message.reasoningTrace,
+            onOpenLink = onOpenLink,
+        )
+    } else {
+        message.thoughtDurationMillis?.let { duration ->
+            Text(
+                text = if (strings.appLanguage == AppLanguage.SimplifiedChinese) {
+                    "思考了 ${formatThoughtDuration(duration)}"
+                } else {
+                    "Thought for ${formatThoughtDuration(duration)}"
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = AetherOnSurfaceVariant,
+            )
+        }
+    }
+    if (message.reasoningTrace == null && agentModeFrames.isNotEmpty()) {
+        AgentModeReplayPanel(
+            frames = agentModeFrames,
+            stateKey = "agent-mode-replay-${message.id}",
+            workspaceDirectory = workspaceDirectory,
+            allowRootImageRead = allowRootImageRead,
+            onOpenLink = onOpenLink,
+        )
+    } else if (message.reasoningTrace == null) {
+        ToolInvocationList(
+            toolInvocations = message.toolInvocations,
+            stateKey = "message-tools-${message.id}",
+        )
+    }
+    AssistantAttachments(
+        attachments = message.attachments,
+        onOpenAttachment = onOpenAttachment,
+    )
+}
+
+@Composable
 fun ConversationAssistantGroupBubble(
     messages: List<ChatMessage>,
     actionsEnabled: Boolean,
@@ -853,11 +1011,31 @@ fun ConversationAssistantGroupBubble(
     val thoughtDurationMillis = messages.lastOrNull()?.thoughtDurationMillis
     val hasReasoningTrace = messages.any { it.reasoningTrace != null }
     val showActions = messages.none { it.assistantActionsHidden }
+    val agentModeReplayTimeline = remember(messages) {
+        buildAgentModeReplayTimeline(messages)
+    }
+    val groupAgentModeFrames = agentModeReplayTimeline.frames
+    val interleavedAgentModeTextIds = agentModeReplayTimeline.interleavedTextMessageIds
+    val firstAgentModeMessageIndex = agentModeReplayTimeline.firstFrameMessageIndex
+    val finalTextMessageIndex = messages.indexOfLast { message ->
+        message.text.isNotBlank() && message.id !in interleavedAgentModeTextIds
+    }
+    val shouldFoldWorkBeforeFinalText = finalTextMessageIndex > 0
+    val workMessages = if (shouldFoldWorkBeforeFinalText) {
+        messages.take(finalTextMessageIndex)
+    } else {
+        emptyList()
+    }
+    val visibleMessages = if (shouldFoldWorkBeforeFinalText) {
+        messages.drop(finalTextMessageIndex)
+    } else {
+        messages
+    }
     Column(
         modifier = Modifier.fillMaxWidth(),
         verticalArrangement = Arrangement.spacedBy(10.dp),
     ) {
-        if (!hasReasoningTrace) thoughtDurationMillis?.let { duration ->
+        if (!shouldFoldWorkBeforeFinalText && !hasReasoningTrace) thoughtDurationMillis?.let { duration ->
             Text(
                 text = if (strings.appLanguage == AppLanguage.SimplifiedChinese) {
                     "思考了 ${formatThoughtDuration(duration)}"
@@ -868,38 +1046,81 @@ fun ConversationAssistantGroupBubble(
                 color = AetherOnSurfaceVariant,
             )
         }
-        messages.forEach { message ->
-            val agentModeFrames = remember(message.toolInvocations) {
-                buildAgentModeReplayFrames(message.toolInvocations)
+        if (shouldFoldWorkBeforeFinalText) {
+            AgentWorkSummaryDisclosure(
+                title = formatWorkedSummaryTitle(
+                    thoughtDurationMillis
+                        ?: workDurationMillisForMessages(
+                            workMessages,
+                            endAtMillis = messages[finalTextMessageIndex].createdAtMillis,
+                        ),
+                ),
+                stateKey = "assistant-work-${messages.first().responseGroupId ?: messages.first().id}",
+            ) {
+                if (groupAgentModeFrames.isNotEmpty()) {
+                    AgentModeReplayPanel(
+                        frames = groupAgentModeFrames,
+                        stateKey = "agent-mode-replay-${messages.first().responseGroupId ?: messages.first().id}-folded",
+                        workspaceDirectory = workspaceDirectory,
+                        allowRootImageRead = allowRootImageRead,
+                        onOpenLink = onOpenLink,
+                    )
+                }
+                workMessages.forEachIndexed { index, message ->
+                    AssistantGroupMessageContent(
+                        message = message,
+                        groupAgentModeFrames = if (groupAgentModeFrames.isNotEmpty() && index >= firstAgentModeMessageIndex) {
+                            groupAgentModeFrames
+                        } else {
+                            emptyList()
+                        },
+                        interleavedAgentModeTextIds = interleavedAgentModeTextIds,
+                        workspaceDirectory = workspaceDirectory,
+                        allowRootImageRead = allowRootImageRead,
+                        onOpenAttachment = onOpenAttachment,
+                        onOpenLink = onOpenLink,
+                    )
+                }
             }
-            if (message.reasoningTrace != null) {
-                ReasoningTraceStatus(
-                    trace = message.reasoningTrace,
-                    onOpenLink = onOpenLink,
-                )
-            } else if (agentModeFrames.isNotEmpty()) {
-                AgentModeReplayPanel(
-                    frames = agentModeFrames,
-                    stateKey = "agent-mode-replay-${message.id}",
-                )
-            } else {
-                ToolInvocationList(
-                    toolInvocations = message.toolInvocations,
-                    stateKey = "message-tools-${message.id}",
-                )
-            }
-            AssistantAttachments(
-                attachments = message.attachments,
-                onOpenAttachment = onOpenAttachment,
-            )
-            if (message.text.isNotBlank()) {
-                MarkdownContent(
-                    markdown = message.text,
+        }
+        if (!shouldFoldWorkBeforeFinalText && groupAgentModeFrames.isNotEmpty() && firstAgentModeMessageIndex > 0) {
+            messages.take(firstAgentModeMessageIndex).forEach { message ->
+                AssistantGroupMessageContent(
+                    message = message,
+                    groupAgentModeFrames = emptyList(),
+                    interleavedAgentModeTextIds = emptySet(),
                     workspaceDirectory = workspaceDirectory,
                     allowRootImageRead = allowRootImageRead,
-                    onLinkClick = onOpenLink,
+                    onOpenAttachment = onOpenAttachment,
+                    onOpenLink = onOpenLink,
                 )
             }
+        }
+        if (!shouldFoldWorkBeforeFinalText && groupAgentModeFrames.isNotEmpty()) {
+            AgentModeReplayPanel(
+                frames = groupAgentModeFrames,
+                stateKey = "agent-mode-replay-${messages.first().responseGroupId ?: messages.first().id}",
+                workspaceDirectory = workspaceDirectory,
+                allowRootImageRead = allowRootImageRead,
+                onOpenLink = onOpenLink,
+            )
+        }
+        messages.forEachIndexed { index, message ->
+            if (shouldFoldWorkBeforeFinalText && message !in visibleMessages) {
+                return@forEachIndexed
+            }
+            if (groupAgentModeFrames.isNotEmpty() && index < firstAgentModeMessageIndex) {
+                return@forEachIndexed
+            }
+            AssistantGroupMessageContent(
+                message = message,
+                groupAgentModeFrames = groupAgentModeFrames,
+                interleavedAgentModeTextIds = interleavedAgentModeTextIds,
+                workspaceDirectory = workspaceDirectory,
+                allowRootImageRead = allowRootImageRead,
+                onOpenAttachment = onOpenAttachment,
+                onOpenLink = onOpenLink,
+            )
         }
         if (showActions) {
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -926,9 +1147,63 @@ fun ConversationAssistantGroupBubble(
 }
 
 @Composable
+private fun AssistantGroupMessageContent(
+    message: ChatMessage,
+    groupAgentModeFrames: List<AgentModeReplayFrame>,
+    interleavedAgentModeTextIds: Set<String>,
+    workspaceDirectory: String?,
+    allowRootImageRead: Boolean,
+    onOpenAttachment: (ChatAttachment) -> Unit,
+    onOpenLink: (String) -> Unit,
+) {
+    val agentModeFrames = remember(message.toolInvocations) {
+        buildAgentModeReplayFrames(message.toolInvocations)
+    }
+    if (message.reasoningTrace != null) {
+        ReasoningTraceStatus(
+            trace = message.reasoningTrace,
+            onOpenLink = onOpenLink,
+        )
+    } else if (agentModeFrames.isNotEmpty() && groupAgentModeFrames.isEmpty()) {
+        AgentModeReplayPanel(
+            frames = agentModeFrames,
+            stateKey = "agent-mode-replay-${message.id}",
+            workspaceDirectory = workspaceDirectory,
+            allowRootImageRead = allowRootImageRead,
+            onOpenLink = onOpenLink,
+        )
+    } else {
+        val visibleInvocations = if (groupAgentModeFrames.isNotEmpty()) {
+            message.toolInvocations.filterNot { it.isAgentModeDisplayInvocation() }
+        } else {
+            message.toolInvocations
+        }
+        ToolInvocationList(
+            toolInvocations = visibleInvocations,
+            stateKey = "message-tools-${message.id}",
+        )
+    }
+    AssistantAttachments(
+        attachments = message.attachments,
+        onOpenAttachment = onOpenAttachment,
+    )
+    if (message.text.isNotBlank() && message.id !in interleavedAgentModeTextIds) {
+        MarkdownContent(
+            markdown = message.text,
+            workspaceDirectory = workspaceDirectory,
+            allowRootImageRead = allowRootImageRead,
+            onLinkClick = onOpenLink,
+        )
+    }
+}
+
+@Composable
 private fun AgentModeReplayPanel(
     frames: List<AgentModeReplayFrame>,
     stateKey: String,
+    workspaceDirectory: String? = null,
+    allowRootImageRead: Boolean = false,
+    onOpenLink: (String) -> Unit = {},
 ) {
     val strings = rememberAetherStrings()
     var selectedIndex by rememberSaveable(stateKey, frames.size) {
@@ -938,6 +1213,7 @@ private fun AgentModeReplayPanel(
         selectedIndex = (frames.size - 1).coerceAtLeast(0)
     }
     val frame = frames[selectedIndex]
+    val overlayText = frame.overlayText
     val bitmap = remember(frame.previewPath, frame.completedAtUptimeMillis) {
         frame.previewPath
             .takeIf { it.isNotBlank() && File(it).exists() }
@@ -962,6 +1238,30 @@ private fun AgentModeReplayPanel(
                 .background(agentModeReplayBackdropBrush()),
             contentAlignment = Alignment.Center,
         ) {
+            var previewSize by remember { mutableStateOf(IntSize.Zero) }
+            val density = LocalDensity.current
+            val imagePaddingPx = with(density) { 10.dp.toPx() }
+            val cursorOffset = remember(
+                previewSize,
+                frame.width,
+                frame.height,
+                frame.cursorX,
+                frame.cursorY,
+            ) {
+                resolveAgentModeCursorOffset(
+                    previewSize = previewSize,
+                    imagePaddingPx = imagePaddingPx,
+                    displayWidth = frame.width,
+                    displayHeight = frame.height,
+                    cursorX = frame.cursorX,
+                    cursorY = frame.cursorY,
+                )
+            }
+            val animatedCursorOffset by animateIntOffsetAsState(
+                targetValue = cursorOffset,
+                animationSpec = tween(durationMillis = 260, easing = ToolTransitionEasing),
+                label = "agent_mode_replay_cursor_offset",
+            )
             if (bitmap != null) {
                 Image(
                     bitmap = bitmap.asImageBitmap(),
@@ -978,6 +1278,45 @@ private fun AgentModeReplayPanel(
                     style = MaterialTheme.typography.bodySmall,
                     color = AetherOnSurfaceVariant,
                 )
+            }
+            Box(
+                modifier = Modifier
+                    .matchParentSize()
+                    .onSizeChanged { previewSize = it },
+            ) {
+                    AgentModeCursor(
+                        modifier = Modifier
+                            .offset {
+                                val tipInsetPx = with(density) { 5.dp.roundToPx() }
+                                IntOffset(animatedCursorOffset.x - tipInsetPx, animatedCursorOffset.y - tipInsetPx)
+                            }
+                            .size(30.dp),
+                    )
+                    if (overlayText.isNotBlank()) {
+                        val bubbleOffset = remember(
+                            cursorOffset,
+                            previewSize,
+                            density,
+                        ) {
+                            resolveAgentModeBubbleOffset(
+                                cursorOffset = cursorOffset,
+                                previewSize = previewSize,
+                                density = density,
+                            )
+                        }
+                        val animatedBubbleOffset by animateIntOffsetAsState(
+                            targetValue = bubbleOffset,
+                            animationSpec = tween(durationMillis = 260, easing = ToolTransitionEasing),
+                            label = "agent_mode_replay_bubble_offset",
+                        )
+                        AgentModeCursorTextBubble(
+                            text = overlayText,
+                            workspaceDirectory = workspaceDirectory,
+                            allowRootImageRead = allowRootImageRead,
+                            onOpenLink = onOpenLink,
+                            modifier = Modifier.offset { animatedBubbleOffset },
+                        )
+                    }
             }
         }
         if (frames.size > 1) {
@@ -1005,6 +1344,107 @@ private fun AgentModeReplayPanel(
             }
         }
     }
+}
+
+@Composable
+private fun AgentModeCursor(
+    modifier: Modifier = Modifier,
+) {
+    Image(
+        painter = painterResource(R.drawable.mouse_pointer_2_white_fill),
+        contentDescription = null,
+        modifier = modifier,
+    )
+}
+
+@Composable
+private fun AgentModeCursorTextBubble(
+    text: String,
+    workspaceDirectory: String?,
+    allowRootImageRead: Boolean,
+    onOpenLink: (String) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val scrollState = rememberScrollState()
+    LaunchedEffect(text, scrollState.maxValue) {
+        if (scrollState.maxValue > 0) {
+            scrollState.scrollTo(scrollState.maxValue)
+        }
+    }
+    Box(
+        modifier = modifier
+            .widthIn(max = 320.dp)
+            .shadow(18.dp, RoundedCornerShape(12.dp), ambientColor = AetherScrim, spotColor = AetherScrim)
+            .clip(RoundedCornerShape(12.dp))
+            .background(AetherSurface)
+            .padding(horizontal = 14.dp, vertical = 12.dp),
+    ) {
+        Box(
+            modifier = Modifier
+                .heightIn(max = 104.dp)
+                .verticalScroll(scrollState),
+        ) {
+            StreamingMarkdownContent(
+                markdown = text,
+                workspaceDirectory = workspaceDirectory,
+                allowRootImageRead = allowRootImageRead,
+                onLinkClick = onOpenLink,
+            )
+        }
+    }
+}
+
+private fun resolveAgentModeCursorOffset(
+    previewSize: IntSize,
+    imagePaddingPx: Float,
+    displayWidth: Int,
+    displayHeight: Int,
+    cursorX: Int?,
+    cursorY: Int?,
+): IntOffset {
+    if (previewSize.width <= 0 || previewSize.height <= 0) return IntOffset.Zero
+    val contentWidth = (previewSize.width - imagePaddingPx * 2f).coerceAtLeast(1f)
+    val contentHeight = (previewSize.height - imagePaddingPx * 2f).coerceAtLeast(1f)
+    val sourceWidth = displayWidth.coerceAtLeast(1)
+    val sourceHeight = displayHeight.coerceAtLeast(1)
+    val scale = minOf(contentWidth / sourceWidth, contentHeight / sourceHeight)
+    val renderedWidth = sourceWidth * scale
+    val renderedHeight = sourceHeight * scale
+    val renderedLeft = imagePaddingPx + (contentWidth - renderedWidth) / 2f
+    val renderedTop = imagePaddingPx + (contentHeight - renderedHeight) / 2f
+    val cursorFractionX = cursorX?.let { it.toFloat() / sourceWidth } ?: 0.58f
+    val cursorFractionY = cursorY?.let { it.toFloat() / sourceHeight } ?: 0.56f
+    return IntOffset(
+        x = (renderedLeft + renderedWidth * cursorFractionX.coerceIn(0f, 1f)).roundToInt(),
+        y = (renderedTop + renderedHeight * cursorFractionY.coerceIn(0f, 1f)).roundToInt(),
+    )
+}
+
+private fun resolveAgentModeBubbleOffset(
+    cursorOffset: IntOffset,
+    previewSize: IntSize,
+    density: androidx.compose.ui.unit.Density,
+): IntOffset {
+    val bubbleMaxWidthPx = with(density) { 320.dp.roundToPx() }
+    val bubbleMaxHeightPx = with(density) { 128.dp.roundToPx() }
+    val horizontalGapPx = with(density) { 34.dp.roundToPx() }
+    val verticalGapPx = with(density) { 34.dp.roundToPx() }
+    val edgePaddingPx = with(density) { 8.dp.roundToPx() }
+    val targetY = if (cursorOffset.y < previewSize.height / 2) {
+        cursorOffset.y + verticalGapPx
+    } else {
+        cursorOffset.y - verticalGapPx - bubbleMaxHeightPx
+    }
+    return IntOffset(
+        x = (cursorOffset.x + horizontalGapPx).coerceIn(
+            edgePaddingPx,
+            (previewSize.width - bubbleMaxWidthPx - edgePaddingPx).coerceAtLeast(edgePaddingPx),
+        ),
+        y = targetY.coerceIn(
+            edgePaddingPx,
+            (previewSize.height - edgePaddingPx).coerceAtLeast(edgePaddingPx),
+        ),
+    )
 }
 
 @Composable
@@ -1197,6 +1637,109 @@ fun ToolInvocationList(
 }
 
 @Composable
+fun AgentWorkSummaryDisclosure(
+    title: String,
+    stateKey: String,
+    modifier: Modifier = Modifier,
+    initiallyExpanded: Boolean = false,
+    content: @Composable () -> Unit,
+) {
+    var expanded by rememberSaveable(stateKey) { mutableStateOf(initiallyExpanded) }
+    val arrowRotation by animateFloatAsState(
+        targetValue = if (expanded) 90f else 0f,
+        animationSpec = tween(durationMillis = ToolTransitionDurationMillis, easing = ToolTransitionEasing),
+        label = "agent_work_arrow_rotation",
+    )
+
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(top = 6.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .noRippleClickable { expanded = !expanded },
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Text(
+                text = title,
+                modifier = Modifier.weight(1f),
+                style = MaterialTheme.typography.bodyMedium,
+                color = AetherOnSurfaceVariant,
+            )
+            Icon(
+                imageVector = Icons.AutoMirrored.Rounded.ArrowForwardIos,
+                contentDescription = if (expanded) "Collapse work" else "Expand work",
+                tint = AetherOnSurfaceVariant,
+                modifier = Modifier
+                    .size(14.dp)
+                    .graphicsLayer { rotationZ = arrowRotation },
+            )
+        }
+
+        AnimatedVisibility(
+            visible = expanded,
+            enter = expandVertically(
+                animationSpec = tween(durationMillis = ToolTransitionDurationMillis, easing = ToolTransitionEasing),
+                expandFrom = Alignment.Top,
+            ) + fadeIn(
+                animationSpec = tween(
+                    durationMillis = ToolTransitionDurationMillis - 90,
+                    delayMillis = 40,
+                    easing = ToolTransitionEasing,
+                ),
+            ),
+            exit = shrinkVertically(
+                animationSpec = tween(durationMillis = 260, easing = FastOutLinearInEasing),
+                shrinkTowards = Alignment.Top,
+            ) + fadeOut(
+                animationSpec = tween(durationMillis = 180, easing = FastOutLinearInEasing),
+            ),
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(start = ToolGroupIndent)
+                    .animateContentSize(
+                        animationSpec = tween(durationMillis = ToolTransitionDurationMillis, easing = ToolTransitionEasing),
+                    ),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                content()
+            }
+        }
+    }
+}
+
+@Composable
+fun AgentWorkingStatusHeader(
+    title: String,
+    modifier: Modifier = Modifier,
+) {
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(top = 6.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        Text(
+            text = title,
+            style = MaterialTheme.typography.bodyMedium,
+            color = AetherOnSurfaceVariant,
+        )
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(1.dp)
+                .background(AetherOutlineSoft.copy(alpha = 0.62f))
+        )
+    }
+}
+
+@Composable
 private fun ToolInvocationCardsColumn(
     toolInvocations: List<ChatToolInvocation>,
     indent: Dp = 0.dp,
@@ -1271,7 +1814,7 @@ fun PendingAssistantResponseBlock(
 }
 
 @Composable
-private fun StreamingMarkdownContent(
+fun StreamingMarkdownContent(
     markdown: String,
     workspaceDirectory: String?,
     allowRootImageRead: Boolean,
@@ -2831,14 +3374,104 @@ private fun calculateSampleSize(
 }
 
 private fun formatThoughtDuration(durationMillis: Long): String {
-    val totalSeconds = (durationMillis / 1000f).toInt().coerceAtLeast(1)
-    val minutes = totalSeconds / 60
+    val totalSeconds = (durationMillis / 1000f).roundToInt().coerceAtLeast(1)
+    val hours = totalSeconds / 3600
+    val minutes = (totalSeconds % 3600) / 60
     val seconds = totalSeconds % 60
-    return if (minutes == 0) {
-        "${seconds}s"
-    } else {
-        "${minutes}m ${seconds}s"
+    return buildList {
+        if (hours > 0) add("${hours}h")
+        if (minutes > 0 || hours > 0) add("${minutes}min")
+        add("${seconds}s")
+    }.joinToString(" ")
+}
+
+fun formatWorkedSummaryTitle(durationMillis: Long): String =
+    "Working for ${formatThoughtDuration(durationMillis)}"
+
+fun workDurationMillisForMessages(
+    messages: List<ChatMessage>,
+    endAtMillis: Long? = null,
+): Long {
+    val timestamps = mutableListOf<Long>()
+    messages.forEach { message ->
+        if (message.createdAtMillis > 0L) {
+            timestamps += message.createdAtMillis
+        }
+        message.reasoningTrace?.let { trace ->
+            if (trace.startedAtMillis > 0L) timestamps += trace.startedAtMillis
+            trace.completedAtMillis?.takeIf { it > 0L }?.let { timestamps += it }
+            trace.chunks.forEach { chunk ->
+                if (chunk.createdAtMillis > 0L) timestamps += chunk.createdAtMillis
+            }
+        }
+        message.toolInvocations.forEach { invocation ->
+            if (invocation.startedAtMillis > 0L) timestamps += invocation.startedAtMillis
+            invocation.completedAtMillis?.takeIf { it > 0L }?.let { timestamps += it }
+        }
     }
+    endAtMillis?.takeIf { it > 0L }?.let { timestamps += it }
+
+    val wallClockTimestamps = timestamps.filter { it >= MinimumEpochMillis }
+    if (wallClockTimestamps.size < 2) {
+        return messages.lastOrNull()?.thoughtDurationMillis ?: 1_000L
+    }
+    return (wallClockTimestamps.maxOrNull()!! - wallClockTimestamps.minOrNull()!!)
+        .coerceAtLeast(1_000L)
+}
+
+fun workDurationMillisForBlocks(
+    blocks: List<AssistantResponseBlock>,
+    endAtMillis: Long = System.currentTimeMillis(),
+): Long {
+    val timestamps = mutableListOf<Long>()
+    blocks.forEach { block ->
+        when (block) {
+            is AssistantResponseBlock.Text -> Unit
+            is AssistantResponseBlock.ToolGroup -> block.toolInvocations.forEach { invocation ->
+                if (invocation.startedAtMillis > 0L) timestamps += invocation.startedAtMillis
+                invocation.completedAtMillis?.takeIf { it > 0L }?.let { timestamps += it }
+            }
+            is AssistantResponseBlock.Reasoning -> {
+                val trace = block.trace
+                if (trace.startedAtMillis > 0L) timestamps += trace.startedAtMillis
+                trace.completedAtMillis?.takeIf { it > 0L }?.let { timestamps += it }
+                trace.chunks.forEach { chunk ->
+                    if (chunk.createdAtMillis > 0L) timestamps += chunk.createdAtMillis
+                }
+                trace.toolInvocations.forEach { invocation ->
+                    if (invocation.startedAtMillis > 0L) timestamps += invocation.startedAtMillis
+                    invocation.completedAtMillis?.takeIf { it > 0L }?.let { timestamps += it }
+                }
+            }
+        }
+    }
+    timestamps += endAtMillis
+
+    val wallClockTimestamps = timestamps.filter { it >= MinimumEpochMillis }
+    if (wallClockTimestamps.size < 2) {
+        return 1_000L
+    }
+    return (wallClockTimestamps.maxOrNull()!! - wallClockTimestamps.minOrNull()!!)
+        .coerceAtLeast(1_000L)
+}
+
+fun workDurationMillisForToolInvocations(
+    toolInvocations: List<ChatToolInvocation>,
+    endAtMillis: Long = System.currentTimeMillis(),
+): Long {
+    val timestamps = mutableListOf<Long>()
+    toolInvocations.forEach { invocation ->
+        if (invocation.startedAtMillis > 0L) timestamps += invocation.startedAtMillis
+        invocation.completedAtMillis?.takeIf { it > 0L }?.let { timestamps += it }
+    }
+    timestamps += endAtMillis
+
+    val wallClockTimestamps = timestamps.filter { it >= MinimumEpochMillis }
+    if (wallClockTimestamps.size < 2) {
+        return 1_000L
+    }
+    return (wallClockTimestamps.maxOrNull()!! - wallClockTimestamps.minOrNull()!!)
+        .coerceAtLeast(1_000L)
 }
 
 private fun formatReasoningTraceDoneLabel(
@@ -2886,8 +3519,33 @@ private fun formatComposerAttachmentMetaLabel(strings: AetherStrings, attachment
     }
     return listOfNotNull(
         formatAttachmentMetaLabel(strings, attachment).ifBlank { null },
-        statusLabel,
+        if (attachment.workspaceState == AttachmentWorkspaceState.Pending) {
+            formatWorkspaceCopyProgress(strings, attachment)
+        } else {
+            statusLabel
+        },
     ).joinToString(" | ")
+}
+
+private fun formatWorkspaceCopyProgress(strings: AetherStrings, attachment: ChatAttachment): String {
+    val copiedLabel = attachment.workspaceBytesCopied
+        .takeIf { it > 0L }
+        ?.let(::formatAttachmentSize)
+    val totalLabel = attachment.sizeBytes?.takeIf { it > 0L }?.let(::formatAttachmentSize)
+    val speedLabel = attachment.workspaceBytesPerSecond
+        .takeIf { it > 0L }
+        ?.let { "${formatAttachmentSize(it)}/s" }
+    val progressLabel = when {
+        copiedLabel != null && totalLabel != null -> "$copiedLabel / $totalLabel"
+        copiedLabel != null -> copiedLabel
+        else -> null
+    }
+    val prefix = if (strings.appLanguage == AppLanguage.SimplifiedChinese) {
+        "正在复制到工作区"
+    } else {
+        "Copying to workspace"
+    }
+    return listOfNotNull(prefix, progressLabel, speedLabel).joinToString(" · ")
 }
 
 private fun formatToolInvocationTitleLabel(toolInvocation: ChatToolInvocation): String {
@@ -2921,6 +3579,17 @@ private fun formatToolInvocationTitleLabel(toolInvocation: ChatToolInvocation): 
             completedVerb = "Fetched",
             subject = arguments?.optString("url").orEmpty(),
             fallback = "web page",
+        )
+        "aether_config_get",
+        "aether_config_set",
+        "aether_skill_manage",
+        "aether_mcp_manage",
+        "aether_termux_manage",
+        "aether_agent_mode_manage",
+        "aether_developer_manage" -> formatAetherToolTitle(
+            toolName = toolInvocation.toolName,
+            isRunning = toolInvocation.isRunning,
+            arguments = arguments,
         )
         else -> if (toolInvocation.isRunning) {
             "Using ${toolInvocation.toolName}"
@@ -2981,6 +3650,13 @@ private fun summarizeToolInvocationCommandLabel(
         "agent_display" -> summarizeAgentDisplayCommand(arguments)
         "tavily_search" -> "search ${arguments.optString("query").trim()}"
         "fetch_web_url" -> "fetch ${arguments.optString("url").trim()}"
+        "aether_config_get",
+        "aether_config_set",
+        "aether_skill_manage",
+        "aether_mcp_manage",
+        "aether_termux_manage",
+        "aether_agent_mode_manage",
+        "aether_developer_manage" -> summarizeAetherToolCommand(toolName, arguments)
         else -> toolName
     }.trim()
 }
@@ -3021,6 +3697,9 @@ private fun formatToolInvocationDetail(strings: AetherStrings, toolInvocation: C
 
     val result = when {
         output == null -> toolInvocation.outputJson.trim().ifBlank { strings.noOutput }
+        toolInvocation.toolName.startsWith("aether_", ignoreCase = true) -> {
+            toolInvocation.outputJson.trim().ifBlank { strings.noOutput }
+        }
         toolInvocation.toolName.equals("fetch_web_url", ignoreCase = true) -> {
             formatFetchWebUrlResult(strings, output)
         }
@@ -3102,6 +3781,13 @@ private fun summarizeToolInvocationCommand(
         "agent_display" -> summarizeAgentDisplayCommand(arguments)
         "tavily_search" -> "search ${arguments.optString("query").trim()}"
         "fetch_web_url" -> "fetch ${arguments.optString("url").trim()}"
+        "aether_config_get",
+        "aether_config_set",
+        "aether_skill_manage",
+        "aether_mcp_manage",
+        "aether_termux_manage",
+        "aether_agent_mode_manage",
+        "aether_developer_manage" -> summarizeAetherToolCommand(toolName, arguments)
         else -> toolName
     }.trim()
 }
@@ -3128,6 +3814,13 @@ private fun formatAgentDisplayTitle(
 ): String {
     val action = arguments?.optString("action").orEmpty().lowercase()
     return when (action) {
+        "list_apps", "apps", "installed_apps" -> formatArgumentDrivenTitle(
+            isRunning = isRunning,
+            progressiveVerb = "Reading",
+            completedVerb = "Read",
+            subject = arguments?.optString("query").orEmpty(),
+            fallback = "installed apps",
+        )
         "start" -> if (isRunning) "Starting Agent Mode display" else "Started Agent Mode display"
         "status" -> if (isRunning) "Checking Agent Mode display" else "Checked Agent Mode display"
         "launch" -> formatArgumentDrivenTitle(
@@ -3153,10 +3846,148 @@ private fun formatAgentDisplayTitle(
     }
 }
 
+private fun formatAetherToolTitle(
+    toolName: String,
+    isRunning: Boolean,
+    arguments: JSONObject?,
+): String {
+    val action = arguments?.optString("action").orEmpty().trim()
+    return when (toolName.lowercase()) {
+        "aether_config_get" -> formatArgumentDrivenTitle(
+            isRunning = isRunning,
+            progressiveVerb = "Reading",
+            completedVerb = "Read",
+            subject = summarizeAetherCategories(arguments),
+            fallback = "Aether settings",
+        )
+        "aether_config_set" -> formatArgumentDrivenTitle(
+            isRunning = isRunning,
+            progressiveVerb = "Updating",
+            completedVerb = "Updated",
+            subject = arguments?.optString("category").orEmpty(),
+            fallback = "Aether settings",
+        )
+        "aether_skill_manage" -> when (action.lowercase()) {
+            "install_remote" -> formatArgumentDrivenTitle(isRunning, "Installing", "Installed", arguments?.optString("url").orEmpty(), "Agent Skill")
+            "remove" -> formatArgumentDrivenTitle(isRunning, "Removing", "Removed", optAetherString(arguments, "skill_id", "skillId"), "Agent Skill")
+            "set_enabled" -> formatArgumentDrivenTitle(isRunning, "Updating", "Updated", optAetherString(arguments, "skill_id", "skillId"), "Agent Skill")
+            else -> if (isRunning) "Reading Agent Skills" else "Read Agent Skills"
+        }
+        "aether_mcp_manage" -> when (action.lowercase()) {
+            "upsert_streamable_http", "upsert_stdio" -> formatArgumentDrivenTitle(isRunning, "Saving", "Saved", optAetherString(arguments, "display_name", "displayName"), "MCP server")
+            "remove" -> formatArgumentDrivenTitle(isRunning, "Removing", "Removed", optAetherString(arguments, "server_id", "serverId"), "MCP server")
+            "set_enabled" -> formatArgumentDrivenTitle(isRunning, "Updating", "Updated", optAetherString(arguments, "server_id", "serverId"), "MCP server")
+            else -> if (isRunning) "Reading MCP servers" else "Read MCP servers"
+        }
+        "aether_termux_manage" -> when (action.lowercase()) {
+            "configure_root_access" -> if (isRunning) "Configuring Termux root access" else "Configured Termux root access"
+            "inspect_root_setup" -> if (isRunning) "Checking Root setup" else "Checked Root setup"
+            else -> if (isRunning) "Checking Termux setup" else "Checked Termux setup"
+        }
+        "aether_agent_mode_manage" -> when (action.lowercase()) {
+            "set_authorization" -> if (isRunning) "Updating Agent Mode authorization" else "Updated Agent Mode authorization"
+            "request_shizuku_permission" -> if (isRunning) "Requesting Shizuku permission" else "Requested Shizuku permission"
+            "stop_display" -> if (isRunning) "Stopping Agent Mode display" else "Stopped Agent Mode display"
+            "refresh_displays" -> if (isRunning) "Refreshing Agent Mode displays" else "Refreshed Agent Mode displays"
+            else -> if (isRunning) "Checking Agent Mode authorization" else "Checked Agent Mode authorization"
+        }
+        "aether_developer_manage" -> if (isRunning) "Reading Aether diagnostics" else "Read Aether diagnostics"
+        else -> if (isRunning) "Managing Aether" else "Managed Aether"
+    }
+}
+
+private fun summarizeAetherToolCommand(
+    toolName: String,
+    arguments: JSONObject,
+): String {
+    val action = arguments.optString("action").trim()
+    return when (toolName.lowercase()) {
+        "aether_config_get" -> "aether_config_get categories=${summarizeAetherCategories(arguments).ifBlank { "all" }}"
+        "aether_config_set" -> "aether_config_set category=${arguments.optString("category").trim()} ${summarizeAetherSettingsPatch(arguments.optJSONObject("settings"))}".trim()
+        "aether_skill_manage" -> buildString {
+            append("aether_skill_manage action=")
+            append(action.ifBlank { "list" })
+            appendAetherKeyValue(arguments, "skill_id", "skillId")
+            appendAetherKeyValue(arguments, "url")
+            if (arguments.has("enabled")) append(" enabled=").append(arguments.optBoolean("enabled"))
+        }.trim()
+        "aether_mcp_manage" -> buildString {
+            append("aether_mcp_manage action=")
+            append(action.ifBlank { "list" })
+            appendAetherKeyValue(arguments, "server_id", "serverId")
+            appendAetherKeyValue(arguments, "display_name", "displayName")
+            appendAetherKeyValue(arguments, "url")
+            appendAetherKeyValue(arguments, "command")
+            if (arguments.has("enabled")) append(" enabled=").append(arguments.optBoolean("enabled"))
+        }.trim()
+        "aether_termux_manage" -> "aether_termux_manage action=${action.ifBlank { "inspect_setup" }}"
+        "aether_agent_mode_manage" -> buildString {
+            append("aether_agent_mode_manage action=")
+            append(action.ifBlank { "inspect_authorization" })
+            if (arguments.has("enabled")) append(" enabled=").append(arguments.optBoolean("enabled"))
+            appendAetherKeyValue(arguments, "method")
+        }.trim()
+        "aether_developer_manage" -> buildString {
+            append("aether_developer_manage action=")
+            append(action.ifBlank { "read_diagnostics" })
+            appendAetherKeyValue(arguments, "include")
+            appendAetherKeyValue(arguments, "max_chars", "maxChars")
+        }.trim()
+        else -> toolName
+    }
+}
+
+private fun summarizeAetherCategories(arguments: JSONObject?): String {
+    val categories = arguments?.optJSONArray("categories") ?: return ""
+    return buildList {
+        for (index in 0 until categories.length()) {
+            val value = categories.optString(index).trim()
+            if (value.isNotBlank()) add(value)
+        }
+    }.joinToString(",")
+}
+
+private fun summarizeAetherSettingsPatch(settings: JSONObject?): String {
+    if (settings == null) return ""
+    val keys = buildList {
+        settings.keys().forEach { add(it) }
+    }
+    return if (keys.isEmpty()) "" else "fields=${keys.joinToString(",")}"
+}
+
+private fun optAetherString(
+    arguments: JSONObject?,
+    primary: String,
+    secondary: String,
+): String = arguments?.optString(primary).orEmpty().ifBlank {
+    arguments?.optString(secondary).orEmpty()
+}
+
+private fun StringBuilder.appendAetherKeyValue(
+    arguments: JSONObject,
+    primary: String,
+    secondary: String = "",
+) {
+    val value = arguments.optString(primary).ifBlank {
+        if (secondary.isBlank()) "" else arguments.optString(secondary)
+    }.trim()
+    if (value.isNotBlank()) {
+        append(' ')
+        append(primary)
+        append('=')
+        append(value.take(96))
+        if (value.length > 96) append("...")
+    }
+}
+
 private fun summarizeAgentDisplayCommand(arguments: JSONObject?): String {
     if (arguments == null) return "agent_display"
     val action = arguments.optString("action").trim().ifBlank { "unknown" }
     return when (action.lowercase()) {
+        "list_apps", "apps", "installed_apps" -> {
+            val query = arguments.optString("query").trim()
+            "agent_display list_apps${if (query.isBlank()) "" else " $query"}"
+        }
         "launch" -> "agent_display launch ${arguments.optString("target").trim()}"
         "tap" -> "agent_display tap x=${arguments.optString("x").trim()} y=${arguments.optString("y").trim()}"
         "swipe" -> "agent_display swipe ${arguments.optString("x1").trim()},${arguments.optString("y1").trim()} -> ${arguments.optString("x2").trim()},${arguments.optString("y2").trim()} ${arguments.optString("duration_ms").ifBlank { arguments.optString("durationMs") }.trim()}ms"
@@ -3169,6 +4000,37 @@ private fun summarizeAgentDisplayCommand(arguments: JSONObject?): String {
         else -> "agent_display $action"
     }.trim()
 }
+
+private fun buildAgentModeReplayTimeline(
+    messages: List<ChatMessage>,
+): AgentModeReplayTimeline {
+    val frames = mutableListOf<AgentModeReplayFrame>()
+    val interleavedTextMessageIds = mutableSetOf<String>()
+    var firstFrameMessageIndex = -1
+    messages.forEachIndexed { index, message ->
+        val messageFrames = buildAgentModeReplayFrames(message.toolInvocations)
+        if (messageFrames.isNotEmpty()) {
+            if (firstFrameMessageIndex < 0) {
+                firstFrameMessageIndex = index
+            }
+            frames += messageFrames
+        }
+        if (message.text.isNotBlank() && frames.isNotEmpty() && messages.hasFutureAgentModeFrame(index + 1)) {
+            frames[frames.lastIndex] = frames.last().copy(overlayText = message.text)
+            interleavedTextMessageIds += message.id
+        }
+    }
+    return AgentModeReplayTimeline(
+        frames = frames,
+        interleavedTextMessageIds = interleavedTextMessageIds,
+        firstFrameMessageIndex = firstFrameMessageIndex,
+    )
+}
+
+private fun List<ChatMessage>.hasFutureAgentModeFrame(startIndex: Int): Boolean =
+    drop(startIndex).any { message ->
+        buildAgentModeReplayFrames(message.toolInvocations).isNotEmpty()
+    }
 
 private fun buildAgentModeReplayFrames(
     toolInvocations: List<ChatToolInvocation>,
@@ -3186,12 +4048,18 @@ private fun buildAgentModeReplayFrames(
                 previewPath = previewPath,
                 width = output.optInt("width"),
                 height = output.optInt("height"),
+                cursorX = output.optionalInt("cursor_x", "cursorX"),
+                cursorY = output.optionalInt("cursor_y", "cursorY"),
+                overlayText = "",
                 completedAtUptimeMillis = invocation.completedAtUptimeMillis ?: invocation.startedAtUptimeMillis,
                 toolTitle = formatToolInvocationTitleLabel(invocation.copy(isRunning = true)),
             )
         )
     }
 }
+
+private fun ChatToolInvocation.isAgentModeDisplayInvocation(): Boolean =
+    toolName.equals("agent_display", ignoreCase = true)
 
 private fun agentModeReplayBackdropBrush(): Brush = Brush.linearGradient(
     colorStops = arrayOf(
@@ -3209,6 +4077,9 @@ private fun parseJsonObject(rawValue: String): JSONObject? {
     if (rawValue.isBlank()) return null
     return runCatching { JSONObject(rawValue) }.getOrNull()
 }
+
+private fun JSONObject.optionalInt(vararg keys: String): Int? =
+    keys.firstOrNull { has(it) && !isNull(it) }?.let { optInt(it) }
 
 private fun highlightBashCommand(command: String): AnnotatedString = buildAnnotatedString {
     appendStyled("$ ", SpanStyle(color = AetherSecondary, fontWeight = FontWeight.SemiBold))
@@ -3299,6 +4170,15 @@ private data class AgentModeReplayFrame(
     val previewPath: String,
     val width: Int,
     val height: Int,
+    val cursorX: Int?,
+    val cursorY: Int?,
+    val overlayText: String,
     val completedAtUptimeMillis: Long,
     val toolTitle: String,
+)
+
+private data class AgentModeReplayTimeline(
+    val frames: List<AgentModeReplayFrame>,
+    val interleavedTextMessageIds: Set<String>,
+    val firstFrameMessageIndex: Int,
 )

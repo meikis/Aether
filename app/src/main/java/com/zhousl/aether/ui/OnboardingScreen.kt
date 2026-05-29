@@ -216,6 +216,13 @@ fun OnboardingScreen(
     fun continueAfterLocalAccessSetup() {
         currentStep = OnboardingStep.TavilySetup
     }
+    fun continueAfterTermuxStep() {
+        currentStep = if (termuxSetupState.isReady) {
+            OnboardingStep.AgentModeAuthorization
+        } else {
+            OnboardingStep.TavilySetup
+        }
+    }
 
     AnimatedContent(
         targetState = currentStep,
@@ -269,7 +276,7 @@ fun OnboardingScreen(
                 setupState = termuxSetupState,
                 rootSetupState = rootSetupState,
                 onClose = onClose,
-                onContinue = { currentStep = OnboardingStep.AgentModeAuthorization },
+                onContinue = ::continueAfterTermuxStep,
                 onRootConfigured = ::continueAfterLocalAccessSetup,
                 onRequestPermission = onRequestTermuxPermission,
                 onOpenAppPermissions = onOpenAppPermissions,
@@ -298,7 +305,13 @@ fun OnboardingScreen(
                 stepCount = steps.size,
                 value = tavilyApiKeyValue,
                 onValueChange = { tavilyApiKeyValue = it },
-                onBack = { currentStep = OnboardingStep.AgentModeAuthorization },
+                onBack = {
+                    currentStep = if (termuxSetupState.isReady) {
+                        OnboardingStep.AgentModeAuthorization
+                    } else {
+                        OnboardingStep.TermuxSetup
+                    }
+                },
                 onClose = onClose,
                 onContinue = {
                     val trimmed = tavilyApiKeyValue.trim()
@@ -934,8 +947,8 @@ private fun TermuxStep(
 
                     TermuxSetupIssue.ExternalAppsDisabled -> {
                         TourActionRow(
-                            primaryLabel = tr(strings, "Copy and Open Termux", "复制并打开 Termux"),
-                            onPrimary = ::copyTermuxSetupCommandAndOpenTermux,
+                            primaryLabel = if (setupState.previouslyConfigured) tr(strings, "Open", "\u6253\u5f00") else tr(strings, "Copy and Open Termux", "复制并打开 Termux"),
+                            onPrimary = if (setupState.previouslyConfigured) onOpenTermux else ::copyTermuxSetupCommandAndOpenTermux,
                             secondaryLabel = strings.skip,
                             onSecondary = onContinue,
                         )
@@ -943,13 +956,15 @@ private fun TermuxStep(
 
                     TermuxSetupIssue.DispatchFailed -> {
                         TourActionRow(
-                            primaryLabel = strings.openTermux,
+                            primaryLabel = if (setupState.previouslyConfigured) tr(strings, "Open", "\u6253\u5f00") else strings.openTermux,
                             onPrimary = onOpenTermux,
                             secondaryLabel = strings.skip,
                             onSecondary = onContinue,
                         )
-                        SecondaryTextAction(label = tr(strings, "Copy setup command", "复制配置命令"), onClick = ::copyTermuxSetupCommand)
-                        SecondaryTextAction(label = tr(strings, "Termux settings", "Termux 设置"), onClick = onOpenTermuxSettings)
+                        if (!setupState.previouslyConfigured) {
+                            SecondaryTextAction(label = tr(strings, "Copy setup command", "复制配置命令"), onClick = ::copyTermuxSetupCommand)
+                            SecondaryTextAction(label = tr(strings, "Termux settings", "Termux 设置"), onClick = onOpenTermuxSettings)
+                        }
                     }
                 }
             }
@@ -1904,8 +1919,20 @@ private fun termuxStatusSentence(
         TermuxSetupIssue.Ready -> if (appLanguage == AppLanguage.SimplifiedChinese) "本地工具已就绪。" else "Local tools are ready."
         TermuxSetupIssue.NotInstalled -> if (appLanguage == AppLanguage.SimplifiedChinese) "先安装 Termux，然后再回到这里。" else "Install Termux first, then come back here."
         TermuxSetupIssue.PermissionMissing -> if (appLanguage == AppLanguage.SimplifiedChinese) "在系统权限中授予“在 Termux 环境中运行命令”。" else "Grant the \"Run commands in Termux environment\" permission in Android settings."
-        TermuxSetupIssue.ExternalAppsDisabled -> if (appLanguage == AppLanguage.SimplifiedChinese) "复制配置命令，在 Termux 中粘贴运行后再回来刷新。" else "Copy the setup command, paste it in Termux, then return and refresh."
-        TermuxSetupIssue.DispatchFailed -> if (appLanguage == AppLanguage.SimplifiedChinese) "先打开一次 Termux，然后回到这里刷新。" else "Open Termux once, then refresh here."
+        TermuxSetupIssue.ExternalAppsDisabled -> if (setupState.previouslyConfigured) {
+            if (appLanguage == AppLanguage.SimplifiedChinese) {
+                "Termux \u4f3c\u4e4e\u4e0d\u5728\u540e\u53f0\u8fd0\u884c\u3002\u6253\u5f00 Termux \u5e76\u4fdd\u6301\u5b83\u5728\u540e\u53f0\u8fd0\u884c\uff0c\u7136\u540e\u56de\u5230 Aether \u5237\u65b0\u72b6\u6001\u3002"
+            } else {
+                "Termux seems to be not running in the background. Open Termux and keep it running in the background, then return to Aether and refresh."
+            }
+        } else if (appLanguage == AppLanguage.SimplifiedChinese) "复制配置命令，在 Termux 中粘贴运行后再回来刷新。" else "Copy the setup command, paste it in Termux, then return and refresh."
+        TermuxSetupIssue.DispatchFailed -> if (setupState.previouslyConfigured) {
+            if (appLanguage == AppLanguage.SimplifiedChinese) {
+                "Termux \u4f3c\u4e4e\u4e0d\u5728\u540e\u53f0\u8fd0\u884c\u3002\u6253\u5f00 Termux \u5e76\u4fdd\u6301\u5b83\u5728\u540e\u53f0\u8fd0\u884c\uff0c\u7136\u540e\u56de\u5230 Aether \u5237\u65b0\u72b6\u6001\u3002"
+            } else {
+                "Termux seems to be not running in the background. Open Termux and keep it running in the background, then return to Aether and refresh."
+            }
+        } else if (appLanguage == AppLanguage.SimplifiedChinese) "先打开一次 Termux，然后回到这里刷新。" else "Open Termux once, then refresh here."
     }
 }
 

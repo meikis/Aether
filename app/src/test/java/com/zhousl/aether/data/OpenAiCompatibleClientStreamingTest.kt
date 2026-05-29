@@ -62,6 +62,116 @@ class OpenAiCompatibleClientStreamingTest {
     }
 
     @Test
+    fun streamChatCompletionRequestsAndParsesUsageChunk() = runBlocking {
+        val server = MockWebServer()
+        server.enqueue(
+            MockResponse()
+                .addHeader("Content-Type", "text/event-stream")
+                .setBody(
+                    """
+                    data: {"choices":[{"delta":{"content":"Hi"}}]}
+
+                    data: {"choices":[],"usage":{"prompt_tokens":9,"completion_tokens":4,"total_tokens":13}}
+
+                    data: [DONE]
+
+                    """.trimIndent()
+                )
+        )
+        server.start()
+
+        try {
+            val settings = AppSettings(
+                provider = LlmProvider.OpenAiCompatible,
+                apiKey = "test-key",
+                baseUrl = server.url("/v1").toString(),
+                modelId = "gpt-5.4",
+            )
+
+            val result = client.streamChatCompletion(
+                settings = settings,
+                systemPrompt = "",
+                conversation = listOf(
+                    JSONObject().apply {
+                        put("role", "user")
+                        put("content", "Hi")
+                    }
+                ),
+            ).getOrThrow()
+
+            assertEquals("Hi", result.assistantText)
+            assertEquals(9L, result.tokenUsage?.inputTokens)
+            assertEquals(4L, result.tokenUsage?.outputTokens)
+            assertEquals(13L, result.tokenUsage?.totalTokens)
+
+            val payload = JSONObject(server.takeRequest().body.readUtf8())
+            assertTrue(payload.getBoolean("stream"))
+            assertTrue(payload.getJSONObject("stream_options").getBoolean("include_usage"))
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun streamAnthropicMessagesParsesMessageDeltaUsage() = runBlocking {
+        val server = MockWebServer()
+        server.enqueue(
+            MockResponse()
+                .addHeader("Content-Type", "text/event-stream")
+                .setBody(
+                    """
+                    event: message_start
+                    data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","content":[],"usage":{"input_tokens":12,"output_tokens":1}}}
+
+                    event: content_block_start
+                    data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+                    event: content_block_delta
+                    data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Done."}}
+
+                    event: content_block_stop
+                    data: {"type":"content_block_stop","index":0}
+
+                    event: message_delta
+                    data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":6}}
+
+                    event: message_stop
+                    data: {"type":"message_stop"}
+
+                    """.trimIndent()
+                )
+        )
+        server.start()
+
+        try {
+            val settings = AppSettings(
+                provider = LlmProvider.AnthropicMessages,
+                apiKey = "test-key",
+                baseUrl = server.url("/v1").toString(),
+                modelId = "claude-test",
+            )
+
+            val result = client.streamChatCompletion(
+                settings = settings,
+                systemPrompt = "",
+                conversation = listOf(
+                    JSONObject().apply {
+                        put("role", "user")
+                        put("content", org.json.JSONArray().put(JSONObject().put("type", "text").put("text", "Hello")))
+                    }
+                ),
+            ).getOrThrow()
+
+            assertEquals("Done.", result.assistantText)
+            assertEquals(12L, result.tokenUsage?.inputTokens)
+            assertEquals(6L, result.tokenUsage?.outputTokens)
+            assertEquals(18L, result.tokenUsage?.totalTokens)
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
     fun streamChatCompletionPreservesReasoningContentForAssistantMessage() = runBlocking {
         val server = MockWebServer()
         server.enqueue(
@@ -516,6 +626,59 @@ class OpenAiCompatibleClientStreamingTest {
             assertTrue(result.isFailure)
             val message = result.exceptionOrNull()?.message.orEmpty().lowercase()
             assertTrue(message.contains("completion"))
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun streamChatCompletionIgnoresNullToolCallsOnDeltaAndAccumulatesRealToolCalls() = runBlocking {
+        // Reproduces mimo-v2.5-pro behavior where deltas include
+        // \"tool_calls\": null before the actual tool_calls delta arrives.
+        val server = MockWebServer()
+        server.enqueue(
+            MockResponse()
+                .addHeader("Content-Type", "text/event-stream")
+                .setBody(
+                    """
+                    data: {"choices":[{"delta":{"reasoning_content":"Need to read the file.","tool_calls":null}}]}
+
+                    data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"read","arguments":"{\"path\":\""}}]}}]}
+
+                    data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"README.md\"}"}}]}}]}
+
+                    data: [DONE]
+
+                    """.trimIndent()
+                )
+        )
+        server.start()
+
+        try {
+            val settings = AppSettings(
+                provider = LlmProvider.OpenAiCompatible,
+                apiKey = "test-key",
+                baseUrl = server.url("/v1").toString(),
+                modelId = "mimo-v2.5-pro",
+            )
+            val reasoningDeltas = StringBuilder()
+
+            val result = client.streamChatCompletion(
+                settings = settings,
+                systemPrompt = "",
+                conversation = listOf(
+                    JSONObject().apply {
+                        put("role", "user")
+                        put("content", "Read README.md")
+                    }
+                ),
+                onReasoningDelta = { reasoningDeltas.append(it) },
+            ).getOrThrow()
+
+            assertEquals("Need to read the file.", reasoningDeltas.toString())
+            assertEquals(1, result.toolCalls.size)
+            assertEquals("read", result.toolCalls.single().name)
+            assertEquals("""{"path":"README.md"}""", result.toolCalls.single().arguments)
         } finally {
             server.shutdown()
         }

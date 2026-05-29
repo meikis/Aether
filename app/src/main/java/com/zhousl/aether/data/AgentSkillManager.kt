@@ -181,18 +181,22 @@ class AgentSkillManager(
         require(skillFile.isFile) { "The selected directory does not contain SKILL.md." }
         val parsed = parseSkillDocument(skillFile)
         val skillId = buildSkillId(parsed.name)
-        val installRoot = File(installedSkillsDirectory(), skillId)
+        val previousSkill = extensionsRepository.extensionState.firstValue()
+            .installedSkills
+            .firstOrNull { it.id == skillId }
+        val installRoot = createInstallRoot(skillId)
         val stagingRoot = File(context.filesDir, SkillTempDirectoryName)
             .apply { mkdirs() }
             .resolve("$skillId-${UUID.randomUUID()}")
             .apply { mkdirs() }
-        sourceRoot.copyRecursively(stagingRoot, overwrite = true)
-        val checksum = sha256OfDirectory(stagingRoot)
-        installRoot.deleteRecursively()
-        if (!stagingRoot.renameTo(installRoot)) {
-            stagingRoot.copyRecursively(installRoot, overwrite = true)
+        val checksum = try {
+            sourceRoot.copyRecursively(stagingRoot, overwrite = true)
+            sha256OfDirectory(stagingRoot)
+        } catch (throwable: Throwable) {
             stagingRoot.deleteRecursively()
+            throw throwable
         }
+        moveStagingRootIntoPlace(stagingRoot, installRoot)
         val installedSkill = InstalledSkill(
             id = skillId,
             name = parsed.name,
@@ -210,7 +214,44 @@ class AgentSkillManager(
             resourceEntries = listSkillResources(installRoot),
         )
         extensionsRepository.upsertInstalledSkill(installedSkill)
+        cleanupReplacedSkill(previousSkill, installRoot)
         return installedSkill
+    }
+
+    private fun createInstallRoot(skillId: String): File {
+        val storageRoot = installedSkillsDirectory()
+        while (true) {
+            val candidate = storageRoot.resolve("$skillId-${UUID.randomUUID()}")
+            if (!candidate.exists()) return candidate
+        }
+    }
+
+    private fun moveStagingRootIntoPlace(
+        stagingRoot: File,
+        installRoot: File,
+    ) {
+        installRoot.parentFile?.mkdirs()
+        try {
+            if (!stagingRoot.renameTo(installRoot)) {
+                stagingRoot.copyRecursively(installRoot, overwrite = false)
+                stagingRoot.deleteRecursively()
+            }
+        } catch (throwable: Throwable) {
+            installRoot.deleteRecursively()
+            stagingRoot.deleteRecursively()
+            throw throwable
+        }
+    }
+
+    private fun cleanupReplacedSkill(
+        previousSkill: InstalledSkill?,
+        installRoot: File,
+    ) {
+        val previousRoot = previousSkill?.let(::validatedInstalledSkillRoot) ?: return
+        val newRoot = runCatching { installRoot.canonicalFile }.getOrNull() ?: installRoot.absoluteFile
+        if (previousRoot != newRoot) {
+            previousRoot.deleteRecursively()
+        }
     }
 
     private fun locateSkillRoot(

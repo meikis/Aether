@@ -5,28 +5,28 @@ import android.app.ActivityOptions
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ApplicationInfo
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Point
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
+import android.media.Image
 import android.media.ImageReader
 import android.os.Build
-import android.os.Handler
-import android.os.HandlerThread
+import android.os.ParcelFileDescriptor
+import android.os.Process
 import android.os.SystemClock
 import android.view.InputDevice
 import android.view.InputEvent
 import android.view.KeyCharacterMap
 import android.view.KeyEvent
 import android.view.MotionEvent
-import android.view.PixelCopy
 import android.view.Surface
 import androidx.annotation.Keep
 import androidx.core.content.getSystemService
-import java.io.ByteArrayOutputStream
+import java.io.OutputStream
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.CountDownLatch
-import java.util.concurrent.TimeUnit
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -42,15 +42,22 @@ private const val VirtualDisplayFlagStealTopFocusDisabled = 1 shl 16
 private const val InjectInputEventModeWaitForFinish = 2
 private const val TapDurationMillis = 60L
 private const val KeyPressDurationMillis = 30L
+private const val ShellPackageName = "com.android.shell"
+private const val SystemPackageName = "android"
 
 class AetherAgentModeShizukuService @Keep constructor(
     private val context: Context,
 ) : IAetherAgentModeService.Stub() {
-    private val displayManager = context.getSystemService<DisplayManager>()!!
+    constructor() : this(resolveLegacyUserServiceContext())
+
+    private val privilegedContext: Context by lazy { contextForCurrentProcess(context) }
+    private val displayManager: DisplayManager by lazy {
+        privilegedContext.getSystemService<DisplayManager>()!!
+    }
     private val displays = ConcurrentHashMap<Int, VirtualDisplay>()
     private val imageReaders = ConcurrentHashMap<Int, ImageReader>()
-    private val pixelCopyThread = HandlerThread("aether-agentmode-pixelcopy").apply { start() }
-    private val pixelCopyHandler = Handler(pixelCopyThread.looper)
+    private val previewSurfaces = ConcurrentHashMap<Int, Surface>()
+    private val displayLocks = ConcurrentHashMap<Int, Any>()
 
     override fun createDisplay(
         name: String,
@@ -69,6 +76,7 @@ class AetherAgentModeShizukuService @Keep constructor(
         )
         val displayId = display.display.displayId
         displays[displayId] = display
+        displayLocks[displayId] = Any()
         return displayId
     }
 
@@ -95,16 +103,49 @@ class AetherAgentModeShizukuService @Keep constructor(
         val displayId = display.display.displayId
         displays[displayId] = display
         imageReaders[displayId] = reader
+        displayLocks[displayId] = Any()
         return displayId
     }
 
+    override fun attachPreviewSurface(displayId: Int, surface: Surface) {
+        val display = displays[displayId]
+            ?: error("Display $displayId is not managed by Aether Agent Mode.")
+        synchronized(displayLock(displayId)) {
+            previewSurfaces[displayId] = surface
+            display.setSurface(surface)
+        }
+    }
+
+    override fun detachPreviewSurface(displayId: Int) {
+        val display = displays[displayId]
+            ?: error("Display $displayId is not managed by Aether Agent Mode.")
+        synchronized(displayLock(displayId)) {
+            previewSurfaces.remove(displayId)
+            display.setSurface(imageReaders[displayId]?.surface)
+        }
+    }
+
     override fun releaseDisplay(displayId: Int) {
-        displays.remove(displayId)?.release()
-        imageReaders.remove(displayId)?.close()
+        synchronized(displayLock(displayId)) {
+            previewSurfaces.remove(displayId)
+            displays.remove(displayId)?.release()
+            imageReaders.remove(displayId)?.close()
+            displayLocks.remove(displayId)
+        }
+    }
+
+    override fun destroy() {
+        displays.keys.toList().forEach { displayId ->
+            runCatching { releaseDisplay(displayId) }
+        }
+        previewSurfaces.clear()
+        imageReaders.clear()
+        displayLocks.clear()
+        System.exit(0)
     }
 
     override fun launchPackage(packageName: String, displayId: Int) {
-        val intent = context.packageManager.getLaunchIntentForPackage(packageName)
+        val intent = privilegedContext.packageManager.getLaunchIntentForPackage(packageName)
             ?: error("No launchable activity for $packageName.")
         val options = ActivityOptions.makeBasic()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -115,7 +156,7 @@ class AetherAgentModeShizukuService @Keep constructor(
 
         val targetDisplay = displayManager.getDisplay(displayId)
             ?: error("Display $displayId is not available.")
-        val displayContext = context.createDisplayContext(targetDisplay)
+        val displayContext = privilegedContext.createDisplayContext(targetDisplay)
         val flags = PendingIntent.FLAG_UPDATE_CURRENT or
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) PendingIntent.FLAG_IMMUTABLE else 0
         PendingIntent.getActivity(
@@ -124,7 +165,7 @@ class AetherAgentModeShizukuService @Keep constructor(
             intent,
             flags,
         ).send(
-            context,
+            privilegedContext,
             0,
             null,
             null,
@@ -237,34 +278,110 @@ class AetherAgentModeShizukuService @Keep constructor(
         }
     }
 
-    override fun capturePng(displayId: Int): ByteArray {
+    override fun captureImageToFd(
+        displayId: Int,
+        output: ParcelFileDescriptor,
+        maxEdge: Int,
+        quality: Int,
+    ) {
         val display = displays[displayId]
             ?: error("Display $displayId is not managed by Aether Agent Mode.")
-        val width = display.display.mode?.physicalWidth?.takeIf { it > 0 } ?: display.display.width
-        val height = display.display.mode?.physicalHeight?.takeIf { it > 0 } ?: display.display.height
-        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-        val latch = CountDownLatch(1)
-        var result = PixelCopy.ERROR_UNKNOWN
-        PixelCopy.request(display.surface, bitmap, { copyResult ->
-            result = copyResult
-            latch.countDown()
-        }, pixelCopyHandler)
-        if (!latch.await(2, TimeUnit.SECONDS)) {
-            bitmap.recycle()
-            error("Timed out while capturing display $displayId.")
+        val reader = imageReaders[displayId]
+            ?: error("Display $displayId does not have an internal capture surface.")
+        val boundedMaxEdge = maxEdge.coerceIn(320, 4096)
+        val boundedQuality = quality.coerceIn(40, 95)
+        synchronized(displayLock(displayId)) {
+            drainImageReader(reader)
+            val previewSurface = previewSurfaces[displayId]?.takeIf { it.isValid }
+            display.setSurface(reader.surface)
+            try {
+                val image = awaitLatestImage(displayId, reader)
+                try {
+                    ParcelFileDescriptor.AutoCloseOutputStream(output).use { stream ->
+                        imageToJpegStream(
+                            image = image,
+                            output = stream,
+                            maxEdge = boundedMaxEdge,
+                            quality = boundedQuality,
+                        )
+                    }
+                } finally {
+                    image.close()
+                }
+            } finally {
+                if (previewSurface != null && displays[displayId] === display) {
+                    runCatching { display.setSurface(previewSurface) }
+                }
+            }
         }
-        if (result != PixelCopy.SUCCESS) {
-            bitmap.recycle()
-            error("PixelCopy failed for display $displayId with code $result.")
+    }
+
+    private fun displayLock(displayId: Int): Any =
+        displayLocks.computeIfAbsent(displayId) { Any() }
+
+    private fun drainImageReader(reader: ImageReader) {
+        while (true) {
+            val image = reader.acquireLatestImage() ?: return
+            image.close()
         }
-        return try {
-            ByteArrayOutputStream().use { output ->
-                bitmap.compress(Bitmap.CompressFormat.PNG, 100, output)
-                output.toByteArray()
+    }
+
+    private fun awaitLatestImage(displayId: Int, reader: ImageReader): Image {
+        val deadline = SystemClock.uptimeMillis() + 2_000L
+        while (SystemClock.uptimeMillis() < deadline) {
+            reader.acquireLatestImage()?.let { return it }
+            SystemClock.sleep(16L)
+        }
+        error("Timed out while capturing display $displayId.")
+    }
+
+    private fun imageToJpegStream(
+        image: Image,
+        output: OutputStream,
+        maxEdge: Int,
+        quality: Int,
+    ) {
+        val plane = image.planes.firstOrNull()
+            ?: error("Captured display image had no pixel planes.")
+        val width = image.width.coerceAtLeast(1)
+        val height = image.height.coerceAtLeast(1)
+        val pixelStride = plane.pixelStride.coerceAtLeast(1)
+        val rowStride = plane.rowStride.coerceAtLeast(width * pixelStride)
+        val paddedWidth = (rowStride / pixelStride).coerceAtLeast(width)
+        val paddedBitmap = Bitmap.createBitmap(paddedWidth, height, Bitmap.Config.ARGB_8888)
+        plane.buffer.rewind()
+        try {
+            paddedBitmap.copyPixelsFromBuffer(plane.buffer)
+            val bitmap = if (paddedWidth == width) {
+                paddedBitmap
+            } else {
+                Bitmap.createBitmap(paddedBitmap, 0, 0, width, height)
+            }
+            try {
+                val scaledBitmap = scaleBitmapIfNeeded(bitmap, maxEdge)
+                try {
+                    if (!scaledBitmap.compress(Bitmap.CompressFormat.JPEG, quality, output)) {
+                        error("Unable to encode Agent Mode screenshot.")
+                    }
+                    output.flush()
+                } finally {
+                    if (scaledBitmap !== bitmap) scaledBitmap.recycle()
+                }
+            } finally {
+                if (bitmap !== paddedBitmap) bitmap.recycle()
             }
         } finally {
-            bitmap.recycle()
+            paddedBitmap.recycle()
         }
+    }
+
+    private fun scaleBitmapIfNeeded(bitmap: Bitmap, maxEdge: Int): Bitmap {
+        val largestEdge = maxOf(bitmap.width, bitmap.height)
+        if (largestEdge <= maxEdge) return bitmap
+        val scale = maxEdge.toFloat() / largestEdge.toFloat()
+        val targetWidth = (bitmap.width * scale).toInt().coerceAtLeast(1)
+        val targetHeight = (bitmap.height * scale).toInt().coerceAtLeast(1)
+        return Bitmap.createScaledBitmap(bitmap, targetWidth, targetHeight, true)
     }
 
     override fun listDisplaysJson(): String =
@@ -284,6 +401,52 @@ class AetherAgentModeShizukuService @Keep constructor(
                 )
             }
         }.toString()
+
+    @Suppress("DEPRECATION")
+    override fun listInstalledAppsJson(): String {
+        val packageManager = privilegedContext.packageManager
+        val launcherIntent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+        val launchables = packageManager.queryIntentActivities(
+            launcherIntent,
+            PackageManager.MATCH_DISABLED_COMPONENTS,
+        )
+        val uniqueApps = linkedMapOf<String, JSONObject>()
+        launchables
+            .sortedWith(
+                compareBy(
+                    { it.loadLabel(packageManager).toString().lowercase() },
+                    { it.activityInfo.packageName },
+                )
+            )
+            .forEach { info ->
+                val activityInfo = info.activityInfo ?: return@forEach
+                val applicationInfo = activityInfo.applicationInfo ?: return@forEach
+                val packageName = activityInfo.packageName.orEmpty()
+                if (packageName.isBlank() || uniqueApps.containsKey(packageName)) return@forEach
+                uniqueApps[packageName] = JSONObject().apply {
+                    put("package_name", packageName)
+                    put("app_name", info.loadLabel(packageManager).toString())
+                    put("activity_name", activityInfo.name.orEmpty())
+                    put("enabled", activityInfo.enabled && applicationInfo.enabled)
+                    put("system", applicationInfo.flags and ApplicationInfo.FLAG_SYSTEM != 0)
+                    put("launchable", true)
+                }
+            }
+        return JSONArray(uniqueApps.values).toString()
+    }
+
+    private fun contextForCurrentProcess(baseContext: Context): Context {
+        val packageName = packageNameForCurrentProcess(baseContext.packageName)
+        if (packageName == baseContext.packageName) return baseContext
+        return baseContext.createPackageContext(packageName, Context.CONTEXT_IGNORE_SECURITY)
+    }
+
+    private fun packageNameForCurrentProcess(defaultPackageName: String): String =
+        when (Process.myUid()) {
+            Process.SHELL_UID -> ShellPackageName
+            Process.SYSTEM_UID -> SystemPackageName
+            else -> defaultPackageName
+        }
 
     private fun agentVirtualDisplayFlags(): Int =
         VirtualDisplayFlagPublic or
@@ -386,5 +549,28 @@ class AetherAgentModeShizukuService @Keep constructor(
         val prefixed = KeyEvent.keyCodeFromString("KEYCODE_${normalized.uppercase()}")
         if (prefixed != KeyEvent.KEYCODE_UNKNOWN) return prefixed
         error("Unsupported key code '$rawValue'.")
+    }
+
+    companion object {
+        private fun resolveLegacyUserServiceContext(): Context {
+            val activityThreadClass = Class.forName("android.app.ActivityThread")
+            val currentActivityThread = activityThreadClass
+                .getDeclaredMethod("currentActivityThread")
+                .apply { isAccessible = true }
+                .invoke(null)
+            val currentApplication = activityThreadClass
+                .getDeclaredMethod("currentApplication")
+                .apply { isAccessible = true }
+                .invoke(null) as? Context
+            if (currentApplication != null) return currentApplication
+            if (currentActivityThread != null) {
+                val systemContext = activityThreadClass
+                    .getDeclaredMethod("getSystemContext")
+                    .apply { isAccessible = true }
+                    .invoke(currentActivityThread) as? Context
+                if (systemContext != null) return systemContext
+            }
+            error("Unable to create an Android context for Shizuku Agent Mode service.")
+        }
     }
 }

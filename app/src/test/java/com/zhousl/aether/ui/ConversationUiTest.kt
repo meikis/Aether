@@ -32,6 +32,7 @@ class ConversationUiTest {
                 isSending = true,
                 pendingAssistantText = "",
                 pendingStatusText = "",
+                lastVisibleMessageAuthor = MessageAuthor.User,
             ),
         )
     }
@@ -44,6 +45,34 @@ class ConversationUiTest {
                 isSending = true,
                 pendingAssistantText = "Streaming body text",
                 pendingStatusText = "",
+                lastVisibleMessageAuthor = MessageAuthor.User,
+            ),
+        )
+    }
+
+    @Test
+    fun pendingIndicatorHidesThinkingAfterAgentMessageAppears() {
+        assertEquals(
+            PendingGenerationIndicator.None,
+            pendingGenerationIndicator(
+                isSending = true,
+                pendingAssistantText = "",
+                pendingStatusText = "",
+                lastVisibleMessageAuthor = MessageAuthor.Agent,
+            ),
+        )
+    }
+
+    @Test
+    fun pendingIndicatorHidesThinkingWhilePendingWorkIsVisible() {
+        assertEquals(
+            PendingGenerationIndicator.None,
+            pendingGenerationIndicator(
+                isSending = true,
+                pendingAssistantText = "",
+                pendingStatusText = "",
+                hasVisiblePendingWork = true,
+                lastVisibleMessageAuthor = MessageAuthor.User,
             ),
         )
     }
@@ -57,6 +86,7 @@ class ConversationUiTest {
                 pendingAssistantText = "",
                 pendingStatusText = "",
                 hasVisiblePendingReasoning = hasVisibleReasoningStatus(ReasoningTrace(id = "empty")),
+                lastVisibleMessageAuthor = MessageAuthor.User,
             ),
         )
     }
@@ -72,6 +102,7 @@ class ConversationUiTest {
                 hasVisiblePendingReasoning = hasVisibleReasoningStatus(
                     ReasoningTrace(id = "reasoning", latestStatusText = "Checking"),
                 ),
+                lastVisibleMessageAuthor = MessageAuthor.User,
             ),
         )
     }
@@ -84,6 +115,7 @@ class ConversationUiTest {
                 isSending = true,
                 pendingAssistantText = "Streaming body text",
                 pendingStatusText = "Reconnecting...",
+                lastVisibleMessageAuthor = MessageAuthor.User,
             ),
         )
     }
@@ -96,6 +128,41 @@ class ConversationUiTest {
                 isSending = false,
                 pendingAssistantText = "",
                 pendingStatusText = "",
+                lastVisibleMessageAuthor = MessageAuthor.Agent,
+            ),
+        )
+    }
+
+    @Test
+    fun pendingGenerationBlockHidesCommittedTextEcho() {
+        val reply = "I'm doing great, thank you for asking!"
+
+        assertEquals(
+            false,
+            shouldRenderPendingGenerationBlock(
+                isSending = true,
+                pendingResponseBlocks = listOf(
+                    AssistantResponseBlock.Text(id = "pending-text", text = reply),
+                ),
+                pendingToolInvocations = emptyList(),
+                pendingStatusText = "",
+                lastVisibleAgentText = reply,
+            ),
+        )
+    }
+
+    @Test
+    fun pendingGenerationBlockKeepsDistinctPendingText() {
+        assertEquals(
+            true,
+            shouldRenderPendingGenerationBlock(
+                isSending = true,
+                pendingResponseBlocks = listOf(
+                    AssistantResponseBlock.Text(id = "pending-text", text = "Still streaming"),
+                ),
+                pendingToolInvocations = emptyList(),
+                pendingStatusText = "",
+                lastVisibleAgentText = "Previous reply",
             ),
         )
     }

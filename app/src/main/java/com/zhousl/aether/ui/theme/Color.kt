@@ -83,8 +83,8 @@ internal val DarkAetherPalette = AetherPalette(
 
 private var currentPalette by mutableStateOf(LightAetherPalette)
 
-internal fun updateAetherPalette(themeMode: AppThemeMode) {
-    val palette = if (themeMode == AppThemeMode.Dark) {
+internal fun updateAetherPalette(darkTheme: Boolean) {
+    val palette = if (darkTheme) {
         DarkAetherPalette
     } else {
         LightAetherPalette

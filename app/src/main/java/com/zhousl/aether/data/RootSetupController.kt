@@ -4,13 +4,13 @@ import android.content.Context
 import com.zhousl.aether.termux.TermuxBashTool
 import com.zhousl.aether.termux.TermuxContract
 import java.io.File
+import java.io.InputStream
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
 private const val RootProbeTimeoutMillis = 1_500L
 private const val RootSetupTimeoutMillis = 30_000L
-private const val TermuxLaunchForBackgroundMarker = "AETHER_TERMUX_LAUNCHED_FOR_BACKGROUND"
 
 enum class RootSetupIssue {
     Unknown,
@@ -65,6 +65,7 @@ class RootSetupController(
     suspend fun configureLocalAccess(): RootSetupState = withContext(Dispatchers.IO) {
         val suPath = findSuPath()
         if (suPath.isBlank()) {
+            bashTool.setRootBackgroundLaunchEnabled(false)
             return@withContext RootSetupState(
                 issue = RootSetupIssue.Unavailable,
                 detail = "No su binary was detected on this device.",
@@ -73,6 +74,7 @@ class RootSetupController(
             )
         }
         if (!isTermuxInstalled()) {
+            bashTool.setRootBackgroundLaunchEnabled(false)
             return@withContext RootSetupState(
                 issue = RootSetupIssue.TermuxNotInstalled,
                 detail = "Install Termux before using root automatic setup.",
@@ -87,6 +89,7 @@ class RootSetupController(
             timeoutMillis = RootSetupTimeoutMillis,
         )
         if (commandResult.timedOut || commandResult.exitCode != 0) {
+            bashTool.setRootBackgroundLaunchEnabled(false)
             val detail = commandResult.combinedOutput().ifBlank {
                 if (commandResult.timedOut) {
                     "Root request timed out. Grant su to Aether, then try again."
@@ -107,30 +110,14 @@ class RootSetupController(
             )
         }
 
-        val didLaunchTermuxForBackground =
-            commandResult.stdout.contains(TermuxLaunchForBackgroundMarker)
-        val termuxSetup = bashTool.inspectSetup()
-        if (termuxSetup.isReady) {
-            RootSetupState(
-                issue = RootSetupIssue.Ready,
-                detail = "Root setup completed. Termux command access and Agent Mode Root authorization are ready.",
-                rootAvailable = true,
-                suPath = suPath,
-                didLaunchTermuxForBackground = didLaunchTermuxForBackground,
-                lastUpdatedMillis = System.currentTimeMillis(),
-            )
-        } else {
-            RootSetupState(
-                issue = RootSetupIssue.Failed,
-                detail = termuxSetup.detail.ifBlank {
-                    "Root setup finished, but Termux still did not accept the setup probe."
-                },
-                rootAvailable = true,
-                suPath = suPath,
-                didLaunchTermuxForBackground = didLaunchTermuxForBackground,
-                lastUpdatedMillis = System.currentTimeMillis(),
-            )
-        }
+        bashTool.setRootBackgroundLaunchEnabled(true)
+        RootSetupState(
+            issue = RootSetupIssue.Ready,
+            detail = "Root setup completed. Aether will keep Termux available in the background when needed.",
+            rootAvailable = true,
+            suPath = suPath,
+            lastUpdatedMillis = System.currentTimeMillis(),
+        )
     }
 
     private fun isTermuxInstalled(): Boolean = runCatching {
@@ -170,20 +157,21 @@ class RootSetupController(
             )
         }
 
+        val stdoutReader = process.inputStream.startReadingText()
+        val stderrReader = process.errorStream.startReadingText()
         val finished = process.waitFor(timeoutMillis, TimeUnit.MILLISECONDS)
         if (!finished) {
             runCatching { process.destroy() }
             if (!process.waitFor(800, TimeUnit.MILLISECONDS)) {
                 runCatching { process.destroyForcibly() }
+                process.waitFor(800, TimeUnit.MILLISECONDS)
             }
+            runCatching { process.inputStream.close() }
+            runCatching { process.errorStream.close() }
         }
 
-        val stdout = runCatching {
-            process.inputStream.bufferedReader().readText()
-        }.getOrDefault("")
-        val stderr = runCatching {
-            process.errorStream.bufferedReader().readText()
-        }.getOrDefault("")
+        val stdout = stdoutReader.awaitText()
+        val stderr = stderrReader.awaitText()
         return RootCommandResult(
             exitCode = if (finished) process.exitValue() else -1,
             stdout = stdout,
@@ -216,32 +204,6 @@ class RootSetupController(
         termux_bash="${'$'}termux_data/files/usr/bin/bash"
         props_dir="${'$'}termux_home/.termux"
         props="${'$'}props_dir/termux.properties"
-        did_launch_termux=false
-
-        launch_app() {
-          package_name="${'$'}1"
-          am start --user "${'$'}current_user" \
-            -a android.intent.action.MAIN \
-            -c android.intent.category.LAUNCHER \
-            -p "${'$'}package_name" >/dev/null 2>&1 && return 0
-
-          resolved_activity="${'$'}(
-            cmd package resolve-activity --brief "${'$'}package_name" 2>/dev/null |
-              tail -n 1
-          )"
-          if [ -n "${'$'}resolved_activity" ] && printf '%s' "${'$'}resolved_activity" | grep -q '/'; then
-            am start --user "${'$'}current_user" -n "${'$'}resolved_activity" >/dev/null 2>&1 && return 0
-          fi
-
-          monkey --user "${'$'}current_user" -p "${'$'}package_name" 1 >/dev/null 2>&1
-        }
-
-        is_package_running() {
-          package_name="${'$'}1"
-          pidof "${'$'}package_name" >/dev/null 2>&1 && return 0
-          pgrep -f "^${'$'}package_name([:]|${'$'})" >/dev/null 2>&1 && return 0
-          return 1
-        }
 
         app_id="${'$'}(
           cmd package dump "${'$'}termux_pkg" 2>/dev/null |
@@ -264,16 +226,9 @@ class RootSetupController(
         fi
         chmod 700 "${'$'}termux_home" 2>/dev/null || true
 
-        should_launch_termux=false
-        if ! is_package_running "${'$'}termux_pkg"; then
-          should_launch_termux=true
-        fi
-
         if [ ! -x "${'$'}termux_bash" ]; then
-          launch_app "${'$'}termux_pkg" || true
-          did_launch_termux=true
-          launch_app "${'$'}aether_pkg" || true
-          sleep 5
+          printf '%s\n' 'Termux is installed but its bash runtime is not initialized. Open Termux once, then retry Root setup.' >&2
+          exit 25
         fi
 
         mkdir -p "${'$'}props_dir" || exit 21
@@ -297,19 +252,34 @@ class RootSetupController(
           cmd package grant "${'$'}aether_pkg" "${'$'}run_command_permission" >/dev/null 2>&1 ||
           true
         am broadcast --user "${'$'}current_user" -a com.termux.app.reload_style -p "${'$'}termux_pkg" >/dev/null 2>&1 || true
-        if [ "${'$'}should_launch_termux" = true ] && [ "${'$'}did_launch_termux" != true ]; then
-          launch_app "${'$'}termux_pkg" || true
-          did_launch_termux=true
-        fi
-        if [ "${'$'}did_launch_termux" = true ]; then
-          echo $TermuxLaunchForBackgroundMarker
-          launch_app "${'$'}aether_pkg" || true
-        fi
         echo AETHER_ROOT_SETUP_READY
     """.trimIndent()
 
     private fun escapeForSingleQuoted(value: String): String =
         value.replace("'", "'\"'\"'")
+
+    private fun InputStream.startReadingText(): ProcessStreamReader {
+        val output = StringBuffer()
+        val thread = Thread(
+            {
+                runCatching {
+                    bufferedReader().use { reader ->
+                        output.append(reader.readText())
+                    }
+                }
+            },
+            "AetherRootSetupStreamReader",
+        ).apply {
+            isDaemon = true
+            start()
+        }
+        return ProcessStreamReader(thread, output)
+    }
+
+    private fun ProcessStreamReader.awaitText(): String {
+        runCatching { thread.join(800) }
+        return output.toString()
+    }
 
     private fun looksLikeRootDenied(value: String): Boolean {
         val normalized = value.lowercase()
@@ -319,6 +289,11 @@ class RootSetupController(
             "su:" in normalized
     }
 }
+
+private data class ProcessStreamReader(
+    val thread: Thread,
+    val output: StringBuffer,
+)
 
 private data class RootCommandResult(
     val exitCode: Int,

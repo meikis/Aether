@@ -10,9 +10,12 @@ fun resolveStoredOrAutomaticModelKey(
     options: List<ProviderModelOption>,
     purpose: AutomaticModelPurpose,
     fallbackPurpose: AutomaticModelPurpose? = null,
+    preferredAutomaticModelKey: String = "",
 ): String = normalizeSelectableModelKey(modelKey, options)
     .ifBlank {
-        options.resolveAutomaticModelKey(purpose).ifBlank {
+        normalizeSelectableModelKey(preferredAutomaticModelKey, options).ifBlank {
+            options.resolveAutomaticModelKey(purpose)
+        }.ifBlank {
             fallbackPurpose?.let(options::resolveAutomaticModelKey).orEmpty()
         }
     }
@@ -55,6 +58,22 @@ fun resolveDefaultNamingModelKey(
     )
 }
 
+fun resolveDefaultCompactingModelKey(
+    settings: AppSettings,
+    providerConfigs: List<LlmProviderConfig>,
+): String {
+    val options = providerConfigs.availableModelOptions()
+    return resolveStoredOrAutomaticModelKey(
+        modelKey = settings.defaultCompactingModelKey,
+        options = options,
+        purpose = AutomaticModelPurpose.Compacting,
+        fallbackPurpose = AutomaticModelPurpose.Chat,
+        preferredAutomaticModelKey = options
+            .filter { it.providerType == LlmProvider.OpenAiResponses }
+            .resolveAutomaticModelKey(AutomaticModelPurpose.Compacting),
+    )
+}
+
 fun resolveModelSettings(
     baseSettings: AppSettings,
     providerConfigs: List<LlmProviderConfig>,
@@ -63,6 +82,8 @@ fun resolveModelSettings(
 ): AppSettings {
     val options = providerConfigs.availableModelOptions()
     val selectedOption = options.findModelOption(preferredModelKey)
+        ?: options.firstOrNull { it.modelId == preferredModelKey }
+        ?: options.firstOrNull { it.fullLabel == preferredModelKey }
         ?: options.findModelOption(fallbackModelKey)
         ?: options.firstOrNull()
     return selectedOption?.let(baseSettings::withModelOption) ?: baseSettings

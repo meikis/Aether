@@ -197,60 +197,53 @@ fun MarkdownContent(
     val normalizedMarkdown = remember(markdown) { markdown.replace("\r\n", "\n") }
     val blocks = remember(normalizedMarkdown) { parseMarkdown(normalizedMarkdown) }
 
-    Column(
-        modifier = modifier,
-        verticalArrangement = Arrangement.spacedBy(14.dp),
-    ) {
-        blocks.forEach { block ->
-            when (block) {
-                is MarkdownBlock.Paragraph -> SelectableMarkdownBlock {
-                    MarkdownParagraph(block.text, color, onLinkClick, fadeSpan)
+    SelectionContainer {
+        Column(
+            modifier = modifier,
+            verticalArrangement = Arrangement.spacedBy(14.dp),
+        ) {
+            blocks.forEach { block ->
+                when (block) {
+                    is MarkdownBlock.Paragraph -> {
+                        MarkdownParagraph(block.text, color, onLinkClick, fadeSpan)
+                    }
+
+                    is MarkdownBlock.Heading -> {
+                        MarkdownHeading(block.level, block.text, onLinkClick, fadeSpan)
+                    }
+
+                    is MarkdownBlock.UnorderedList -> {
+                        MarkdownBullets(block.items, onLinkClick, fadeSpan)
+                    }
+
+                    is MarkdownBlock.OrderedList -> {
+                        MarkdownNumbers(block.items, onLinkClick, fadeSpan)
+                    }
+
+                    is MarkdownBlock.Quote -> {
+                        MarkdownQuote(block.text, onLinkClick, fadeSpan)
+                    }
+
+                    is MarkdownBlock.Table -> {
+                        MarkdownTable(block.headers, block.rows, onLinkClick, fadeSpan)
+                    }
+
+                    is MarkdownBlock.CodeFence -> {
+                        MarkdownCodeFence(block.code, fadeSpan)
+                    }
+
+                    is MarkdownBlock.Image -> MarkdownImageBlock(
+                        image = block.image,
+                        workspaceDirectory = workspaceDirectory,
+                        allowRootImageRead = allowRootImageRead,
+                        onLinkClick = onLinkClick,
+                    )
+
+                    is MarkdownBlock.Mermaid -> MarkdownMermaidBlock(block.diagram)
+                    MarkdownBlock.Rule -> HorizontalDivider(color = AetherOutlineSoft)
                 }
-
-                is MarkdownBlock.Heading -> SelectableMarkdownBlock {
-                    MarkdownHeading(block.level, block.text, onLinkClick, fadeSpan)
-                }
-
-                is MarkdownBlock.UnorderedList -> SelectableMarkdownBlock {
-                    MarkdownBullets(block.items, onLinkClick, fadeSpan)
-                }
-
-                is MarkdownBlock.OrderedList -> SelectableMarkdownBlock {
-                    MarkdownNumbers(block.items, onLinkClick, fadeSpan)
-                }
-
-                is MarkdownBlock.Quote -> SelectableMarkdownBlock {
-                    MarkdownQuote(block.text, onLinkClick, fadeSpan)
-                }
-
-                is MarkdownBlock.Table -> SelectableMarkdownBlock {
-                    MarkdownTable(block.headers, block.rows, onLinkClick, fadeSpan)
-                }
-
-                is MarkdownBlock.CodeFence -> SelectableMarkdownBlock {
-                    MarkdownCodeFence(block.code, fadeSpan)
-                }
-
-                is MarkdownBlock.Image -> MarkdownImageBlock(
-                    image = block.image,
-                    workspaceDirectory = workspaceDirectory,
-                    allowRootImageRead = allowRootImageRead,
-                    onLinkClick = onLinkClick,
-                )
-
-                is MarkdownBlock.Mermaid -> MarkdownMermaidBlock(block.diagram)
-                MarkdownBlock.Rule -> HorizontalDivider(color = AetherOutlineSoft)
             }
         }
-    }
-}
-
-@Composable
-private fun SelectableMarkdownBlock(
-    content: @Composable () -> Unit,
-) {
-    SelectionContainer {
-        content()
     }
 }
 

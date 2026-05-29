@@ -8,8 +8,10 @@ import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import org.json.JSONArray
+import org.json.JSONObject
 
 private val Context.dataStore by preferencesDataStore(name = "aether_settings")
 
@@ -17,18 +19,31 @@ class SettingsRepository(
     private val context: Context,
 ) {
     val settings: Flow<AppSettings> = context.dataStore.data.map { preferences ->
+        val defaults = AppSettings()
+        val storedWorkspaceMode = AgentWorkspaceMode.fromStorage(preferences[AGENT_WORKSPACE_MODE])
         AppSettings(
             provider = LlmProvider.fromStorage(preferences[PROVIDER]),
             apiKey = preferences[API_KEY].orEmpty(),
-            baseUrl = preferences[BASE_URL] ?: AppSettings().baseUrl,
-            modelId = preferences[MODEL_ID] ?: AppSettings().modelId,
-            systemPrompt = preferences[SYSTEM_PROMPT] ?: AppSettings().systemPrompt,
+            baseUrl = preferences[BASE_URL] ?: defaults.baseUrl,
+            modelId = preferences[MODEL_ID] ?: defaults.modelId,
+            systemPrompt = preferences[SYSTEM_PROMPT] ?: defaults.systemPrompt,
             tavilyApiKey = preferences[TAVILY_API_KEY].orEmpty(),
+            tavilyBaseUrl = normalizeTavilyBaseUrl(preferences[TAVILY_BASE_URL] ?: defaults.tavilyBaseUrl),
             llmInactivityReconnectTimeoutSeconds = normalizeLlmInactivityReconnectTimeoutSeconds(
                 preferences[LLM_INACTIVITY_RECONNECT_TIMEOUT_SECONDS]
             ),
             keepTasksRunningInBackground = preferences[KEEP_TASKS_RUNNING_IN_BACKGROUND] ?: true,
             notifyOnTaskCompletion = preferences[NOTIFY_ON_TASK_COMPLETION] ?: true,
+            agentWorkspaceMode = if (preferences[WORKSPACE_MODE_INITIALIZED] == true) {
+                storedWorkspaceMode
+            } else {
+                defaults.agentWorkspaceMode
+            },
+            termuxSetupCompleted = preferences[TERMUX_SETUP_COMPLETED] ?: false,
+            termuxSetupNoticeDismissed = preferences[TERMUX_SETUP_NOTICE_DISMISSED] ?: false,
+            termuxEnvironmentVariables = parseTermuxEnvironmentVariables(
+                preferences[TERMUX_ENVIRONMENT_VARIABLES].orEmpty()
+            ),
             agentModeAuthorizationEnabled = preferences[AGENT_MODE_AUTHORIZATION_ENABLED] ?: false,
             agentModeAuthorizationMethod = AgentModeAuthorizationMethod.fromStorage(
                 preferences[AGENT_MODE_AUTHORIZATION_METHOD],
@@ -39,6 +54,7 @@ class SettingsRepository(
             defaultChatModelKey = preferences[DEFAULT_CHAT_MODEL_KEY].orEmpty(),
             defaultTitleModelKey = preferences[DEFAULT_TITLE_MODEL_KEY].orEmpty(),
             defaultNamingModelKey = preferences[DEFAULT_NAMING_MODEL_KEY].orEmpty(),
+            defaultCompactingModelKey = preferences[DEFAULT_COMPACTING_MODEL_KEY].orEmpty(),
             unsupportedParallelToolCallProviderKeys = parseStoredStringList(
                 preferences[UNSUPPORTED_PARALLEL_TOOL_CALL_PROVIDER_KEYS].orEmpty()
             ),
@@ -84,13 +100,34 @@ class SettingsRepository(
     ) {
         context.dataStore.edit { prefs ->
             val current = parseProviderConfigs(prefs[PROVIDER_CONFIGS].orEmpty())
+            val currentProvider = LlmProvider.fromStorage(prefs[PROVIDER])
+            val currentApiKey = prefs[API_KEY].orEmpty()
+            val currentBaseUrl = prefs[BASE_URL] ?: AppSettings().baseUrl
+            val currentModelId = prefs[MODEL_ID] ?: AppSettings().modelId
+            val toggledConfigWasCurrent = current
+                .firstOrNull { it.id == id }
+                ?.matchesStoredModel(
+                    provider = currentProvider,
+                    apiKey = currentApiKey,
+                    baseUrl = currentBaseUrl,
+                    modelId = currentModelId,
+                ) == true
             val updated = current.map { config ->
                 if (config.id == id) config.copy(isEnabled = enabled) else config
             }
             prefs[PROVIDER_CONFIGS] = serializeProviderConfigs(updated)
 
-            val fallbackOption = updated.availableModelOptions().firstOrNull()
-            if (fallbackOption != null) {
+            val availableOptions = updated.availableModelOptions()
+            val currentStillAvailable = availableOptions.any {
+                it.matchesStoredModel(
+                    provider = currentProvider,
+                    apiKey = currentApiKey,
+                    baseUrl = currentBaseUrl,
+                    modelId = currentModelId,
+                )
+            }
+            val fallbackOption = availableOptions.firstOrNull()
+            if (!enabled && toggledConfigWasCurrent && !currentStillAvailable && fallbackOption != null) {
                 prefs[PROVIDER] = fallbackOption.providerType.storageValue
                 prefs[API_KEY] = fallbackOption.apiKey
                 prefs[BASE_URL] = fallbackOption.baseUrl
@@ -112,12 +149,19 @@ class SettingsRepository(
             it[MODEL_ID] = settings.modelId
             it[SYSTEM_PROMPT] = settings.systemPrompt
             it[TAVILY_API_KEY] = settings.tavilyApiKey
+            it[TAVILY_BASE_URL] = normalizeTavilyBaseUrl(settings.tavilyBaseUrl)
             it[LLM_INACTIVITY_RECONNECT_TIMEOUT_SECONDS] =
                 normalizeLlmInactivityReconnectTimeoutSeconds(
                     settings.llmInactivityReconnectTimeoutSeconds
                 )
             it[KEEP_TASKS_RUNNING_IN_BACKGROUND] = settings.keepTasksRunningInBackground
             it[NOTIFY_ON_TASK_COMPLETION] = settings.notifyOnTaskCompletion
+            it[AGENT_WORKSPACE_MODE] = settings.agentWorkspaceMode.storageValue
+            it[WORKSPACE_MODE_INITIALIZED] = true
+            it[TERMUX_SETUP_COMPLETED] = settings.termuxSetupCompleted
+            it[TERMUX_SETUP_NOTICE_DISMISSED] = settings.termuxSetupNoticeDismissed
+            it[TERMUX_ENVIRONMENT_VARIABLES] =
+                serializeTermuxEnvironmentVariables(settings.termuxEnvironmentVariables)
             it[AGENT_MODE_AUTHORIZATION_ENABLED] = settings.agentModeAuthorizationEnabled
             it[AGENT_MODE_AUTHORIZATION_METHOD] = settings.agentModeAuthorizationMethod.storageValue
             it[LANGUAGE] = settings.language.storageValue
@@ -125,6 +169,7 @@ class SettingsRepository(
             it[DEFAULT_CHAT_MODEL_KEY] = settings.defaultChatModelKey
             it[DEFAULT_TITLE_MODEL_KEY] = settings.defaultTitleModelKey
             it[DEFAULT_NAMING_MODEL_KEY] = settings.defaultNamingModelKey
+            it[DEFAULT_COMPACTING_MODEL_KEY] = settings.defaultCompactingModelKey
             it[UNSUPPORTED_PARALLEL_TOOL_CALL_PROVIDER_KEYS] =
                 serializeStoredStringList(settings.unsupportedParallelToolCallProviderKeys)
             it[BASIC_FUNCTION_CALLING_COMPATIBILITY_MODE] = settings.basicFunctionCallingCompatibilityMode
@@ -156,6 +201,10 @@ class SettingsRepository(
         context.dataStore.edit { it[TAVILY_API_KEY] = value }
     }
 
+    suspend fun updateTavilyBaseUrl(value: String) {
+        context.dataStore.edit { it[TAVILY_BASE_URL] = normalizeTavilyBaseUrl(value) }
+    }
+
     suspend fun updateLanguage(language: AppLanguage) {
         context.dataStore.edit { it[LANGUAGE] = language.storageValue }
     }
@@ -172,12 +221,19 @@ class SettingsRepository(
             it[MODEL_ID] = settings.modelId
             it[SYSTEM_PROMPT] = settings.systemPrompt
             it[TAVILY_API_KEY] = settings.tavilyApiKey
+            it[TAVILY_BASE_URL] = normalizeTavilyBaseUrl(settings.tavilyBaseUrl)
             it[LLM_INACTIVITY_RECONNECT_TIMEOUT_SECONDS] =
                 normalizeLlmInactivityReconnectTimeoutSeconds(
                     settings.llmInactivityReconnectTimeoutSeconds
                 )
             it[KEEP_TASKS_RUNNING_IN_BACKGROUND] = settings.keepTasksRunningInBackground
             it[NOTIFY_ON_TASK_COMPLETION] = settings.notifyOnTaskCompletion
+            it[AGENT_WORKSPACE_MODE] = settings.agentWorkspaceMode.storageValue
+            it[WORKSPACE_MODE_INITIALIZED] = true
+            it[TERMUX_SETUP_COMPLETED] = settings.termuxSetupCompleted
+            it[TERMUX_SETUP_NOTICE_DISMISSED] = settings.termuxSetupNoticeDismissed
+            it[TERMUX_ENVIRONMENT_VARIABLES] =
+                serializeTermuxEnvironmentVariables(settings.termuxEnvironmentVariables)
             it[AGENT_MODE_AUTHORIZATION_ENABLED] = settings.agentModeAuthorizationEnabled
             it[AGENT_MODE_AUTHORIZATION_METHOD] = settings.agentModeAuthorizationMethod.storageValue
             it[LANGUAGE] = settings.language.storageValue
@@ -185,6 +241,7 @@ class SettingsRepository(
             it[DEFAULT_CHAT_MODEL_KEY] = settings.defaultChatModelKey
             it[DEFAULT_TITLE_MODEL_KEY] = settings.defaultTitleModelKey
             it[DEFAULT_NAMING_MODEL_KEY] = settings.defaultNamingModelKey
+            it[DEFAULT_COMPACTING_MODEL_KEY] = settings.defaultCompactingModelKey
             it[UNSUPPORTED_PARALLEL_TOOL_CALL_PROVIDER_KEYS] =
                 serializeStoredStringList(settings.unsupportedParallelToolCallProviderKeys)
             it[BASIC_FUNCTION_CALLING_COMPATIBILITY_MODE] = settings.basicFunctionCallingCompatibilityMode
@@ -231,6 +288,11 @@ class SettingsRepository(
         }
     }
 
+    suspend fun isWorkspaceModeInitialized(): Boolean =
+        context.dataStore.data.map { preferences ->
+            preferences[WORKSPACE_MODE_INITIALIZED] ?: false
+        }.first()
+
     private companion object {
         val PROVIDER = stringPreferencesKey("provider")
         val API_KEY = stringPreferencesKey("api_key")
@@ -238,12 +300,22 @@ class SettingsRepository(
         val MODEL_ID = stringPreferencesKey("model_id")
         val SYSTEM_PROMPT = stringPreferencesKey("system_prompt")
         val TAVILY_API_KEY = stringPreferencesKey("tavily_api_key")
+        val TAVILY_BASE_URL = stringPreferencesKey("tavily_base_url")
         val LLM_INACTIVITY_RECONNECT_TIMEOUT_SECONDS =
             intPreferencesKey("llm_inactivity_reconnect_timeout_seconds")
         val KEEP_TASKS_RUNNING_IN_BACKGROUND =
             booleanPreferencesKey("keep_tasks_running_in_background")
         val NOTIFY_ON_TASK_COMPLETION =
             booleanPreferencesKey("notify_on_task_completion")
+        val AGENT_WORKSPACE_MODE = stringPreferencesKey("agent_workspace_mode")
+        val WORKSPACE_MODE_INITIALIZED =
+            booleanPreferencesKey("workspace_mode_initialized")
+        val TERMUX_SETUP_COMPLETED =
+            booleanPreferencesKey("termux_setup_completed")
+        val TERMUX_SETUP_NOTICE_DISMISSED =
+            booleanPreferencesKey("termux_setup_notice_dismissed")
+        val TERMUX_ENVIRONMENT_VARIABLES =
+            stringPreferencesKey("termux_environment_variables")
         val AGENT_MODE_AUTHORIZATION_ENABLED =
             booleanPreferencesKey("agent_mode_authorization_enabled")
         val AGENT_MODE_AUTHORIZATION_METHOD =
@@ -253,6 +325,7 @@ class SettingsRepository(
         val DEFAULT_CHAT_MODEL_KEY = stringPreferencesKey("default_chat_model_key")
         val DEFAULT_TITLE_MODEL_KEY = stringPreferencesKey("default_title_model_key")
         val DEFAULT_NAMING_MODEL_KEY = stringPreferencesKey("default_naming_model_key")
+        val DEFAULT_COMPACTING_MODEL_KEY = stringPreferencesKey("default_compacting_model_key")
         val UNSUPPORTED_PARALLEL_TOOL_CALL_PROVIDER_KEYS =
             stringPreferencesKey("unsupported_parallel_tool_call_provider_keys")
         val BASIC_FUNCTION_CALLING_COMPATIBILITY_MODE =
@@ -265,6 +338,28 @@ class SettingsRepository(
         const val MaxUnsupportedParallelToolCallKeys = 128
     }
 }
+
+private fun LlmProviderConfig.matchesStoredModel(
+    provider: LlmProvider,
+    apiKey: String,
+    baseUrl: String,
+    modelId: String,
+): Boolean =
+    providerType == provider &&
+        this.apiKey.trim() == apiKey.trim() &&
+        this.baseUrl.trim() == baseUrl.trim() &&
+        enabledModels().contains(modelId.trim())
+
+private fun ProviderModelOption.matchesStoredModel(
+    provider: LlmProvider,
+    apiKey: String,
+    baseUrl: String,
+    modelId: String,
+): Boolean =
+    providerType == provider &&
+        this.apiKey.trim() == apiKey.trim() &&
+        this.baseUrl.trim() == baseUrl.trim() &&
+        this.modelId.trim() == modelId.trim()
 
 private fun parseStoredStringList(rawValue: String): List<String> {
     if (rawValue.isBlank()) return emptyList()
@@ -287,6 +382,56 @@ private fun serializeStoredStringList(values: List<String>): String =
             .filter(String::isNotEmpty)
             .distinct()
             .forEach(::put)
+    }.toString()
+
+private val TermuxEnvironmentVariableNamePattern = Regex("^[A-Za-z_][A-Za-z0-9_]*$")
+
+fun normalizeTermuxEnvironmentVariables(
+    variables: List<TermuxEnvironmentVariable>,
+): List<TermuxEnvironmentVariable> =
+    variables
+        .mapNotNull { variable ->
+            val name = variable.name.trim()
+            if (!TermuxEnvironmentVariableNamePattern.matches(name)) {
+                null
+            } else {
+                TermuxEnvironmentVariable(name = name, value = variable.value)
+            }
+        }
+        .distinctBy { it.name }
+
+private fun parseTermuxEnvironmentVariables(rawValue: String): List<TermuxEnvironmentVariable> {
+    if (rawValue.isBlank()) return emptyList()
+    return runCatching {
+        val array = JSONArray(rawValue)
+        normalizeTermuxEnvironmentVariables(
+            buildList {
+                for (index in 0 until array.length()) {
+                    val item = array.optJSONObject(index) ?: continue
+                    add(
+                        TermuxEnvironmentVariable(
+                            name = item.optString("name"),
+                            value = item.optString("value"),
+                        )
+                    )
+                }
+            }
+        )
+    }.getOrDefault(emptyList())
+}
+
+private fun serializeTermuxEnvironmentVariables(
+    variables: List<TermuxEnvironmentVariable>,
+): String =
+    JSONArray().apply {
+        normalizeTermuxEnvironmentVariables(variables).forEach { variable ->
+            put(
+                JSONObject().apply {
+                    put("name", variable.name)
+                    put("value", variable.value)
+                }
+            )
+        }
     }.toString()
 
 private val ShizukuManagerPackages = listOf(

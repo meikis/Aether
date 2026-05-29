@@ -89,12 +89,32 @@ enum class AppLanguage(
 enum class AppThemeMode(
     val storageValue: String,
 ) {
+    System("system"),
     Light("light"),
     Dark("dark");
 
     companion object {
         fun fromStorage(value: String?): AppThemeMode =
-            entries.firstOrNull { it.storageValue == value } ?: Light
+            entries.firstOrNull { it.storageValue == value } ?: System
+    }
+}
+
+enum class AgentWorkspaceMode(
+    val storageValue: String,
+    val displayName: String,
+) {
+    Shared(
+        storageValue = "shared",
+        displayName = "Single Workspace",
+    ),
+    PerSession(
+        storageValue = "per_session",
+        displayName = "Independent Workspaces",
+    );
+
+    companion object {
+        fun fromStorage(value: String?): AgentWorkspaceMode =
+            entries.firstOrNull { it.storageValue == value } ?: Shared
     }
 }
 
@@ -103,24 +123,41 @@ data class AppSettings(
     val apiKey: String = "",
     val baseUrl: String = LlmProvider.OpenAiCompatible.defaultBaseUrl,
     val modelId: String = LlmProvider.OpenAiCompatible.defaultModelId,
+    val customHeaders: List<LlmCustomHeader> = emptyList(),
     val systemPrompt: String = "You are Aether, a local-first Android agent that can call tools and complete tasks on-device. Use available tools instead of guessing local state.",
     val tavilyApiKey: String = "",
+    val tavilyBaseUrl: String = DefaultTavilyBaseUrl,
     val llmInactivityReconnectTimeoutSeconds: Int = DefaultLlmInactivityReconnectTimeoutSeconds,
     val keepTasksRunningInBackground: Boolean = true,
     val notifyOnTaskCompletion: Boolean = true,
+    val agentWorkspaceMode: AgentWorkspaceMode = AgentWorkspaceMode.Shared,
+    val termuxSetupCompleted: Boolean = false,
+    val termuxSetupNoticeDismissed: Boolean = false,
+    val termuxEnvironmentVariables: List<TermuxEnvironmentVariable> = emptyList(),
     val agentModeAuthorizationEnabled: Boolean = false,
     val agentModeAuthorizationMethod: AgentModeAuthorizationMethod = AgentModeAuthorizationMethod.Shizuku,
     val language: AppLanguage = defaultAppLanguage(),
-    val themeMode: AppThemeMode = AppThemeMode.Light,
+    val themeMode: AppThemeMode = AppThemeMode.System,
     val defaultChatModelKey: String = "",
     val defaultTitleModelKey: String = "",
     val defaultNamingModelKey: String = "",
+    val defaultCompactingModelKey: String = "",
     val unsupportedParallelToolCallProviderKeys: List<String> = emptyList(),
     val basicFunctionCallingCompatibilityMode: Boolean = false,
     val onboardingSeenVersion: Int = 0,
     val onboardingCompletedVersion: Int = 0,
     val privacyPolicyAccepted: Boolean = false,
     val lastUpdateCheckAtMillis: Long = 0L,
+)
+
+data class LlmCustomHeader(
+    val name: String,
+    val value: String,
+)
+
+data class TermuxEnvironmentVariable(
+    val name: String,
+    val value: String,
 )
 
 const val CurrentOnboardingVersion = 1
@@ -148,6 +185,9 @@ fun normalizeLlmInactivityReconnectTimeoutSeconds(
         MaxLlmInactivityReconnectTimeoutSeconds,
     )
 }
+
+fun normalizeTavilyBaseUrl(value: String): String =
+    value.trim().ifBlank { DefaultTavilyBaseUrl }
 
 fun AppSettings.shouldLaunchOnboarding(
     onboardingVersion: Int = CurrentOnboardingVersion,
@@ -223,16 +263,6 @@ fun usesOfficialVertexEndpoint(
         host.endsWith("-aiplatform.googleapis.com")
 }
 
-fun shouldShowResumeSetupBanner(
-    settings: AppSettings,
-    messageCount: Int,
-    draftInput: String,
-    hasDraftAttachments: Boolean,
-): Boolean = messageCount == 0 &&
-    !settings.isOnboardingComplete() &&
-    draftInput.isBlank() &&
-    !hasDraftAttachments
-
 fun shouldMarkOnboardingCompleted(
     settings: AppSettings,
     isSuccessfulAssistantReply: Boolean,
@@ -255,8 +285,10 @@ data class LlmProviderConfig(
     val apiKey: String,
     val baseUrl: String,
     val modelId: String,
-    val cachedModels: List<String> = listOf(modelId),
-    val enabledModelIds: List<String> = cachedModels,
+    val manualModelIds: List<String> = listOf(modelId),
+    val customHeaders: List<LlmCustomHeader> = emptyList(),
+    val cachedModels: List<String> = emptyList(),
+    val enabledModelIds: List<String> = cachedModels + manualModelIds,
     val isEnabled: Boolean = true,
     val basicFunctionCallingCompatibilityMode: Boolean = false,
     val createdAtMillis: Long = System.currentTimeMillis(),
@@ -271,6 +303,8 @@ internal fun LlmProviderConfig.toJson(): JSONObject = JSONObject().apply {
     put("apiKey", apiKey)
     put("baseUrl", baseUrl)
     put("modelId", modelId)
+    put("manualModelIds", JSONArray().apply { manualModelIds.forEach(::put) })
+    put("customHeaders", customHeaders.toJsonArray())
     put("cachedModels", JSONArray().apply { cachedModels.forEach(::put) })
     put("enabledModelIds", JSONArray().apply { enabledModelIds.forEach(::put) })
     put("isEnabled", isEnabled)
@@ -294,13 +328,20 @@ internal fun parseProviderConfigs(rawValue: String): List<LlmProviderConfig> {
                 val modelId = json.optString("modelId").trim()
                     .ifBlank { providerType.defaultModelId }
                 val enabledModelIds = json.optJSONArray("enabledModelIds").toStringListSafe()
+                val manualModelIds = if (json.has("manualModelIds")) {
+                    json.optJSONArray("manualModelIds").toStringListSafe()
+                } else {
+                    listOf(modelId)
+                }
                 val cachedModels = normalizeStringList(
                     buildList {
                         addAll(json.optJSONArray("cachedModels").toStringListSafe())
-                        add(modelId)
-                        addAll(enabledModelIds)
+                        if (!json.has("manualModelIds")) {
+                            removeAll(manualModelIds)
+                        }
                     }
                 )
+                val availableModels = normalizeStringList(cachedModels + manualModelIds)
                 val inferredProviderId = providerName
                     .sanitizeProviderId()
                     .ifBlank { "${providerType.storageValue}_${index + 1}" }
@@ -313,11 +354,13 @@ internal fun parseProviderConfigs(rawValue: String): List<LlmProviderConfig> {
                         apiKey = json.optString("apiKey"),
                         baseUrl = baseUrl,
                         modelId = modelId,
+                        manualModelIds = manualModelIds,
+                        customHeaders = parseCustomHeaders(json.optJSONArray("customHeaders")),
                         cachedModels = cachedModels,
                         enabledModelIds = if (json.has("enabledModelIds")) {
-                            normalizeStringList(enabledModelIds.filter(cachedModels::contains))
+                            normalizeStringList(enabledModelIds.filter(availableModels::contains))
                         } else {
-                            cachedModels
+                            availableModels
                         },
                         isEnabled = if (json.has("isEnabled")) {
                             json.optBoolean("isEnabled", true)
@@ -339,6 +382,34 @@ internal fun parseProviderConfigs(rawValue: String): List<LlmProviderConfig> {
 
 internal fun serializeProviderConfigs(configs: List<LlmProviderConfig>): String =
     JSONArray().apply { configs.forEach { put(it.toJson()) } }.toString()
+
+internal fun List<LlmCustomHeader>.toJsonArray(): JSONArray = JSONArray().apply {
+    forEach { header ->
+        put(
+            JSONObject().apply {
+                put("name", header.name)
+                put("value", header.value)
+            }
+        )
+    }
+}
+
+internal fun parseCustomHeaders(array: JSONArray?): List<LlmCustomHeader> {
+    if (array == null) return emptyList()
+    return buildList {
+        for (index in 0 until array.length()) {
+            val json = array.optJSONObject(index) ?: continue
+            val name = json.optString("name").trim()
+            if (name.isBlank()) continue
+            add(
+                LlmCustomHeader(
+                    name = name,
+                    value = json.optString("value"),
+                )
+            )
+        }
+    }.distinctBy { it.name.lowercase(Locale.US) }
+}
 
 private fun JSONArray?.toStringListSafe(): List<String> {
     if (this == null) return emptyList()
@@ -374,7 +445,7 @@ fun buildModelOptionKey(
     modelId: String,
 ): String = "$providerConfigId::$modelId"
 
-fun LlmProviderConfig.availableModels(): List<String> = normalizeStringList(cachedModels + modelId)
+fun LlmProviderConfig.availableModels(): List<String> = normalizeStringList(cachedModels + manualModelIds)
 
 fun LlmProviderConfig.enabledModels(): List<String> = normalizeStringList(
     enabledModelIds.filter { availableModels().contains(it) }
@@ -389,6 +460,7 @@ data class ProviderModelOption(
     val apiKey: String,
     val baseUrl: String,
     val modelId: String,
+    val customHeaders: List<LlmCustomHeader>,
     val basicFunctionCallingCompatibilityMode: Boolean,
     val fullLabel: String,
     val chatLabel: String,
@@ -398,6 +470,7 @@ enum class AutomaticModelPurpose {
     Chat,
     Title,
     Naming,
+    Compacting,
 }
 
 fun List<LlmProviderConfig>.availableModelOptions(
@@ -430,6 +503,7 @@ fun List<LlmProviderConfig>.availableModelOptions(
                 apiKey = config.apiKey,
                 baseUrl = config.baseUrl.trim(),
                 modelId = normalizedModelId,
+                customHeaders = config.customHeaders,
                 basicFunctionCallingCompatibilityMode = config.basicFunctionCallingCompatibilityMode,
                 fullLabel = fullLabel,
                 chatLabel = if ((modelCounts[normalizedModelId] ?: 0) > 1) fullLabel else normalizedModelId,
@@ -443,6 +517,7 @@ fun AppSettings.withModelOption(option: ProviderModelOption): AppSettings = copy
     apiKey = option.apiKey.trim(),
     baseUrl = option.baseUrl.trim(),
     modelId = option.modelId.trim(),
+    customHeaders = option.customHeaders,
     basicFunctionCallingCompatibilityMode = option.basicFunctionCallingCompatibilityMode,
 )
 
@@ -483,11 +558,14 @@ private fun automaticModelPriority(
         }
 
         AutomaticModelPurpose.Title,
-        AutomaticModelPurpose.Naming -> when {
+        AutomaticModelPurpose.Naming,
+        AutomaticModelPurpose.Compacting -> when {
             isGemini3Flash -> 0
             isGemini31FlashLite -> 1
             normalized.contains("gpt54mini") -> 2
             normalized.contains("claude") && normalized.contains("haiku") && normalized.contains("46") -> 3
+            normalized.contains("gpt54") -> 4
+            normalized.contains("claude") && normalized.contains("sonnet") -> 5
             else -> null
         }
     }

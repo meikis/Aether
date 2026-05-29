@@ -39,6 +39,7 @@ object LlmApiClient {
         connection.requestMethod = "GET"
         connection.setRequestProperty("Authorization", "Bearer ${config.apiKey}")
         connection.setRequestProperty("Content-Type", "application/json")
+        connection.applyAetherLlmHeaders(config.customHeaders)
         connection.connectTimeout = 15_000
         connection.readTimeout = 30_000
 
@@ -103,6 +104,7 @@ object LlmApiClient {
         connection.setRequestProperty("x-api-key", config.apiKey)
         connection.setRequestProperty("anthropic-version", "2023-06-01")
         connection.setRequestProperty("Content-Type", "application/json")
+        connection.applyAetherLlmHeaders(config.customHeaders)
         connection.connectTimeout = 15_000
         connection.readTimeout = 30_000
 

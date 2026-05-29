@@ -61,16 +61,64 @@ class ModelSelectionResolverTest {
         assertEquals("gpt-5.4", resolved.modelId)
     }
 
+    @Test
+    fun resolveDefaultCompactingModelPrefersSummaryOptimizedAutomaticModel() {
+        val chatConfig = providerConfig(
+            id = "chat-provider",
+            providerId = "chat",
+            baseUrl = "https://chat.example/v1",
+            modelId = "gpt-5.4",
+        )
+        val compactConfig = providerConfig(
+            id = "compact-provider",
+            providerId = "compact",
+            baseUrl = "https://compact.example/v1",
+            modelId = "gemini-3-flash-preview",
+        )
+
+        val resolved = resolveDefaultCompactingModelKey(
+            settings = AppSettings(),
+            providerConfigs = listOf(chatConfig, compactConfig),
+        )
+
+        assertEquals(buildModelOptionKey(compactConfig.id, compactConfig.modelId), resolved)
+    }
+
+    @Test
+    fun resolveDefaultCompactingModelPrefersOpenAiResponsesProvider() {
+        val chatOptimizedConfig = providerConfig(
+            id = "chat-optimized-provider",
+            providerId = "chat-optimized",
+            baseUrl = "https://chat.example/v1",
+            modelId = "gemini-3-flash-preview",
+        )
+        val openAiResponsesConfig = providerConfig(
+            id = "openai-responses-provider",
+            providerId = "openai",
+            baseUrl = "https://api.openai.com/v1",
+            modelId = "gpt-5.4",
+            providerType = LlmProvider.OpenAiResponses,
+        )
+
+        val resolved = resolveDefaultCompactingModelKey(
+            settings = AppSettings(),
+            providerConfigs = listOf(chatOptimizedConfig, openAiResponsesConfig),
+        )
+
+        assertEquals(buildModelOptionKey(openAiResponsesConfig.id, openAiResponsesConfig.modelId), resolved)
+    }
+
     private fun providerConfig(
         id: String,
         providerId: String,
         baseUrl: String,
         modelId: String,
+        providerType: LlmProvider = LlmProvider.OpenAiCompatible,
     ): LlmProviderConfig = LlmProviderConfig(
         id = id,
         providerId = providerId,
         name = providerId,
-        providerType = LlmProvider.OpenAiCompatible,
+        providerType = providerType,
         apiKey = "test-key",
         baseUrl = baseUrl,
         modelId = modelId,

@@ -6,6 +6,7 @@ import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.SideEffect
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -111,14 +112,19 @@ private val AetherTypography = Typography(
 
 @Composable
 fun AetherTheme(
-    themeMode: AppThemeMode = AppThemeMode.Light,
+    themeMode: AppThemeMode = AppThemeMode.System,
     content: @Composable () -> Unit
 ) {
+    val darkTheme = when (themeMode) {
+        AppThemeMode.System -> isSystemInDarkTheme()
+        AppThemeMode.Light -> false
+        AppThemeMode.Dark -> true
+    }
     SideEffect {
-        updateAetherPalette(themeMode)
+        updateAetherPalette(darkTheme)
     }
     MaterialTheme(
-        colorScheme = if (themeMode == AppThemeMode.Dark) DarkAetherColors else LightAetherColors,
+        colorScheme = if (darkTheme) DarkAetherColors else LightAetherColors,
         typography = AetherTypography,
         content = content
     )

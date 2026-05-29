@@ -50,6 +50,7 @@ internal class QueuedTurnRequestBuilder(
             activeSkills = selection.activeSkills,
             activeMcpServerIds = selection.activeMcpServerIds,
             agentModeEnabled = selection.agentModeEnabled,
+            providerConfigs = providerConfigs,
         )
     }
 

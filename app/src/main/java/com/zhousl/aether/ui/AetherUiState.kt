@@ -9,6 +9,7 @@ import com.zhousl.aether.data.InstalledSkill
 import com.zhousl.aether.data.LlmProviderConfig
 import com.zhousl.aether.data.McpServerConfig
 import com.zhousl.aether.data.RootSetupState
+import com.zhousl.aether.data.ScheduledTask
 import com.zhousl.aether.data.SessionExecutionState
 import com.zhousl.aether.termux.TermuxSetupState
 
@@ -38,6 +39,12 @@ enum class RootSetupProgressReturnPage {
 enum class MessageAuthor {
     User,
     Agent,
+}
+
+enum class MessageDisplayKind {
+    Standard,
+    HiddenContext,
+    CompactStatus,
 }
 
 enum class AttachmentKind {
@@ -73,6 +80,9 @@ data class ChatAttachment(
     val workspacePath: String = "",
     val workspaceState: AttachmentWorkspaceState = AttachmentWorkspaceState.Ready,
     val workspaceError: String = "",
+    val workspaceBytesCopied: Long = 0L,
+    val workspaceBytesPerSecond: Long = 0L,
+    val inlineBase64: String = "",
 )
 
 data class ChatToolInvocation(
@@ -145,6 +155,8 @@ data class ChatMessage(
     val branchGroup: ChatBranchGroup? = null,
     val responseGroupId: String? = null,
     val assistantActionsHidden: Boolean = false,
+    val providerPayloadJson: String = "",
+    val displayKind: MessageDisplayKind = MessageDisplayKind.Standard,
 )
 
 data class ChatSession(
@@ -194,13 +206,16 @@ data class AetherUiState(
     val pendingAssistantText: String = "",
     val pendingStatusText: String = "",
     val pendingStatusDetail: String = "",
+    val compactingSessionId: String? = null,
     val sessionExecutionStates: Map<String, SessionExecutionState> = emptyMap(),
     val unviewedCompletedSessionIds: Set<String> = emptySet(),
     val termuxSetupState: TermuxSetupState = TermuxSetupState(),
+    val developerTermuxReadyOverride: Boolean? = null,
     val rootSetupState: RootSetupState = RootSetupState(),
     val rootSetupProgressReturnPage: RootSetupProgressReturnPage? = null,
     val installedSkills: List<InstalledSkill> = emptyList(),
     val mcpServers: List<McpServerConfig> = emptyList(),
+    val scheduledTasks: List<ScheduledTask> = emptyList(),
     val providerConfigs: List<LlmProviderConfig> = emptyList(),
     val isFetchingModels: Boolean = false,
     val showStarterPromptHint: Boolean = false,

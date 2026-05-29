@@ -16,8 +16,10 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.ArrowDropDown
 import androidx.compose.material.icons.rounded.Check
+import androidx.compose.material.icons.rounded.Delete
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
@@ -48,6 +50,7 @@ import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.unit.dp
 import com.zhousl.aether.data.LlmProvider
 import com.zhousl.aether.data.LlmProviderConfig
+import com.zhousl.aether.data.LlmCustomHeader
 import com.zhousl.aether.data.isProviderSetupValid
 import com.zhousl.aether.data.isValidProviderId
 import com.zhousl.aether.data.requiresApiKey
@@ -68,6 +71,7 @@ class ProviderFormState internal constructor(
     apiKey: String,
     baseUrl: String,
     modelId: String,
+    customHeaders: List<LlmCustomHeader>,
     cachedModels: List<String>,
     enabledModelIds: List<String>,
     basicFunctionCallingCompatibilityMode: Boolean,
@@ -80,6 +84,7 @@ class ProviderFormState internal constructor(
     var apiKey by mutableStateOf(apiKey)
     var baseUrl by mutableStateOf(baseUrl)
     var modelId by mutableStateOf(modelId)
+    var customHeaders by mutableStateOf(customHeaders)
     var cachedModels by mutableStateOf(cachedModels)
     var enabledModelIds by mutableStateOf(enabledModelIds)
     var basicFunctionCallingCompatibilityMode by mutableStateOf(basicFunctionCallingCompatibilityMode)
@@ -91,14 +96,15 @@ class ProviderFormState internal constructor(
         get() = LlmProvider.fromStorage(providerStorageValue)
 
     val allModels: List<String>
-        get() = (cachedModels + modelId)
-            .map(String::trim)
-            .filter(String::isNotEmpty)
-            .distinct()
+        get() = normalizeModelIds(cachedModels + manualModelIds)
+
+    private val manualModelIds: List<String>
+        get() = parseManualModelIds(modelId)
 
     val effectiveModelId: String
         get() = enabledModelIds.firstOrNull()
-            ?: modelId.trim().ifBlank { allModels.firstOrNull().orEmpty() }
+            ?: manualModelIds.firstOrNull()
+            ?: allModels.firstOrNull().orEmpty()
 
     val isCurrentlyEnabled: Boolean
         get() = existingConfig?.isEnabled ?: true
@@ -159,10 +165,11 @@ class ProviderFormState internal constructor(
         model: String,
         enabled: Boolean,
     ) {
+        val normalizedModel = model.trim()
         enabledModelIds = if (enabled) {
-            (enabledModelIds + model).map(String::trim).filter(String::isNotEmpty).distinct()
+            normalizeModelIds(enabledModelIds + normalizedModel)
         } else {
-            enabledModelIds.filterNot { it == model }
+            enabledModelIds.filterNot { it == normalizedModel }
         }
     }
 
@@ -173,12 +180,32 @@ class ProviderFormState internal constructor(
             .filter(String::isNotEmpty)
             .distinct()
         cachedModels = normalizedModels
-        enabledModelIds = normalizedModels.filter { model ->
-            enabledModelIds.contains(model) || !normalizedCurrent.contains(model)
+        val availableModels = normalizeModelIds(normalizedModels + manualModelIds)
+        val newlyFetchedModels = normalizedModels.filter { model -> !normalizedCurrent.contains(model) }
+        enabledModelIds = normalizeModelIds(enabledModelIds + newlyFetchedModels)
+            .filter(availableModels::contains)
+    }
+
+    fun addCustomHeader() {
+        customHeaders = customHeaders + LlmCustomHeader("", "")
+    }
+
+    fun updateCustomHeader(
+        index: Int,
+        name: String = customHeaders.getOrNull(index)?.name.orEmpty(),
+        value: String = customHeaders.getOrNull(index)?.value.orEmpty(),
+    ) {
+        customHeaders = customHeaders.mapIndexed { headerIndex, header ->
+            if (headerIndex == index) {
+                header.copy(name = name, value = value)
+            } else {
+                header
+            }
         }
-        if (modelId.trim().isBlank() || modelId !in (normalizedModels + modelId)) {
-            modelId = normalizedModels.firstOrNull().orEmpty()
-        }
+    }
+
+    fun removeCustomHeader(index: Int) {
+        customHeaders = customHeaders.filterIndexed { headerIndex, _ -> headerIndex != index }
     }
 
     fun buildConfig(): LlmProviderConfig = LlmProviderConfig(
@@ -189,7 +216,11 @@ class ProviderFormState internal constructor(
         apiKey = apiKey.trim(),
         baseUrl = baseUrl.trim(),
         modelId = effectiveModelId.ifBlank { selectedProvider.defaultModelId },
-        cachedModels = allModels,
+        manualModelIds = manualModelIds,
+        customHeaders = customHeaders
+            .map { header -> LlmCustomHeader(header.name.trim(), header.value) }
+            .filter { header -> header.name.isNotBlank() },
+        cachedModels = normalizeModelIds(cachedModels),
         enabledModelIds = enabledModelIds
             .map(String::trim)
             .filter { it.isNotEmpty() && allModels.contains(it) }
@@ -203,7 +234,10 @@ class ProviderFormState internal constructor(
         fun fromConfig(existingConfig: LlmProviderConfig?): ProviderFormState {
             val initialProvider = existingConfig?.providerType ?: LlmProvider.OpenAiCompatible
             val initialModelId = existingConfig?.modelId ?: initialProvider.defaultModelId
-            val initialModels = (existingConfig?.cachedModels.orEmpty() + initialModelId)
+            val initialManualModels = existingConfig?.manualModelIds
+                ?.takeIf { it.isNotEmpty() }
+                ?: listOf(initialModelId)
+            val initialModels = (existingConfig?.cachedModels.orEmpty() + initialManualModels)
                 .map(String::trim)
                 .filter(String::isNotEmpty)
                 .distinct()
@@ -222,8 +256,9 @@ class ProviderFormState internal constructor(
                 providerStorageValue = initialProvider.storageValue,
                 apiKey = existingConfig?.apiKey.orEmpty(),
                 baseUrl = existingConfig?.baseUrl ?: initialProvider.defaultBaseUrl,
-                modelId = initialModelId,
-                cachedModels = initialModels,
+                modelId = initialManualModels.joinToString("\n"),
+                customHeaders = existingConfig?.customHeaders.orEmpty(),
+                cachedModels = existingConfig?.cachedModels.orEmpty(),
                 enabledModelIds = initialEnabledModels,
                 basicFunctionCallingCompatibilityMode =
                     existingConfig?.basicFunctionCallingCompatibilityMode ?: false,
@@ -337,7 +372,7 @@ fun ProviderConfigurationForm(
             )
             ProviderFormDivider()
             ProviderFormTextField(
-                label = "Manual model ID",
+                label = "Manual model IDs",
                 value = state.modelId,
                 onValueChange = { state.modelId = it },
             )
@@ -354,6 +389,13 @@ fun ProviderConfigurationForm(
                         state.isFetchingModelsLocally = false
                     }
                 },
+            )
+            ProviderFormDivider()
+            ProviderCustomHeadersField(
+                headers = state.customHeaders,
+                onAddHeader = state::addCustomHeader,
+                onUpdateHeader = state::updateCustomHeader,
+                onRemoveHeader = state::removeCustomHeader,
             )
         }
 
@@ -381,6 +423,7 @@ private fun providerFormStateSaver(
             state.apiKey,
             state.baseUrl,
             state.modelId,
+            state.customHeaders.map { listOf(it.name, it.value) },
             state.cachedModels,
             state.enabledModelIds,
             state.basicFunctionCallingCompatibilityMode,
@@ -390,6 +433,21 @@ private fun providerFormStateSaver(
     },
     restore = { restored ->
         @Suppress("UNCHECKED_CAST")
+        val customHeadersIndex = 6
+        val hasCustomHeaders = restored.size >= 12
+        val modelIndexOffset = if (hasCustomHeaders) 1 else 0
+        val restoredCustomHeaders = if (hasCustomHeaders) {
+            (restored[customHeadersIndex] as List<*>)
+                .mapNotNull { item ->
+                    val values = item as? List<*> ?: return@mapNotNull null
+                    LlmCustomHeader(
+                        name = values.getOrNull(0) as? String ?: "",
+                        value = values.getOrNull(1) as? String ?: "",
+                    )
+                }
+        } else {
+            existingConfig?.customHeaders.orEmpty()
+        }
         ProviderFormState(
             existingConfig = existingConfig,
             providerId = restored[0] as String,
@@ -398,16 +456,26 @@ private fun providerFormStateSaver(
             apiKey = restored[3] as String,
             baseUrl = restored[4] as String,
             modelId = restored[5] as String,
-            cachedModels = restored[6] as List<String>,
-            enabledModelIds = restored[7] as List<String>,
-            basicFunctionCallingCompatibilityMode = restored.getOrNull(8) as? Boolean
+            customHeaders = restoredCustomHeaders,
+            cachedModels = restored[6 + modelIndexOffset] as List<String>,
+            enabledModelIds = restored[7 + modelIndexOffset] as List<String>,
+            basicFunctionCallingCompatibilityMode = restored.getOrNull(8 + modelIndexOffset) as? Boolean
                 ?: existingConfig?.basicFunctionCallingCompatibilityMode
                 ?: false,
-            providerIdManuallyEdited = restored.getOrNull(9) as? Boolean ?: (existingConfig != null),
-            lastAutoGeneratedProviderId = restored.getOrNull(10) as? String ?: restored[0] as String,
+            providerIdManuallyEdited = restored.getOrNull(9 + modelIndexOffset) as? Boolean ?: (existingConfig != null),
+            lastAutoGeneratedProviderId = restored.getOrNull(10 + modelIndexOffset) as? String ?: restored[0] as String,
         )
     },
 )
+
+internal fun parseManualModelIds(value: String): List<String> =
+    normalizeModelIds(value.split('\n', ',', ';').map(String::trim))
+
+private fun normalizeModelIds(values: List<String>): List<String> =
+    values
+        .map(String::trim)
+        .filter(String::isNotEmpty)
+        .distinct()
 
 @Composable
 private fun ProviderCompatibilityModeField(
@@ -652,6 +720,95 @@ private fun ProviderModelListField(
                     }
                 }
             }
+        }
+    }
+}
+
+@Composable
+private fun ProviderCustomHeadersField(
+    headers: List<LlmCustomHeader>,
+    onAddHeader: () -> Unit,
+    onUpdateHeader: (Int, String, String) -> Unit,
+    onRemoveHeader: (Int) -> Unit,
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 14.dp),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween,
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = "Custom request headers",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = AetherOnSurfaceVariant,
+                )
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    text = if (headers.isEmpty()) "Optional" else "${headers.size} configured",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = AetherOnSurface,
+                )
+            }
+            IconButton(onClick = onAddHeader) {
+                Icon(
+                    imageVector = Icons.Rounded.Add,
+                    contentDescription = "Add header",
+                    tint = ProviderFormPrimary,
+                )
+            }
+        }
+
+        if (headers.isNotEmpty()) {
+            Spacer(modifier = Modifier.height(10.dp))
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                headers.forEachIndexed { index, header ->
+                    ProviderCustomHeaderRow(
+                        header = header,
+                        onNameChange = { name -> onUpdateHeader(index, name, header.value) },
+                        onValueChange = { value -> onUpdateHeader(index, header.name, value) },
+                        onRemove = { onRemoveHeader(index) },
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ProviderCustomHeaderRow(
+    header: LlmCustomHeader,
+    onNameChange: (String) -> Unit,
+    onValueChange: (String) -> Unit,
+    onRemove: () -> Unit,
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        ProviderFormTextField(
+            label = "Header",
+            value = header.name,
+            onValueChange = onNameChange,
+            modifier = Modifier.weight(0.42f),
+        )
+        ProviderFormTextField(
+            label = "Value",
+            value = header.value,
+            onValueChange = onValueChange,
+            modifier = Modifier.weight(0.58f),
+        )
+        IconButton(onClick = onRemove) {
+            Icon(
+                imageVector = Icons.Rounded.Delete,
+                contentDescription = "Remove header",
+                tint = AetherOnSurfaceVariant,
+            )
         }
     }
 }

@@ -99,6 +99,179 @@ class OpenAiCompatibleClientProviderFormatsTest {
     }
 
     @Test
+    fun chatCompletionParsesOpenAiTokenUsage() = runBlocking {
+        val server = MockWebServer()
+        server.enqueue(
+            MockResponse()
+                .addHeader("Content-Type", "application/json")
+                .setBody(
+                    """
+                    {
+                      "choices": [
+                        {
+                          "message": {
+                            "role": "assistant",
+                            "content": "Done."
+                          }
+                        }
+                      ],
+                      "usage": {
+                        "prompt_tokens": 11,
+                        "completion_tokens": 7,
+                        "total_tokens": 18,
+                        "completion_tokens_details": {
+                          "reasoning_tokens": 3
+                        },
+                        "prompt_tokens_details": {
+                          "cached_tokens": 5
+                        }
+                      }
+                    }
+                    """.trimIndent()
+                )
+        )
+        server.start()
+
+        try {
+            val result = client.createChatCompletion(
+                settings = AppSettings(
+                    provider = LlmProvider.OpenAiCompatible,
+                    apiKey = "test-key",
+                    baseUrl = server.url("/v1").toString(),
+                    modelId = "gpt-test",
+                ),
+                systemPrompt = "",
+                conversation = listOf(
+                    JSONObject().apply {
+                        put("role", "user")
+                        put("content", "Hello")
+                    }
+                ),
+            ).getOrThrow()
+
+            val usage = result.tokenUsage!!
+            assertEquals(11L, usage.inputTokens)
+            assertEquals(7L, usage.outputTokens)
+            assertEquals(18L, usage.totalTokens)
+            assertEquals(3L, usage.reasoningTokens)
+            assertEquals(5L, usage.cachedInputTokens)
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun vertexGenerateContentParsesTokenUsage() = runBlocking {
+        val server = MockWebServer()
+        server.enqueue(
+            MockResponse()
+                .addHeader("Content-Type", "application/json")
+                .setBody(
+                    """
+                    {
+                      "candidates": [
+                        {
+                          "content": {
+                            "role": "model",
+                            "parts": [
+                              { "text": "Done." }
+                            ]
+                          }
+                        }
+                      ],
+                      "usageMetadata": {
+                        "promptTokenCount": 13,
+                        "candidatesTokenCount": 8,
+                        "totalTokenCount": 21,
+                        "cachedContentTokenCount": 4
+                      }
+                    }
+                    """.trimIndent()
+                )
+        )
+        server.start()
+
+        try {
+            val result = client.createChatCompletion(
+                settings = AppSettings(
+                    provider = LlmProvider.VertexExpress,
+                    apiKey = "test-key",
+                    baseUrl = server.url("/v1").toString(),
+                    modelId = "gemini-test",
+                ),
+                systemPrompt = "",
+                conversation = listOf(
+                    JSONObject().apply {
+                        put("role", "user")
+                        put("parts", org.json.JSONArray().put(JSONObject().put("text", "Hello")))
+                    }
+                ),
+            ).getOrThrow()
+
+            val usage = result.tokenUsage!!
+            assertEquals(13L, usage.inputTokens)
+            assertEquals(8L, usage.outputTokens)
+            assertEquals(21L, usage.totalTokens)
+            assertEquals(4L, usage.cachedInputTokens)
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun llmRequestsIncludeAetherUserAgentAndCustomHeaders() = runBlocking {
+        val server = MockWebServer()
+        server.enqueue(
+            MockResponse()
+                .addHeader("Content-Type", "application/json")
+                .setBody(
+                    """
+                    {
+                      "choices": [
+                        {
+                          "message": {
+                            "role": "assistant",
+                            "content": "Done."
+                          }
+                        }
+                      ]
+                    }
+                    """.trimIndent()
+                )
+        )
+        server.start()
+
+        try {
+            val settings = AppSettings(
+                provider = LlmProvider.OpenAiCompatible,
+                apiKey = "test-key",
+                baseUrl = server.url("/v1").toString(),
+                modelId = "gpt-test",
+                customHeaders = listOf(
+                    LlmCustomHeader("X-Aether-Test", "enabled"),
+                ),
+            )
+
+            client.createChatCompletion(
+                settings = settings,
+                systemPrompt = "",
+                conversation = listOf(
+                    JSONObject().apply {
+                        put("role", "user")
+                        put("content", "Hello")
+                    }
+                ),
+            ).getOrThrow()
+
+            val request = server.takeRequest()
+            assertEquals(AetherLlmUserAgent, request.getHeader("User-Agent"))
+            assertEquals("enabled", request.getHeader("X-Aether-Test"))
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
     fun disableReasoningAddsDeepSeekThinkingDisabledParameter() = runBlocking {
         val server = MockWebServer()
         server.enqueue(

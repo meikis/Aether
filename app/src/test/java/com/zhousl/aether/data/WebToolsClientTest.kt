@@ -107,4 +107,29 @@ class WebToolsClientTest {
             server.shutdown()
         }
     }
+
+    @Test
+    fun tavilySearchAcceptsFullSearchEndpoint() = runBlocking {
+        val server = MockWebServer()
+        server.enqueue(
+            MockResponse()
+                .addHeader("Content-Type", "application/json")
+                .setBody("""{"query":"android agent","results":[]}"""),
+        )
+        server.start()
+
+        try {
+            val client = WebToolsClient()
+            client.searchTavily(
+                apiKey = "tvly-test",
+                baseUrl = server.url("/proxy/tavily/search").toString(),
+                request = TavilySearchRequest(query = "android agent"),
+            ).getOrThrow()
+
+            val request = server.takeRequest()
+            assertEquals("/proxy/tavily/search", request.path)
+        } finally {
+            server.shutdown()
+        }
+    }
 }

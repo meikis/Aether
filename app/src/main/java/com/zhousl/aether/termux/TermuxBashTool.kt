@@ -8,8 +8,12 @@ import android.os.Build
 import android.util.Log
 import androidx.core.content.ContextCompat
 import com.zhousl.aether.BuildConfig
+import com.zhousl.aether.data.AetherDiagnosticLogger
+import com.zhousl.aether.data.TermuxEnvironmentVariable
+import com.zhousl.aether.data.normalizeTermuxEnvironmentVariables
 import java.util.Base64
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
@@ -39,6 +43,7 @@ enum class TermuxSetupIssue {
 data class TermuxSetupState(
     val issue: TermuxSetupIssue = TermuxSetupIssue.Ready,
     val detail: String = "",
+    val previouslyConfigured: Boolean = false,
 ) {
     val isReady: Boolean
         get() = issue == TermuxSetupIssue.Ready
@@ -46,7 +51,20 @@ data class TermuxSetupState(
 
 class TermuxBashTool(
     private val context: Context,
+    private val diagnosticLogger: AetherDiagnosticLogger = AetherDiagnosticLogger.NoOp,
 ) {
+    private val environmentVariables = AtomicReference<List<TermuxEnvironmentVariable>>(emptyList())
+
+    fun setEnvironmentVariables(variables: List<TermuxEnvironmentVariable>) {
+        environmentVariables.set(normalizeTermuxEnvironmentVariables(variables))
+    }
+
+    @Suppress("UNUSED_PARAMETER")
+    fun setRootBackgroundLaunchEnabled(enabled: Boolean) {
+        // Root setup can configure Termux files, but command dispatch should not
+        // auto-launch Termux when it is not already running in the background.
+    }
+
     suspend fun inspectSetup(): TermuxSetupState = withContext(Dispatchers.IO) {
         if (!isTermuxInstalled()) {
             return@withContext TermuxSetupState(
@@ -215,6 +233,7 @@ class TermuxBashTool(
     suspend fun executeCommand(
         command: String,
         workingDirectory: String = TermuxContract.HomeDirectory,
+        awaitTimeoutMillis: Long = InternalCommandTimeoutMillis,
     ): String = withContext(Dispatchers.IO) {
         val normalizedWorkingDirectory = normalizeTermuxPath(workingDirectory)
         prepareWorkingDirectoryIfNeeded(normalizedWorkingDirectory)?.let { raw ->
@@ -230,7 +249,7 @@ class TermuxBashTool(
         dispatchCommand(
             command = command,
             workingDirectory = normalizedWorkingDirectory,
-            awaitTimeoutMillis = InternalCommandTimeoutMillis,
+            awaitTimeoutMillis = awaitTimeoutMillis,
         )
     }
 
@@ -374,6 +393,20 @@ class TermuxBashTool(
             )
         }
 
+        return dispatchCommandToTermuxService(
+            command = command,
+            workingDirectory = workingDirectory,
+            awaitTimeoutMillis = awaitTimeoutMillis,
+            startedAt = startedAt,
+        )
+    }
+
+    private suspend fun dispatchCommandToTermuxService(
+        command: String,
+        workingDirectory: String,
+        awaitTimeoutMillis: Long?,
+        startedAt: Long,
+    ): String {
         val executionId = TermuxPendingResults.nextExecutionId()
         val deferred = TermuxPendingResults.register(executionId)
         val resultIntent = Intent(context, TermuxResultReceiver::class.java)
@@ -396,7 +429,10 @@ class TermuxBashTool(
             action = TermuxContract.RunCommandAction
             putExtra(TermuxContract.RunCommandPathExtra, TermuxContract.BashPath)
             putExtra(TermuxContract.RunCommandArgumentsExtra, arrayOf("-s"))
-            putExtra(TermuxContract.RunCommandStdinExtra, command)
+            putExtra(
+                TermuxContract.RunCommandStdinExtra,
+                buildTermuxDispatchScript(command, environmentVariables.get()),
+            )
             putExtra(TermuxContract.RunCommandWorkdirExtra, workingDirectory)
             putExtra(TermuxContract.RunCommandBackgroundExtra, true)
             putExtra(TermuxContract.RunCommandPendingIntentExtra, pendingIntent)
@@ -868,6 +904,11 @@ class TermuxBashTool(
     ) {
         builder.appendLine("#!/data/data/com.termux/files/usr/bin/bash")
         builder.appendLine("set -euo pipefail")
+        appendTermuxShellEnvironment(
+            builder = builder,
+            includeShellStartupPath = true,
+            environmentVariables = environmentVariables.get(),
+        )
         builder.appendLine("now_ms() {")
         builder.appendLine("  date +%s%3N")
         builder.appendLine("}")
@@ -991,6 +1032,11 @@ class TermuxBashTool(
             .take(120)
 
 private fun logTermux(message: String) {
+    diagnosticLogger.event(
+        category = "termux",
+        event = "trace",
+        details = mapOf("message" to message),
+    )
     if (EnableTermuxLogging) {
         Log.d(TermuxLogTag, message)
     }
@@ -1046,6 +1092,76 @@ internal object TermuxManagedRuns {
     fun nextRunId(): String = "run-${System.currentTimeMillis()}-${nextId.getAndIncrement()}"
 }
 
+private fun buildTermuxDispatchScript(
+    command: String,
+    environmentVariables: List<TermuxEnvironmentVariable>,
+): String = buildString {
+    appendTermuxShellEnvironment(
+        builder = this,
+        includeShellStartupPath = false,
+        environmentVariables = environmentVariables,
+    )
+    appendLine(command)
+}
+
+internal fun appendTermuxShellEnvironment(
+    builder: StringBuilder,
+    includeShellStartupPath: Boolean,
+    environmentVariables: List<TermuxEnvironmentVariable> = emptyList(),
+) {
+    builder.appendLine("export PREFIX='${TermuxContract.PrefixDirectory}'")
+    builder.appendLine("export HOME='${TermuxContract.HomeDirectory}'")
+    builder.appendLine("export TMPDIR=\"\$PREFIX/tmp\"")
+    builder.appendLine("export PATH=\"\${PATH:-}\"")
+    builder.appendLine("aether_dedupe_path() {")
+    builder.appendLine("  local old_path=\"\$PATH\"")
+    builder.appendLine("  local entry")
+    builder.appendLine("  PATH=''")
+    builder.appendLine("  while [ -n \"\$old_path\" ]; do")
+    builder.appendLine("    entry=\"\${old_path%%:*}\"")
+    builder.appendLine("    if [ \"\$old_path\" = \"\$entry\" ]; then")
+    builder.appendLine("      old_path=''")
+    builder.appendLine("    else")
+    builder.appendLine("      old_path=\"\${old_path#*:}\"")
+    builder.appendLine("    fi")
+    builder.appendLine("    [ -n \"\$entry\" ] || continue")
+    builder.appendLine("    case \":\$PATH:\" in")
+    builder.appendLine("      *\":\$entry:\"*) ;;")
+    builder.appendLine("      *) PATH=\"\${PATH:+\$PATH:}\$entry\" ;;")
+    builder.appendLine("    esac")
+    builder.appendLine("  done")
+    builder.appendLine("}")
+    builder.appendLine("PATH=\"\$HOME/.local/bin:\$HOME/bin:\$HOME/.cargo/bin:\$HOME/go/bin:\$PREFIX/bin:\$PREFIX/bin/applets:\$PATH\"")
+    builder.appendLine("aether_dedupe_path")
+    if (includeShellStartupPath) {
+        builder.appendLine("aether_capture_shell_path() {")
+        builder.appendLine("  local mode=\"\$1\"")
+        builder.appendLine("  local captured=''")
+        builder.appendLine("  local captured_path=''")
+        builder.appendLine("  command -v timeout >/dev/null 2>&1 || return 0")
+        builder.appendLine("  captured=\"\$(timeout 3 \"\$PREFIX/bin/bash\" \"\$mode\" 'printf \"\\036%s\" \"\$PATH\"' 2>/dev/null || true)\"")
+        builder.appendLine("  case \"\$captured\" in")
+        builder.appendLine("    *\$'\\036'*) captured_path=\"\${captured##*\$'\\036'}\" ;;")
+        builder.appendLine("    *) captured_path='' ;;")
+        builder.appendLine("  esac")
+        builder.appendLine("  [ -n \"\$captured_path\" ] || return 0")
+        builder.appendLine("  PATH=\"\$captured_path:\$PATH\"")
+        builder.appendLine("  aether_dedupe_path")
+        builder.appendLine("}")
+        builder.appendLine("aether_capture_shell_path -lc")
+        builder.appendLine("aether_capture_shell_path -ic")
+        builder.appendLine("unset -f aether_capture_shell_path")
+    }
+    builder.appendLine("export PATH")
+    normalizeTermuxEnvironmentVariables(environmentVariables).forEach { variable ->
+        builder.appendLine("export ${variable.name}='${escapeTermuxEnvValue(variable.value)}'")
+    }
+    builder.appendLine("unset -f aether_dedupe_path")
+}
+
+private fun escapeTermuxEnvValue(value: String): String =
+    value.replace("'", "'\"'\"'")
+
 internal object TermuxContract {
     const val PackageName = "com.termux"
     const val RunCommandPermission = "com.termux.permission.RUN_COMMAND"
@@ -1068,7 +1184,8 @@ internal object TermuxContract {
     const val ResultErrExtra = "err"
     const val ResultErrmsgExtra = "errmsg"
     const val ExecutionIdExtra = "com.baimoqilin.aether.termux.EXECUTION_ID"
-    const val BashPath = "/data/data/com.termux/files/usr/bin/bash"
+    const val PrefixDirectory = "/data/data/com.termux/files/usr"
+    const val BashPath = "$PrefixDirectory/bin/bash"
     const val HomeDirectory = "/data/data/com.termux/files/home"
     const val ManagedCommandsDirectory = "$HomeDirectory/.aether/bash-runs"
     const val ExternalAppsSetupCommand =

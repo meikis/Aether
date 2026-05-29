@@ -20,7 +20,7 @@ private const val MinFetchMarkdownChars = 500
 private const val MaxFetchMarkdownChars = 100_000
 private const val DefaultUserAgent =
     "Mozilla/5.0 (Linux; Android 15) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Mobile Safari/537.36"
-private const val DefaultTavilyBaseUrl = "https://api.tavily.com/"
+const val DefaultTavilyBaseUrl = "https://api.tavily.com/"
 
 data class FetchedWebPage(
     val requestUrl: String,
@@ -107,6 +107,7 @@ class WebToolsClient(
     suspend fun searchTavily(
         apiKey: String,
         request: TavilySearchRequest,
+        baseUrl: String = tavilyBaseUrl,
     ): Result<JSONObject> = runCatching {
         withContext(Dispatchers.IO) {
             val trimmedApiKey = apiKey.trim()
@@ -141,7 +142,7 @@ class WebToolsClient(
                 }
             }
 
-            val searchEndpoint = buildEndpoint("search")
+            val searchEndpoint = buildEndpoint(baseUrl, "search")
             val httpRequest = Request.Builder()
                 .url(searchEndpoint)
                 .header("Authorization", "Bearer $trimmedApiKey")
@@ -163,10 +164,18 @@ class WebToolsClient(
         }
     }
 
-    private fun buildEndpoint(pathSegment: String): String {
-        val baseUrl = tavilyBaseUrl.trim().toHttpUrlOrNull()
+    private fun buildEndpoint(
+        baseUrl: String,
+        pathSegment: String,
+    ): String {
+        val parsedBaseUrl = baseUrl.trim().toHttpUrlOrNull()
             ?: error("Tavily base URL is invalid.")
-        return baseUrl.newBuilder()
+        val pathSegments = parsedBaseUrl.pathSegments.filter { it.isNotBlank() }
+        val builder = parsedBaseUrl.newBuilder()
+        if (pathSegments.lastOrNull() == pathSegment) {
+            return builder.build().toString()
+        }
+        return builder
             .addPathSegments(pathSegment)
             .build()
             .toString()

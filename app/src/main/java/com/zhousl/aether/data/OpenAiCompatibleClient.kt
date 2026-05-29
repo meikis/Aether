@@ -31,6 +31,7 @@ import kotlin.coroutines.resumeWithException
 import kotlin.math.roundToLong
 
 class OpenAiCompatibleClient(
+    private val diagnosticLogger: AetherDiagnosticLogger = AetherDiagnosticLogger.NoOp,
     private val httpClient: OkHttpClient = OkHttpClient.Builder()
         .connectTimeout(DefaultHttpConnectTimeoutMillis, TimeUnit.MILLISECONDS)
         .readTimeout(DefaultHttpReadTimeoutMillis, TimeUnit.MILLISECONDS)
@@ -38,6 +39,8 @@ class OpenAiCompatibleClient(
         .callTimeout(DefaultHttpCallTimeoutMillis, TimeUnit.MILLISECONDS)
         .build(),
 ) {
+    private val requestCounter = AtomicLong(1)
+
     suspend fun createChatCompletion(
         settings: AppSettings,
         systemPrompt: String,
@@ -46,69 +49,102 @@ class OpenAiCompatibleClient(
         toolChoice: String? = null,
         parallelToolCalls: Boolean? = null,
         disableReasoning: Boolean = false,
-    ): Result<ChatCompletionResult> = try {
-        val request = when (settings.provider) {
-            LlmProvider.OpenAiResponses -> buildOpenAiResponsesRequest(
-                settings = settings,
-                systemPrompt = systemPrompt,
-                conversation = conversation,
-                tools = tools,
-                toolChoice = toolChoice,
-                parallelToolCalls = parallelToolCalls,
-                disableReasoning = disableReasoning,
+    ): Result<ChatCompletionResult> {
+        val requestId = nextLlmRequestId()
+        diagnosticLogger.event(
+            category = "llm",
+            event = "request_start",
+            requestId = requestId,
+            details = llmDiagnosticDetails(settings) + mapOf(
+                "streaming" to false,
+                "conversation_message_count" to conversation.size,
+                "tool_count" to tools.size,
+                "tool_choice" to toolChoice.orEmpty(),
+                "parallel_tool_calls" to parallelToolCalls,
+            ),
+        )
+        return try {
+            val request = when (settings.provider) {
+                LlmProvider.OpenAiResponses -> buildOpenAiResponsesRequest(
+                    settings = settings,
+                    systemPrompt = systemPrompt,
+                    conversation = conversation,
+                    tools = tools,
+                    toolChoice = toolChoice,
+                    parallelToolCalls = parallelToolCalls,
+                    disableReasoning = disableReasoning,
             )
 
-            LlmProvider.OpenAiCompatible -> buildOpenAiRequest(
-                settings = settings,
-                systemPrompt = systemPrompt,
-                conversation = conversation,
-                tools = tools,
-                toolChoice = toolChoice,
-                parallelToolCalls = parallelToolCalls,
-                disableReasoning = disableReasoning,
+                LlmProvider.OpenAiCompatible -> buildOpenAiRequest(
+                    settings = settings,
+                    systemPrompt = systemPrompt,
+                    conversation = conversation,
+                    tools = tools,
+                    toolChoice = toolChoice,
+                    parallelToolCalls = parallelToolCalls,
+                    disableReasoning = disableReasoning,
             )
 
-            LlmProvider.VertexExpress -> buildVertexRequest(
-                settings = settings,
-                systemPrompt = systemPrompt,
-                conversation = conversation,
-                tools = tools,
-                toolChoice = toolChoice,
+                LlmProvider.VertexExpress -> buildVertexRequest(
+                    settings = settings,
+                    systemPrompt = systemPrompt,
+                    conversation = conversation,
+                    tools = tools,
+                    toolChoice = toolChoice,
             )
 
-            LlmProvider.AnthropicMessages -> buildAnthropicMessagesRequest(
-                settings = settings,
-                systemPrompt = systemPrompt,
-                conversation = conversation,
-                tools = tools,
-                toolChoice = toolChoice,
+                LlmProvider.AnthropicMessages -> buildAnthropicMessagesRequest(
+                    settings = settings,
+                    systemPrompt = systemPrompt,
+                    conversation = conversation,
+                    tools = tools,
+                    toolChoice = toolChoice,
             )
-        }
+            }
 
-        val responsePayload = executeRequest(request)
-        val json = parseJsonObject(responsePayload.bodyString)
+            val responsePayload = executeRequest(request)
+            val json = parseJsonObject(responsePayload.bodyString)
 
-        if (!responsePayload.isSuccessful) {
-            val errorMessage = extractLlmErrorMessage(json, responsePayload)
-            throw buildLlmRequestException(responsePayload, errorMessage)
-        }
+            if (!responsePayload.isSuccessful) {
+                val errorMessage = extractLlmErrorMessage(json, responsePayload)
+                throw buildLlmRequestException(responsePayload, errorMessage)
+            }
 
-        if (json == null) {
-            error(buildUnexpectedResponseMessage(responsePayload))
-        }
+            if (json == null) {
+                error(buildUnexpectedResponseMessage(responsePayload))
+            }
 
-        Result.success(
-            when (settings.provider) {
+            val result = when (settings.provider) {
                 LlmProvider.OpenAiResponses -> parseOpenAiResponses(json)
                 LlmProvider.OpenAiCompatible -> parseOpenAiChatCompletion(json)
                 LlmProvider.VertexExpress -> parseVertexGenerateContent(json)
                 LlmProvider.AnthropicMessages -> parseAnthropicMessage(json)
             }
-        )
-    } catch (cancellationException: CancellationException) {
-        throw cancellationException
-    } catch (throwable: Throwable) {
-        Result.failure(throwable)
+            diagnosticLogger.event(
+                category = "llm",
+                event = "request_end",
+                requestId = requestId,
+                details = mapOf(
+                    "http_code" to responsePayload.code,
+                    "content_type" to responsePayload.contentType,
+                    "request_url" to responsePayload.requestUrl,
+                    "assistant_text_chars" to result.assistantText.length,
+                    "tool_call_count" to result.toolCalls.size,
+                ) + result.tokenUsage.diagnosticDetails(),
+            )
+            Result.success(result)
+        } catch (cancellationException: CancellationException) {
+            throw cancellationException
+        } catch (throwable: Throwable) {
+            diagnosticLogger.exception(
+                category = "llm",
+                event = "request_failed",
+                requestId = requestId,
+                throwable = throwable,
+                details = llmDiagnosticDetails(settings) + mapOf("streaming" to false),
+            )
+            Result.failure(throwable)
+        }
     }
 
     suspend fun streamChatCompletion(
@@ -122,9 +158,22 @@ class OpenAiCompatibleClient(
         onReasoningDelta: suspend (String) -> Unit = {},
         onReasoningSummaryDelta: suspend (String) -> Unit = {},
         onStreamActivity: suspend () -> Unit = {},
-    ): Result<ChatCompletionResult> = try {
-        Result.success(
-            when (settings.provider) {
+    ): Result<ChatCompletionResult> {
+        val requestId = nextLlmRequestId()
+        diagnosticLogger.event(
+            category = "llm",
+            event = "request_start",
+            requestId = requestId,
+            details = llmDiagnosticDetails(settings) + mapOf(
+                "streaming" to true,
+                "conversation_message_count" to conversation.size,
+                "tool_count" to tools.size,
+                "tool_choice" to toolChoice.orEmpty(),
+                "parallel_tool_calls" to parallelToolCalls,
+            ),
+        )
+        return try {
+            val result = when (settings.provider) {
                 LlmProvider.OpenAiResponses -> streamOpenAiResponses(
                     settings = settings,
                     systemPrompt = systemPrompt,
@@ -169,22 +218,110 @@ class OpenAiCompatibleClient(
                     onStreamActivity = onStreamActivity,
                 )
             }
-        )
-    } catch (cancellationException: CancellationException) {
-        throw cancellationException
-    } catch (throwable: Throwable) {
-        Result.failure(throwable)
+            diagnosticLogger.event(
+                category = "llm",
+                event = "request_end",
+                requestId = requestId,
+                details = mapOf(
+                    "streaming" to true,
+                    "assistant_text_chars" to result.assistantText.length,
+                    "tool_call_count" to result.toolCalls.size,
+                ) + result.tokenUsage.diagnosticDetails(),
+            )
+            Result.success(result)
+        } catch (cancellationException: CancellationException) {
+            throw cancellationException
+        } catch (throwable: Throwable) {
+            diagnosticLogger.exception(
+                category = "llm",
+                event = "request_failed",
+                requestId = requestId,
+                throwable = throwable,
+                details = llmDiagnosticDetails(settings) + mapOf("streaming" to true),
+            )
+            Result.failure(throwable)
+        }
     }
 
     fun buildConversation(
         settings: AppSettings,
         messages: List<LlmMessage>,
     ): List<JSONObject> = messages.map { message ->
+        message.providerPayload?.takeIf { isProviderPayloadFor(settings, it) }?.let { payload ->
+            return@map JSONObject(payload.toString())
+        }
         when (settings.provider) {
             LlmProvider.OpenAiResponses -> serializeOpenAiResponsesConversationMessage(message)
             LlmProvider.OpenAiCompatible -> serializeOpenAiConversationMessage(message)
             LlmProvider.VertexExpress -> serializeVertexConversationMessage(message)
             LlmProvider.AnthropicMessages -> serializeAnthropicConversationMessage(message)
+        }
+    }
+
+    suspend fun createOpenAiResponsesCompaction(
+        settings: AppSettings,
+        input: List<JSONObject>,
+    ): Result<OpenAiResponsesCompactionResult> {
+        if (settings.provider != LlmProvider.OpenAiResponses) {
+            return Result.failure(IllegalArgumentException("Compaction endpoint requires OpenAI Responses provider."))
+        }
+        val requestId = nextLlmRequestId()
+        diagnosticLogger.event(
+            category = "llm",
+            event = "compact_request_start",
+            requestId = requestId,
+            details = llmDiagnosticDetails(settings) + mapOf(
+                "conversation_message_count" to input.size,
+            ),
+        )
+        return try {
+            val responsePayload = executeRequest(
+                buildOpenAiResponsesCompactionRequest(
+                    settings = settings,
+                    input = input,
+                )
+            )
+            val json = parseJsonObject(responsePayload.bodyString)
+            if (!responsePayload.isSuccessful) {
+                val errorMessage = extractLlmErrorMessage(json, responsePayload)
+                throw buildLlmRequestException(responsePayload, errorMessage)
+            }
+            if (json == null) {
+                error(buildUnexpectedResponseMessage(responsePayload))
+            }
+            val output = json.optJSONArray("output")
+                ?: error("Missing compaction output in response.")
+            val assistantText = extractOpenAiResponsesOutputText(output)
+            val result = OpenAiResponsesCompactionResult(
+                assistantText = assistantText,
+                providerPayload = JSONObject().apply {
+                    put(OpenAiResponsesProviderPayloadKey, JSONArray(output.toString()))
+                },
+            )
+            diagnosticLogger.event(
+                category = "llm",
+                event = "compact_request_end",
+                requestId = requestId,
+                details = mapOf(
+                    "http_code" to responsePayload.code,
+                    "content_type" to responsePayload.contentType,
+                    "request_url" to responsePayload.requestUrl,
+                    "output_item_count" to output.length(),
+                    "assistant_text_chars" to assistantText.length,
+                ),
+            )
+            Result.success(result)
+        } catch (cancellationException: CancellationException) {
+            throw cancellationException
+        } catch (throwable: Throwable) {
+            diagnosticLogger.exception(
+                category = "llm",
+                event = "compact_request_failed",
+                requestId = requestId,
+                throwable = throwable,
+                details = llmDiagnosticDetails(settings),
+            )
+            Result.failure(throwable)
         }
     }
 
@@ -309,6 +446,24 @@ class OpenAiCompatibleClient(
         )
     }
 
+    private fun nextLlmRequestId(): String = "llm-${requestCounter.getAndIncrement()}"
+
+    private fun llmDiagnosticDetails(settings: AppSettings): Map<String, Any?> =
+        mapOf(
+            "provider" to settings.provider.storageValue,
+            "model" to settings.modelId,
+            "base_url" to DiagnosticRedactor.sanitizedBaseUrl(settings.baseUrl),
+            "inactivity_reconnect_timeout_seconds" to settings.llmInactivityReconnectTimeoutSeconds,
+            "basic_tool_compatibility" to settings.basicFunctionCallingCompatibilityMode,
+        )
+
+    private fun isProviderPayloadFor(
+        settings: AppSettings,
+        payload: JSONObject,
+    ): Boolean =
+        settings.provider == LlmProvider.OpenAiResponses &&
+            payload.has(OpenAiResponsesProviderPayloadKey)
+
     private fun parseOpenAiChatCompletion(json: JSONObject): ChatCompletionResult {
         val message = json.optJSONArray("choices")
             ?.optJSONObject(0)
@@ -335,7 +490,10 @@ class OpenAiCompatibleClient(
         }
 
         val toolCalls = buildList {
-            val toolCallsArray = message.optJSONArray("tool_calls") ?: JSONArray()
+            // Guard against "tool_calls": null which some providers (e.g. mimo)
+            // may include in non-streaming responses.
+            val toolCallsArray = if (message.isNull("tool_calls")) JSONArray()
+                else message.optJSONArray("tool_calls") ?: JSONArray()
             for (index in 0 until toolCallsArray.length()) {
                 val toolCall = toolCallsArray.optJSONObject(index) ?: continue
                 val function = toolCall.optJSONObject("function") ?: continue
@@ -355,12 +513,16 @@ class OpenAiCompatibleClient(
             assistantMessage = JSONObject(message.toString()),
             reasoningText = extractOpenAiReasoningText(message),
             reasoningSummaryText = extractReasoningDetailsSummary(message.optJSONArray("reasoning_details")),
+            tokenUsage = parseOpenAiUsage(json),
         )
     }
 
     private fun parseOpenAiResponses(json: JSONObject): ChatCompletionResult {
         val output = json.optJSONArray("output") ?: JSONArray()
-        return buildOpenAiResponsesResult(output)
+        return buildOpenAiResponsesResult(
+            output = output,
+            tokenUsage = parseOpenAiUsage(json),
+        )
     }
 
     private fun parseAnthropicMessage(json: JSONObject): ChatCompletionResult {
@@ -396,6 +558,7 @@ class OpenAiCompatibleClient(
                 put("role", "assistant")
                 put("content", JSONArray(content.toString()))
             },
+            tokenUsage = parseAnthropicUsage(json),
         )
     }
 
@@ -440,6 +603,7 @@ class OpenAiCompatibleClient(
             assistantText = assistantText,
             toolCalls = toolCalls,
             assistantMessage = assistantMessage,
+            tokenUsage = parseVertexUsage(json),
         )
     }
 
@@ -760,6 +924,41 @@ class OpenAiCompatibleClient(
                     addHeader("Authorization", "Bearer $trimmedApiKey")
                 }
             }
+            .applyAetherLlmHeaders(settings.customHeaders)
+            .post(payload.toString().toRequestBody(JsonMediaType))
+            .build()
+    }
+
+    private fun buildOpenAiResponsesCompactionRequest(
+        settings: AppSettings,
+        input: List<JSONObject>,
+    ): Request {
+        val endpoint = buildOpenAiResponsesCompactionEndpoint(settings.baseUrl)
+        val trimmedApiKey = settings.apiKey.trim()
+        if (settings.provider.requiresApiKey(settings.baseUrl) && trimmedApiKey.isBlank()) {
+            error("API Key is required for ${settings.provider.displayName}.")
+        }
+        val payload = JSONObject().apply {
+            put("model", settings.modelId.trim())
+            put(
+                "input",
+                JSONArray().apply {
+                    input.forEach { item ->
+                        appendOpenAiResponsesInputItem(item)
+                    }
+                },
+            )
+        }
+
+        return Request.Builder()
+            .url(endpoint)
+            .addHeader("Content-Type", "application/json")
+            .apply {
+                if (trimmedApiKey.isNotBlank()) {
+                    addHeader("Authorization", "Bearer $trimmedApiKey")
+                }
+            }
+            .applyAetherLlmHeaders(settings.customHeaders)
             .post(payload.toString().toRequestBody(JsonMediaType))
             .build()
     }
@@ -817,6 +1016,12 @@ class OpenAiCompatibleClient(
             }
             if (stream) {
                 put("stream", true)
+                put(
+                    "stream_options",
+                    JSONObject().apply {
+                        put("include_usage", true)
+                    },
+                )
             }
             putReasoningDisabledIfNeeded(settings, disableReasoning)
         }
@@ -834,6 +1039,7 @@ class OpenAiCompatibleClient(
                     addHeader("Authorization", "Bearer $trimmedApiKey")
                 }
             }
+            .applyAetherLlmHeaders(settings.customHeaders)
             .post(payload.toString().toRequestBody(JsonMediaType))
             .build()
     }
@@ -889,6 +1095,7 @@ class OpenAiCompatibleClient(
             .addHeader("Accept", if (stream) "text/event-stream" else "application/json")
             .addHeader("x-api-key", trimmedApiKey)
             .addHeader("anthropic-version", AnthropicVersion)
+            .applyAetherLlmHeaders(settings.customHeaders)
             .post(payload.toString().toRequestBody(JsonMediaType))
             .build()
     }
@@ -976,6 +1183,7 @@ class OpenAiCompatibleClient(
                     addHeader("Accept", "text/event-stream")
                 }
             }
+            .applyAetherLlmHeaders(settings.customHeaders)
             .post(payload.toString().toRequestBody(JsonMediaType))
             .build()
     }
@@ -1001,6 +1209,9 @@ class OpenAiCompatibleClient(
             .build()
             .toString()
     }
+
+    private fun buildOpenAiResponsesCompactionEndpoint(baseUrl: String): String =
+        buildOpenAiResponsesEndpoint(baseUrl).trimEnd('/') + "/compact"
 
     private fun buildOpenAiChatCompletionEndpoint(baseUrl: String): String {
         val normalizedBaseUrl = parseAbsoluteBaseUrl(baseUrl)
@@ -1172,6 +1383,13 @@ class OpenAiCompatibleClient(
     }
 
     private fun JSONArray.appendOpenAiResponsesInputItem(item: JSONObject) {
+        val providerPayloadItems = item.optJSONArray(OpenAiResponsesProviderPayloadKey)
+        if (providerPayloadItems != null) {
+            for (index in 0 until providerPayloadItems.length()) {
+                providerPayloadItems.optJSONObject(index)?.let(::put)
+            }
+            return
+        }
         val wrappedItems = item.optJSONArray(OpenAiResponsesItemsKey)
         if (wrappedItems != null) {
             for (index in 0 until wrappedItems.length()) {
@@ -1573,8 +1791,12 @@ private class OpenAiStreamAccumulator(
     private val reasoningSummary = StringBuilder()
     private val reasoningDetails = mutableListOf<JSONObject>()
     private val toolCalls = linkedMapOf<Int, MutableToolCallAccumulator>()
+    private var tokenUsage: LlmTokenUsage? = null
 
     suspend fun consume(chunk: JSONObject) {
+        parseOpenAiUsage(chunk)?.let { usage ->
+            tokenUsage = usage
+        }
         val choices = chunk.optJSONArray("choices") ?: return
         for (choiceIndex in 0 until choices.length()) {
             val choice = choices.optJSONObject(choiceIndex) ?: continue
@@ -1621,6 +1843,12 @@ private class OpenAiStreamAccumulator(
                 onTextDelta(textDelta)
             }
 
+            // Skip when tool_calls is explicitly null (e.g. mimo-v2.5-pro sends
+            // "tool_calls": null in deltas that carry no tool invocation). Without
+            // this guard, has("tool_calls") returns true even for a null value and
+            // getJSONArray("tool_calls") would throw JSONException, dropping the
+            // entire chunk so that real tool_calls never accumulate.
+            if (delta.isNull("tool_calls")) continue
             val toolCallDeltas = delta.optJSONArray("tool_calls") ?: continue
             for (toolCallIndex in 0 until toolCallDeltas.length()) {
                 val toolCallDelta = toolCallDeltas.optJSONObject(toolCallIndex) ?: continue
@@ -1672,6 +1900,7 @@ private class OpenAiStreamAccumulator(
                 .ifBlank { reasoningDetailsText.toString() }
                 .ifBlank { reasoningSummary.toString() },
             reasoningSummaryText = reasoningSummary.toString(),
+            tokenUsage = tokenUsage,
         )
     }
 }
@@ -1683,8 +1912,12 @@ private class OpenAiResponsesStreamAccumulator(
     private val messageContent = mutableListOf<JSONObject>()
     private val toolCalls = linkedMapOf<Int, MutableToolCallAccumulator>()
     private val completedFunctionCalls = linkedMapOf<Int, JSONObject>()
+    private var tokenUsage: LlmTokenUsage? = null
 
     suspend fun consume(chunk: JSONObject) {
+        parseOpenAiUsage(chunk)?.let { usage ->
+            tokenUsage = usage
+        }
         when (chunk.optString("type")) {
             "response.output_text.delta" -> {
                 val delta = chunk.optString("delta")
@@ -1751,7 +1984,10 @@ private class OpenAiResponsesStreamAccumulator(
             }
             completedFunctionCalls.toSortedMap().values.forEach(::put)
         }
-        return buildOpenAiResponsesResult(responseItems)
+        return buildOpenAiResponsesResult(
+            output = responseItems,
+            tokenUsage = tokenUsage,
+        )
     }
 
     private fun consumeOutputItem(
@@ -1806,8 +2042,12 @@ private class AnthropicStreamAccumulator(
     private val assistantText = StringBuilder()
     private val contentBlocks = mutableListOf<JSONObject>()
     private val toolUseBlocks = linkedMapOf<Int, MutableAnthropicToolUseAccumulator>()
+    private var tokenUsage: LlmTokenUsage? = null
 
     suspend fun consume(chunk: JSONObject) {
+        parseAnthropicUsage(chunk)?.let { usage ->
+            tokenUsage = mergePartialTokenUsage(tokenUsage, usage)
+        }
         when (chunk.optString("type")) {
             "content_block_start" -> {
                 val index = chunk.optInt("index", contentBlocks.size)
@@ -1872,6 +2112,7 @@ private class AnthropicStreamAccumulator(
         return buildAnthropicResultFromContent(
             assistantText = assistantText.toString(),
             content = normalizedBlocks,
+            tokenUsage = tokenUsage,
         )
     }
 
@@ -1902,8 +2143,12 @@ private class VertexStreamAccumulator(
 ) {
     private val assistantText = StringBuilder()
     private val parts = mutableListOf<MutableVertexPartAccumulator>()
+    private var tokenUsage: LlmTokenUsage? = null
 
     suspend fun consume(chunk: JSONObject) {
+        parseVertexUsage(chunk)?.let { usage ->
+            tokenUsage = usage
+        }
         val candidates = chunk.optJSONArray("candidates") ?: return
         for (candidateIndex in 0 until candidates.length()) {
             val candidate = candidates.optJSONObject(candidateIndex) ?: continue
@@ -1945,6 +2190,7 @@ private class VertexStreamAccumulator(
             assistantText = resolvedText,
             toolCalls = resolvedToolCalls,
             assistantMessage = buildVertexAssistantMessage(resolvedParts),
+            tokenUsage = tokenUsage,
         )
     }
 }
@@ -2064,7 +2310,10 @@ private fun JSONObject.optNullableString(key: String): String? {
     }
 }
 
-private fun buildOpenAiResponsesResult(output: JSONArray): ChatCompletionResult {
+private fun buildOpenAiResponsesResult(
+    output: JSONArray,
+    tokenUsage: LlmTokenUsage? = null,
+): ChatCompletionResult {
     val assistantText = StringBuilder()
     val toolCalls = mutableListOf<ChatCompletionToolCall>()
     val assistantItems = JSONArray()
@@ -2106,12 +2355,45 @@ private fun buildOpenAiResponsesResult(output: JSONArray): ChatCompletionResult 
         assistantMessage = JSONObject().apply {
             put(OpenAiResponsesItemsKey, assistantItems)
         },
+        tokenUsage = tokenUsage,
     )
+}
+
+private fun extractOpenAiResponsesOutputText(output: JSONArray): String = buildString {
+    for (index in 0 until output.length()) {
+        val item = output.optJSONObject(index) ?: continue
+        when (item.optString("type")) {
+            "message" -> {
+                val content = item.optJSONArray("content") ?: JSONArray()
+                for (contentIndex in 0 until content.length()) {
+                    val block = content.optJSONObject(contentIndex) ?: continue
+                    val text = when (block.optString("type")) {
+                        "output_text", "text" -> block.optString("text")
+                        else -> ""
+                    }
+                    if (text.isBlank()) continue
+                    if (isNotEmpty()) append('\n')
+                    append(text)
+                }
+            }
+
+            "compaction" -> {
+                val text = item.optString("summary")
+                    .ifBlank { item.optString("text") }
+                    .ifBlank { item.optString("content") }
+                if (text.isNotBlank()) {
+                    if (isNotEmpty()) append('\n')
+                    append(text)
+                }
+            }
+        }
+    }
 }
 
 private fun buildAnthropicResultFromContent(
     assistantText: String,
     content: JSONArray,
+    tokenUsage: LlmTokenUsage? = null,
 ): ChatCompletionResult {
     val toolCalls = buildList {
         for (index in 0 until content.length()) {
@@ -2133,6 +2415,7 @@ private fun buildAnthropicResultFromContent(
             put("role", "assistant")
             put("content", JSONArray(content.toString()))
         },
+        tokenUsage = tokenUsage,
     )
 }
 
@@ -2199,6 +2482,111 @@ private fun buildVertexAssistantMessage(
             }
         }
     )
+}
+
+private fun parseOpenAiUsage(json: JSONObject): LlmTokenUsage? {
+    val usage = json.optJSONObject("usage") ?: return null
+    val inputTokens = usage.optPositiveLong(
+        "input_tokens",
+        "prompt_tokens",
+    )
+    val outputTokens = usage.optPositiveLong(
+        "output_tokens",
+        "completion_tokens",
+    )
+    val completionDetails = usage.optJSONObject("completion_tokens_details")
+    val promptDetails = usage.optJSONObject("prompt_tokens_details")
+    return LlmTokenUsage(
+        inputTokens = inputTokens,
+        outputTokens = outputTokens,
+        totalTokens = usage.optPositiveLong("total_tokens")
+            ?: LlmTokenUsage.sumNullable(inputTokens, outputTokens),
+        reasoningTokens = completionDetails?.optPositiveLong("reasoning_tokens")
+            ?: usage.optPositiveLong("reasoning_tokens"),
+        cachedInputTokens = promptDetails?.optPositiveLong("cached_tokens")
+            ?: usage.optPositiveLong("cached_input_tokens"),
+    ).takeIfMeaningful()
+}
+
+private fun parseAnthropicUsage(json: JSONObject): LlmTokenUsage? {
+    val usage = when (json.optString("type")) {
+        "message_delta" -> json.optJSONObject("usage")
+        "message_start" -> json.optJSONObject("message")?.optJSONObject("usage")
+        else -> json.optJSONObject("usage")
+    } ?: return null
+    val inputTokens = usage.optPositiveLong("input_tokens")
+    val outputTokens = usage.optPositiveLong("output_tokens")
+    return LlmTokenUsage(
+        inputTokens = inputTokens,
+        outputTokens = outputTokens,
+        totalTokens = LlmTokenUsage.sumNullable(inputTokens, outputTokens),
+        cachedInputTokens = usage.optPositiveLong(
+            "cache_read_input_tokens",
+            "cache_creation_input_tokens",
+        ),
+    ).takeIfMeaningful()
+}
+
+private fun parseVertexUsage(json: JSONObject): LlmTokenUsage? {
+    val usage = json.optJSONObject("usageMetadata") ?: return null
+    val inputTokens = usage.optPositiveLong("promptTokenCount")
+    val outputTokens = usage.optPositiveLong("candidatesTokenCount")
+    return LlmTokenUsage(
+        inputTokens = inputTokens,
+        outputTokens = outputTokens,
+        totalTokens = usage.optPositiveLong("totalTokenCount")
+            ?: LlmTokenUsage.sumNullable(inputTokens, outputTokens),
+        cachedInputTokens = usage.optPositiveLong("cachedContentTokenCount"),
+    ).takeIfMeaningful()
+}
+
+private fun JSONObject.optPositiveLong(vararg keys: String): Long? {
+    keys.forEach { key ->
+        if (!has(key) || isNull(key)) return@forEach
+        val value = when (val raw = opt(key)) {
+            is Number -> raw.toLong()
+            is String -> raw.toLongOrNull()
+            else -> null
+        }
+        if (value != null && value >= 0L) return value
+    }
+    return null
+}
+
+private fun LlmTokenUsage.takeIfMeaningful(): LlmTokenUsage? =
+    if (
+        inputTokens != null ||
+        outputTokens != null ||
+        totalTokens != null ||
+        reasoningTokens != null ||
+        cachedInputTokens != null
+    ) {
+        withMissingTotalResolved()
+    } else {
+        null
+    }
+
+private fun mergePartialTokenUsage(
+    existing: LlmTokenUsage?,
+    incoming: LlmTokenUsage,
+): LlmTokenUsage = LlmTokenUsage(
+    inputTokens = incoming.inputTokens ?: existing?.inputTokens,
+    outputTokens = incoming.outputTokens ?: existing?.outputTokens,
+    totalTokens = null,
+    reasoningTokens = incoming.reasoningTokens ?: existing?.reasoningTokens,
+    cachedInputTokens = incoming.cachedInputTokens ?: existing?.cachedInputTokens,
+    requestCount = existing?.requestCount ?: incoming.requestCount,
+).withMissingTotalResolved()
+
+private fun LlmTokenUsage?.diagnosticDetails(): Map<String, Any> {
+    val usage = this ?: return emptyMap()
+    return buildMap {
+        usage.inputTokens?.let { put("input_tokens", it) }
+        usage.outputTokens?.let { put("output_tokens", it) }
+        usage.totalTokens?.let { put("total_tokens", it) }
+        usage.reasoningTokens?.let { put("reasoning_tokens", it) }
+        usage.cachedInputTokens?.let { put("cached_input_tokens", it) }
+    }
 }
 
 private fun sanitizeVertexConversationMessage(message: JSONObject): JSONObject =
@@ -2481,3 +2869,4 @@ private const val DefaultStreamingWriteTimeoutMillis = 30_000L
 private const val DefaultAnthropicMaxTokens = 4096
 private const val AnthropicVersion = "2023-06-01"
 private const val OpenAiResponsesItemsKey = "aether_response_items"
+private const val OpenAiResponsesProviderPayloadKey = "aether_openai_responses_compaction_items"

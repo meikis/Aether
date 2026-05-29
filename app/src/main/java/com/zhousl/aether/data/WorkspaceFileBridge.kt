@@ -5,59 +5,97 @@ import android.net.Uri
 import android.webkit.MimeTypeMap
 import com.zhousl.aether.termux.TermuxBashTool
 import com.zhousl.aether.termux.TermuxContract
+import java.io.BufferedOutputStream
+import java.io.BufferedReader
 import java.io.ByteArrayOutputStream
+import java.io.InputStreamReader
+import java.net.InetAddress
+import java.net.ServerSocket
 import java.net.URLDecoder
 import java.nio.file.Paths
 import java.util.Base64
+import java.util.UUID
+import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.TimeUnit
 import kotlin.concurrent.thread
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 
-private const val MaxWorkspaceImportBytes = 20 * 1024 * 1024
 private const val MaxWorkspaceDownloadBytes = 32 * 1024 * 1024
+private const val WorkspaceImportChunkBytes = 48 * 1024
 private const val WorkspaceTransferChunkBytes = 6 * 1024
 private const val WorkspaceUploadChunkChars = 64 * 1024
-private const val WorkspaceBaseDirectoryName = ".aether/workspaces"
+private const val MaxAnalyzeInlineBytes = 5 * 1024 * 1024
+private const val WorkspaceImportProgressIntervalMillis = 500L
+private const val WorkspaceHttpUploadBufferBytes = 256 * 1024
+private const val WorkspaceHttpUploadTimeoutMillis = 60 * 60 * 1000L
+private const val SharedWorkspaceBaseDirectoryName = ".aether/workspace"
+private const val PerSessionWorkspaceBaseDirectoryName = ".aether/workspaces"
 private const val RootReadTimeoutMillis = 20_000L
 
 class WorkspaceFileBridge(
     private val context: Context,
     private val bashTool: TermuxBashTool = TermuxBashTool(context),
 ) {
-    fun workspaceDirectory(sessionId: String): String =
-        "${TermuxContract.HomeDirectory}/$WorkspaceBaseDirectoryName/$sessionId"
+    fun workspaceDirectory(
+        sessionId: String,
+        mode: AgentWorkspaceMode = AgentWorkspaceMode.Shared,
+    ): String = when (mode) {
+        AgentWorkspaceMode.Shared ->
+            "${TermuxContract.HomeDirectory}/$SharedWorkspaceBaseDirectoryName"
+
+        AgentWorkspaceMode.PerSession ->
+            "${TermuxContract.HomeDirectory}/$PerSessionWorkspaceBaseDirectoryName/$sessionId"
+    }
+
+    fun workspaceUploadsDirectory(
+        sessionId: String,
+        mode: AgentWorkspaceMode = AgentWorkspaceMode.Shared,
+    ): String = "${workspaceDirectory(sessionId, mode)}/uploads"
 
     suspend fun importAttachmentToWorkspace(
         sourceUri: Uri,
         sessionId: String,
         attachmentId: String,
         displayName: String,
+        mode: AgentWorkspaceMode = AgentWorkspaceMode.Shared,
+        onProgress: (WorkspaceImportProgress) -> Unit = {},
     ): Result<ImportedWorkspaceFile> = runCatching {
         val safeFileName = buildWorkspaceFileName(
             attachmentId = attachmentId,
             displayName = displayName,
         )
-        val destinationPath = "${workspaceDirectory(sessionId)}/uploads/$safeFileName"
-        val bytes = readContentBytes(
+        val destinationPath = "${workspaceUploadsDirectory(sessionId, mode)}/$safeFileName"
+        var inlineBytes = ByteArray(0)
+        val bytesCopied = copyUriToWorkspace(
             sourceUri = sourceUri,
-            byteLimit = MaxWorkspaceImportBytes + 1,
-        ) ?: error("Couldn't read the selected file.")
-
-        if (bytes.size > MaxWorkspaceImportBytes) {
-            error("File is larger than ${formatBytes(MaxWorkspaceImportBytes.toLong())}.")
-        }
-
-        writeWorkspaceBytes(
             absolutePath = destinationPath,
-            bytes = bytes,
-        ).getOrThrow()
+            onProgress = onProgress,
+            onInlineBytes = { inlineBytes = it },
+        )
 
         ImportedWorkspaceFile(
             absolutePath = destinationPath,
-            bytesCopied = bytes.size.toLong(),
+            bytesCopied = bytesCopied,
+            inlineBytes = inlineBytes,
         )
+    }
+
+    suspend fun hasLegacySessionWorkspaces(): Boolean = withContext(Dispatchers.IO) {
+        val legacyRootPath = "${TermuxContract.HomeDirectory}/$PerSessionWorkspaceBaseDirectoryName"
+        val command = buildString {
+            appendCommonShellPreamble(this)
+            appendLine("legacy_root=\"\$(decode_b64 '${encodeBase64(legacyRootPath)}')\"")
+            appendLine("if [ -d \"\$legacy_root\" ] && find \"\$legacy_root\" -mindepth 1 -maxdepth 1 2>/dev/null | read -r _; then")
+            appendLine("  emit_kv legacy true")
+            appendLine("else")
+            appendLine("  emit_kv legacy false")
+            appendLine("fi")
+        }
+        val raw = JSONObject(bashTool.executeCommand(command))
+        if (!raw.optBoolean("ok")) return@withContext false
+        parseStructuredStdout(raw.optString("stdout"))["legacy"] == "true"
     }
 
     suspend fun readWorkspaceFile(
@@ -271,11 +309,143 @@ class WorkspaceFileBridge(
         values["bytes_written"]?.toLongOrNull() ?: bytes.size.toLong()
     }
 
+    private suspend fun copyUriToWorkspace(
+        sourceUri: Uri,
+        absolutePath: String,
+        onProgress: (WorkspaceImportProgress) -> Unit,
+        onInlineBytes: (ByteArray) -> Unit,
+    ): Long = withContext(Dispatchers.IO) {
+        copyUriToWorkspaceOverHttp(
+            sourceUri = sourceUri,
+            absolutePath = absolutePath,
+            onProgress = onProgress,
+            onInlineBytes = onInlineBytes,
+        ).getOrElse {
+            copyUriToWorkspaceOverBase64(
+                sourceUri = sourceUri,
+                absolutePath = absolutePath,
+                onProgress = onProgress,
+                onInlineBytes = onInlineBytes,
+            )
+        }
+    }
+
+    private suspend fun copyUriToWorkspaceOverHttp(
+        sourceUri: Uri,
+        absolutePath: String,
+        onProgress: (WorkspaceImportProgress) -> Unit,
+        onInlineBytes: (ByteArray) -> Unit,
+    ): Result<Long> = runCatching {
+        val uploadServer = WorkspaceHttpUploadServer(
+            context = context,
+            sourceUri = sourceUri,
+            onProgress = onProgress,
+        )
+        uploadServer.use { server ->
+            val command = buildHttpWorkspaceUploadCommand(
+                absolutePath = absolutePath,
+                url = server.url,
+            )
+            val rawResult = executeUploadCommand(
+                command = command,
+                fallbackMessage = "Couldn't stream the selected file into $absolutePath.",
+                awaitTimeoutMillis = WorkspaceHttpUploadTimeoutMillis,
+            )
+            val serverBytes = server.awaitBytesServed()
+            if (serverBytes <= MaxAnalyzeInlineBytes) {
+                onInlineBytes(server.inlineBytes())
+            }
+            val values = parseStructuredStdout(rawResult.optString("stdout"))
+            values["bytes_written"]?.toLongOrNull() ?: serverBytes
+        }
+    }
+
+    private suspend fun copyUriToWorkspaceOverBase64(
+        sourceUri: Uri,
+        absolutePath: String,
+        onProgress: (WorkspaceImportProgress) -> Unit,
+        onInlineBytes: (ByteArray) -> Unit,
+    ): Long {
+        val pathBase64 = encodeBase64(absolutePath)
+        executeUploadCommand(
+            command = buildInitWorkspaceUploadCommand(pathBase64),
+            fallbackMessage = "Couldn't prepare $absolutePath in the workspace.",
+        )
+
+        val inputStream = context.contentResolver.openInputStream(sourceUri)
+            ?: error("Couldn't read the selected file.")
+        val startedAtMillis = System.currentTimeMillis()
+        var lastProgressAtMillis = 0L
+        var bytesCopied = 0L
+        val inlineBuffer = ByteArrayOutputStream()
+
+        fun maybeEmitProgress(force: Boolean = false) {
+            val now = System.currentTimeMillis()
+            if (!force && now - lastProgressAtMillis < WorkspaceImportProgressIntervalMillis) return
+            val elapsedMillis = (now - startedAtMillis).coerceAtLeast(1L)
+            onProgress(
+                WorkspaceImportProgress(
+                    bytesCopied = bytesCopied,
+                    bytesPerSecond = bytesCopied * 1_000L / elapsedMillis,
+                )
+            )
+            lastProgressAtMillis = now
+        }
+
+        inputStream.use { stream ->
+            val buffer = ByteArray(WorkspaceImportChunkBytes)
+            while (true) {
+                val read = stream.read(buffer)
+                if (read <= 0) break
+                val contentBase64 = Base64.getEncoder().encodeToString(
+                    if (read == buffer.size) buffer else buffer.copyOf(read)
+                )
+                contentBase64.chunked(WorkspaceUploadChunkChars).forEach { chunk ->
+                    executeUploadCommand(
+                        command = buildAppendWorkspaceUploadChunkCommand(
+                            pathBase64 = pathBase64,
+                            chunk = chunk,
+                        ),
+                        fallbackMessage = "Couldn't append a file chunk for $absolutePath in the workspace.",
+                    )
+                }
+                bytesCopied += read.toLong()
+                if (inlineBuffer.size() <= MaxAnalyzeInlineBytes) {
+                    val remaining = MaxAnalyzeInlineBytes - inlineBuffer.size()
+                    if (remaining > 0) {
+                        inlineBuffer.write(buffer, 0, minOf(read, remaining))
+                    }
+                }
+                maybeEmitProgress()
+            }
+        }
+        if (bytesCopied <= MaxAnalyzeInlineBytes) {
+            onInlineBytes(inlineBuffer.toByteArray())
+        }
+
+        val rawResult = executeUploadCommand(
+            command = buildFinalizeWorkspaceUploadCommand(pathBase64),
+            fallbackMessage = "Couldn't finalize $absolutePath in the workspace.",
+        )
+        val values = parseStructuredStdout(rawResult.optString("stdout"))
+        val bytesWritten = values["bytes_written"]?.toLongOrNull()
+            ?: error("Couldn't determine how many bytes were written to $absolutePath.")
+        bytesCopied = bytesWritten
+        maybeEmitProgress(force = true)
+        return bytesWritten
+    }
+
     private suspend fun executeUploadCommand(
         command: String,
         fallbackMessage: String,
+        awaitTimeoutMillis: Long = 15_000L,
     ): JSONObject {
-        val rawResult = JSONObject(bashTool.executeCommand(command))
+        val rawResult = JSONObject(
+            bashTool.executeCommand(
+                command = command,
+                awaitTimeoutMillis = awaitTimeoutMillis,
+            )
+        )
         ensureBashSuccess(
             rawResult = rawResult,
             fallbackMessage = fallbackMessage,
@@ -570,6 +740,49 @@ class WorkspaceFileBridge(
         appendLine("emit_kv stage appended")
     }
 
+    private fun buildHttpWorkspaceUploadCommand(
+        absolutePath: String,
+        url: String,
+    ): String = buildString {
+        appendCommonShellPreamble(this)
+        appendLine("path=\"\$(decode_b64 '${encodeBase64(absolutePath)}')\"")
+        appendLine("url=\"\$(decode_b64 '${encodeBase64(url)}')\"")
+        appendLine("parent_dir=\$(dirname -- \"\$path\")")
+        appendLine("tmp_path=\"\${path}.aether-tmp\"")
+        appendLine("mkdir -p \"\$parent_dir\"")
+        appendLine("rm -f \"\$tmp_path\"")
+        appendLine("trap 'rm -f \"\$tmp_path\"' EXIT")
+        appendLine("if command -v curl >/dev/null 2>&1; then")
+        appendLine("  curl -fsSL --connect-timeout 10 --retry 1 --output \"\$tmp_path\" \"\$url\"")
+        appendLine("elif command -v wget >/dev/null 2>&1; then")
+        appendLine("  wget -q -O \"\$tmp_path\" \"\$url\"")
+        appendLine("elif command -v python3 >/dev/null 2>&1; then")
+        appendLine("  python3 - \"\$url\" \"\$tmp_path\" <<'PY'")
+        appendLine("import shutil, sys, urllib.request")
+        appendLine("with urllib.request.urlopen(sys.argv[1], timeout=10) as r, open(sys.argv[2], 'wb') as f:")
+        appendLine("    shutil.copyfileobj(r, f, 1024 * 1024)")
+        appendLine("PY")
+        appendLine("elif command -v python >/dev/null 2>&1; then")
+        appendLine("  python - \"\$url\" \"\$tmp_path\" <<'PY'")
+        appendLine("import shutil, sys")
+        appendLine("try:")
+        appendLine("    from urllib.request import urlopen")
+        appendLine("except ImportError:")
+        appendLine("    from urllib2 import urlopen")
+        appendLine("with urlopen(sys.argv[1], timeout=10) as r:")
+        appendLine("    with open(sys.argv[2], 'wb') as f:")
+        appendLine("        shutil.copyfileobj(r, f, 1024 * 1024)")
+        appendLine("PY")
+        appendLine("else")
+        appendLine("  echo 'No curl, wget, or python is available for workspace upload.' >&2")
+        appendLine("  exit 127")
+        appendLine("fi")
+        appendLine("mv \"\$tmp_path\" \"\$path\"")
+        appendLine("trap - EXIT")
+        appendLine("bytes_written=\$(wc -c < \"\$path\" | tr -d '[:space:]')")
+        appendLine("emit_kv bytes_written \"\$bytes_written\"")
+    }
+
     private fun buildFinalizeWorkspaceUploadCommand(
         pathBase64: String,
     ): String = buildString {
@@ -585,33 +798,6 @@ class WorkspaceFileBridge(
         appendLine("trap - EXIT")
         appendLine("emit_kv bytes_written \"\$bytes_written\"")
     }
-
-    private fun readContentBytes(
-        sourceUri: Uri,
-        byteLimit: Int,
-    ): ByteArray? = runCatching {
-        context.contentResolver.openInputStream(sourceUri)?.use { inputStream ->
-            val output = ByteArrayOutputStream()
-            val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
-            var totalRead = 0
-
-            while (true) {
-                val read = inputStream.read(buffer)
-                if (read <= 0) break
-
-                val remaining = byteLimit - totalRead
-                if (remaining <= 0) break
-
-                val writeCount = minOf(read, remaining)
-                output.write(buffer, 0, writeCount)
-                totalRead += writeCount
-
-                if (totalRead >= byteLimit) break
-            }
-
-            output.toByteArray()
-        }
-    }.getOrNull()
 
     private fun encodeBase64(value: String): String =
         Base64.getEncoder().encodeToString(value.toByteArray(Charsets.UTF_8))
@@ -659,7 +845,111 @@ private data class RootReadCommandResult(
 data class ImportedWorkspaceFile(
     val absolutePath: String,
     val bytesCopied: Long,
+    val inlineBytes: ByteArray = ByteArray(0),
 )
+
+data class WorkspaceImportProgress(
+    val bytesCopied: Long,
+    val bytesPerSecond: Long,
+)
+
+private class WorkspaceHttpUploadServer(
+    private val context: Context,
+    private val sourceUri: Uri,
+    private val onProgress: (WorkspaceImportProgress) -> Unit,
+) : AutoCloseable {
+    private val token = UUID.randomUUID().toString()
+    private val serverSocket = ServerSocket(0, 1, InetAddress.getByName("127.0.0.1"))
+    private val result = AtomicReference<Result<Long>?>(null)
+    private val inlineBuffer = ByteArrayOutputStream()
+    private val worker = thread(
+        name = "aether-workspace-upload",
+        isDaemon = true,
+        start = true,
+    ) {
+        result.set(runCatching { serveOneRequest() })
+        runCatching { serverSocket.close() }
+    }
+
+    val url: String =
+        "http://127.0.0.1:${serverSocket.localPort}/upload/$token"
+
+    fun awaitBytesServed(): Long {
+        worker.join()
+        return result.get()?.getOrThrow()
+            ?: error("Workspace upload server stopped without a result.")
+    }
+
+    fun inlineBytes(): ByteArray = inlineBuffer.toByteArray()
+
+    override fun close() {
+        runCatching { serverSocket.close() }
+        if (worker.isAlive) {
+            worker.join(1000)
+        }
+    }
+
+    private fun serveOneRequest(): Long {
+        serverSocket.soTimeout = 30_000
+        serverSocket.accept().use { socket ->
+            socket.soTimeout = 30_000
+            val reader = BufferedReader(InputStreamReader(socket.getInputStream(), Charsets.ISO_8859_1))
+            val requestLine = reader.readLine().orEmpty()
+            val expectedPath = "/upload/$token"
+            val requestedPath = requestLine.split(' ').getOrNull(1).orEmpty()
+            while (true) {
+                val line = reader.readLine() ?: break
+                if (line.isEmpty()) break
+            }
+            val output = BufferedOutputStream(socket.getOutputStream())
+            if (!requestLine.startsWith("GET ") || requestedPath != expectedPath) {
+                output.write("HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n".toByteArray())
+                output.flush()
+                error("Unexpected workspace upload request.")
+            }
+
+            val input = context.contentResolver.openInputStream(sourceUri)
+                ?: error("Couldn't read the selected file.")
+            val startedAtMillis = System.currentTimeMillis()
+            var lastProgressAtMillis = 0L
+            var bytesCopied = 0L
+
+            fun maybeEmitProgress(force: Boolean = false) {
+                val now = System.currentTimeMillis()
+                if (!force && now - lastProgressAtMillis < WorkspaceImportProgressIntervalMillis) return
+                val elapsedMillis = (now - startedAtMillis).coerceAtLeast(1L)
+                onProgress(
+                    WorkspaceImportProgress(
+                        bytesCopied = bytesCopied,
+                        bytesPerSecond = bytesCopied * 1_000L / elapsedMillis,
+                    )
+                )
+                lastProgressAtMillis = now
+            }
+
+            output.write("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/octet-stream\r\n\r\n".toByteArray())
+            input.use { stream ->
+                val buffer = ByteArray(WorkspaceHttpUploadBufferBytes)
+                while (true) {
+                    val read = stream.read(buffer)
+                    if (read <= 0) break
+                    output.write(buffer, 0, read)
+                    bytesCopied += read.toLong()
+                    if (inlineBuffer.size() <= MaxAnalyzeInlineBytes) {
+                        val remaining = MaxAnalyzeInlineBytes - inlineBuffer.size()
+                        if (remaining > 0) {
+                            inlineBuffer.write(buffer, 0, minOf(read, remaining))
+                        }
+                    }
+                    maybeEmitProgress()
+                }
+            }
+            output.flush()
+            maybeEmitProgress(force = true)
+            return bytesCopied
+        }
+    }
+}
 
 data class WorkspaceFilePayload(
     val absolutePath: String,
